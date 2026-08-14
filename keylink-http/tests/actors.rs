@@ -114,6 +114,7 @@ async fn local_node() -> Node {
 struct Running {
     address: std::net::SocketAddr,
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     denied: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     ticks: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
@@ -132,7 +133,33 @@ async fn start() -> Running {
     let client_node = local_node().await;
     let blobs = Blobs::memory();
 
-    let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never).build();
+    // Every id the factory is ever asked for, whether or not it mounts one.
+    // A lazy mount is the moment a registry LEARNS an id exists, so this is
+    // where "a denied caller cannot reach the registry" is measurable.
+    let asked: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_asked = std::sync::Arc::clone(&asked);
+    let factory_blob = blobs
+        .add_bytes(b"bytes of lazy".to_vec())
+        .await
+        .expect("stores");
+    let lazy_ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let factory_ticks = std::sync::Arc::clone(&lazy_ticks);
+    let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never)
+        .spawn_with(move |id| {
+            factory_asked
+                .lock()
+                .expect("the record is not poisoned")
+                .push(id.as_str().to_owned());
+            id.as_str().starts_with("lazy").then(|| {
+                ledger::spawn(Book {
+                    name: id.as_str().to_owned(),
+                    blob: (factory_blob, 13),
+                    ticks: std::sync::Arc::clone(&factory_ticks),
+                })
+            })
+        })
+        .build();
     let mut ticks = std::collections::HashMap::new();
     for name in ["one", "obra/4471", "forbidden"] {
         // Content that names its own actor, so bytes reached through the wrong
@@ -165,6 +192,7 @@ async fn start() -> Running {
         .await
         .expect("dials the keyed system");
 
+    ticks.insert("lazy".to_owned(), lazy_ticks);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let denied = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let surface = HttpSurface::new("/v1", Addressing::Actors)
@@ -193,6 +221,7 @@ async fn start() -> Running {
     Running {
         address,
         seen,
+        asked,
         denied,
         ticks,
         task,
@@ -235,6 +264,14 @@ impl Running {
             .send()
             .await
             .expect("the request completes")
+    }
+
+    /// Every id the registry's lazy factory was asked to build.
+    fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
     }
 
     /// Refuse one actor from the next request onward.
@@ -675,4 +712,140 @@ async fn an_over_long_method_name_is_refused_like_an_unknown_one() {
         running.seen().is_empty(),
         "and none of them reached the policy"
     );
+}
+
+/// Revoking an actor makes its BYTES unreachable, from its own path and from
+/// any other actor's.
+///
+/// The plan asks the revocation test to be repeated with a blob result. A blob
+/// grant is longer-lived than an rpc answer — it is a row in a table that
+/// outlives the call that minted it — so "the policy now refuses this actor" has
+/// to reach content that was already addressable when the policy still allowed
+/// it.
+///
+/// Three probes, three different mechanisms:
+///
+/// 1. The minting actor's own path: refused by the POLICY, which runs before
+///    the ticket table is read at all.
+/// 2. Another actor's path over the same address: refused by the TICKET, whose
+///    actor field cannot match. This holds with the policy removed.
+/// 3. A re-mint from the other actor: succeeds, and its `Location` addresses
+///    bytes that are that actor's own. The revoked actor's content is not
+///    reachable through it, which is what "no B-context ticket reaches A bytes"
+///    means when both actors are content-addressed.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK43`) by replacing
+/// `        actor: surface.actor.clone(),`
+/// with `        actor: None,`. Probe 2 answered `200` where this asserts
+/// `404`: the revoked actor's bytes came back under a permitted actor's path.
+#[tokio::test]
+async fn a_revoked_actors_bytes_are_reachable_from_no_path() {
+    let running = start().await;
+
+    let minted = running.post("/v1/one/blob/Take", "{}").await;
+    assert_eq!(minted.status(), http::StatusCode::CREATED);
+    let mine = minted
+        .headers()
+        .get(http::header::LOCATION)
+        .expect("a lookup says where the bytes live")
+        .to_str()
+        .expect("a header-safe path")
+        .to_owned();
+
+    // Control, while `one` is still permitted.
+    let before = running.get(&mine).await;
+    assert_eq!(before.status(), http::StatusCode::OK);
+    assert_eq!(before.text().await.expect("a body"), "bytes of one");
+
+    running.deny("one");
+
+    // 1. The policy refuses, and refuses before the table is read.
+    let own = running.get(&mine).await;
+    assert_eq!(
+        own.status(),
+        http::StatusCode::FORBIDDEN,
+        "a revoked actor cannot read the grant it minted"
+    );
+
+    // 2. The same address under a permitted actor. The ticket refuses.
+    let crossed = mine.replacen("/one/", "/obra%2F4471/", 1);
+    assert_ne!(crossed, mine, "the probe really changed the actor");
+    let theirs = running.get(&crossed).await;
+    assert_eq!(
+        theirs.status(),
+        http::StatusCode::NOT_FOUND,
+        "a permitted actor does not inherit a revoked actor's grant"
+    );
+
+    // 3. A grant the permitted actor mints itself addresses its OWN bytes.
+    let fresh = running.post("/v1/obra%2F4471/blob/Take", "{}").await;
+    assert_eq!(fresh.status(), http::StatusCode::CREATED);
+    let ours = fresh
+        .headers()
+        .get(http::header::LOCATION)
+        .expect("a lookup says where the bytes live")
+        .to_str()
+        .expect("a header-safe path")
+        .to_owned();
+    let served = running.get(&ours).await;
+    assert_eq!(served.status(), http::StatusCode::OK);
+    assert_eq!(
+        served.text().await.expect("a body"),
+        "bytes of obra/4471",
+        "the fresh grant serves its own actor's content, not the revoked one's"
+    );
+}
+
+/// A denied caller cannot make the registry mount an actor it has never held.
+///
+/// A lazy registry builds an actor the first time an id is asked for, so an
+/// unauthorized request that reached the registry would leave state behind:
+/// a mailbox, a task, a capacity slot. The policy runs before the call is
+/// made, so the factory is never asked.
+///
+/// The recorder is the FACTORY, not the policy. A test that only watched the
+/// policy could not tell an ordering violation from a correct run, because both
+/// record the same policy entry — this one records the moment the registry
+/// learns an id exists, which is the thing that must not happen.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK44`) by replacing
+/// `            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),`
+/// with an `Ok(Admitted { method, principal })`, which lets a denied caller
+/// through to the call. Terminated on
+/// `a denied caller left no id in the factory's record`, `left` carrying
+/// `["lazy", "forbidden-lazy"]` against a `right` of `["lazy"]`.
+#[tokio::test]
+async fn a_denied_caller_never_reaches_the_lazy_factory() {
+    let running = start().await;
+
+    // Control: a PERMITTED id the factory will build. This is what reaching
+    // the registry looks like, so the assertion below is not satisfied by a
+    // gateway that has stopped calling anything.
+    let built = running.post("/v1/lazy/rpc/Whoami", "{}").await;
+    assert_eq!(built.status(), http::StatusCode::OK);
+    assert_eq!(built.text().await.expect("a body"), r#""lazy""#);
+    assert_eq!(
+        running.asked(),
+        ["lazy".to_owned()],
+        "control: a permitted call does reach the factory"
+    );
+
+    // Denied, and never mounted. `forbidden-lazy` would build if it were asked
+    // for, so the factory's silence is about the policy and not about the id.
+    let refused = running.post("/v1/forbidden-lazy/rpc/Whoami", "{}").await;
+    // The factory FIRST, and deliberately. A denied call that reached the
+    // registry answers `404` rather than `403`, so a status assertion placed
+    // here would fire first and report a status where the finding is that the
+    // registry was touched at all.
+    assert_eq!(
+        running.asked(),
+        ["lazy".to_owned()],
+        "a denied caller left no id in the factory's record"
+    );
+    assert_eq!(refused.status(), http::StatusCode::FORBIDDEN);
+
+    // And a second denied call does not accumulate either.
+    let again = running.post("/v1/forbidden-lazy/rpc/Tick", "{}").await;
+    assert_eq!(running.asked().len(), 1);
+    assert_eq!(again.status(), http::StatusCode::FORBIDDEN);
 }
