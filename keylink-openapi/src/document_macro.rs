@@ -107,8 +107,19 @@ macro_rules! __keylink_document_impl {
                             request: ::serde_json::to_value(
                                 ::schemars::schema_for!(Request)
                             ).unwrap_or_default(),
+                            // The SERIALIZE contract, which is a different
+                            // schema from the deserialize one whenever a DTO
+                            // carries `skip_serializing` or `skip_deserializing`.
+                            // Built from the deserialize contract, a response
+                            // would promise a field the runtime never sends and
+                            // omit one it always does — and would mark it
+                            // `writeOnly` in a response body, which contradicts
+                            // itself on its face.
                             response: ::serde_json::to_value(
-                                ::schemars::schema_for!($ret)
+                                ::schemars::generate::SchemaSettings::default()
+                                    .for_serialize()
+                                    .into_generator()
+                                    .into_root_schema_for::<$ret>()
                             ).unwrap_or_default(),
                         });
                     }

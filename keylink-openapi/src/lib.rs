@@ -265,7 +265,7 @@ pub fn document<D: Documented>(
     }
 
     let value = Value::Object(root);
-    check_references(&value)?;
+    check_references(&value, "#/components/schemas/", &["components", "schemas"])?;
     let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
     Ok(Document { value, bytes })
 }
@@ -304,6 +304,10 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
         "$id": format!("urn:keylink:{}", D::SERVICE),
         "$defs": to_value(defs),
     });
+    // The same check the OpenAPI document runs, against the space THIS document
+    // resolves in. Running it on only one of the two published documents would
+    // make every dangling reference silent in the other.
+    check_references(&value, "#/$defs/", &["$defs"])?;
     let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
     Ok(Document { value, bytes })
 }
@@ -331,33 +335,51 @@ fn hoist(
         .and_then(|map| map.remove("$defs"))
         .and_then(|defs| defs.as_object().cloned());
     let Some(defs) = taken else {
-        rewrite_refs(schema, into, &BTreeMap::new());
+        rewrite_refs(schema, into, &BTreeMap::new(), None);
         return Ok(());
     };
-    let mut names = BTreeMap::new();
+    // The WHOLE map first, then one rewrite pass. Built the other way round —
+    // register, then learn the name — a definition that references itself is
+    // rewritten while its own name is still unknown, and `rewrite_refs` falls
+    // back to the bare logical name. The result is a `$ref` to a component that
+    // does not exist, which `check_references` then refuses. Mutual recursion
+    // fails the same way in one direction.
+    let names: BTreeMap<String, String> = defs
+        .keys()
+        .map(|logical| {
+            (
+                logical.clone(),
+                format!("{logical}_{}", digest::component_name(logical)),
+            )
+        })
+        .collect();
     for (logical, mut definition) in defs {
-        let component = format!("{logical}_{}", digest::component_name(&logical));
-        // Depth first: a definition can reference another definition.
-        rewrite_refs(&mut definition, into, &names);
+        rewrite_refs(&mut definition, into, &names, None);
+        let component = names
+            .get(&logical)
+            .cloned()
+            .unwrap_or_else(|| logical.clone());
         __register(components, &component, definition)?;
-        names.insert(logical, component);
     }
-    // A second pass, so a definition registered early can reference one
-    // registered late. Mutual recursion needs both directions.
-    for (logical, component) in &names {
-        let Some(mut definition) = components.get(component).cloned() else {
-            continue;
-        };
-        rewrite_refs(&mut definition, into, &names);
-        components.insert(component.clone(), definition);
-        let _ = logical;
-    }
-    rewrite_refs(schema, into, &names);
+    // The root's own component name, so a `"$ref": "#"` — how a schema says "me"
+    // — lands on the component the root was hoisted into rather than on the
+    // document root, which constrains nothing and would validate anything.
+    let root = schema
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(|title| names.get(title).cloned());
+    rewrite_refs(schema, into, &names, root.as_deref());
     Ok(())
 }
 
-/// Rewrite every `#/$defs/Name` to `<into>/<component>`.
-fn rewrite_refs(value: &mut Value, into: &str, names: &BTreeMap<String, String>) {
+/// Rewrite every `#/$defs/Name` to `<into>/<component>`, and a bare `#` to the
+/// root's own component when it has one.
+fn rewrite_refs(
+    value: &mut Value,
+    into: &str,
+    names: &BTreeMap<String, String>,
+    root: Option<&str>,
+) {
     match value {
         Value::Object(map) => {
             if let Some(Value::String(reference)) = map.get_mut("$ref") {
@@ -367,15 +389,19 @@ fn rewrite_refs(value: &mut Value, into: &str, names: &BTreeMap<String, String>)
                         .cloned()
                         .unwrap_or_else(|| logical.to_owned());
                     *reference = format!("{into}/{target}");
+                } else if reference == "#" {
+                    if let Some(root) = root {
+                        *reference = format!("{into}/{root}");
+                    }
                 }
             }
             for child in map.values_mut() {
-                rewrite_refs(child, into, names);
+                rewrite_refs(child, into, names, root);
             }
         }
         Value::Array(items) => {
             for item in items {
-                rewrite_refs(item, into, names);
+                rewrite_refs(item, into, names, root);
             }
         }
         _ => {}
@@ -490,13 +516,39 @@ fn operation_object(
         "parameters".to_owned(),
         Value::Array(parameters(route.template())),
     );
+    // A raw-octet route carries its arguments in a header, not in the body.
+    // Documenting the body without the header would describe a request that is
+    // half a request.
+    if route.request_media() == Some("application/octet-stream") {
+        if let Some(Value::Array(parameters)) = object.get_mut("parameters") {
+            parameters.push(json!({
+                "name": "keylink-arguments",
+                "in": "header",
+                "required": true,
+                "description": "The declared arguments, as base64url with no \
+                                padding, decoding to the schema this operation's \
+                                x-keylink-arguments-schema describes.",
+                "schema": { "type": "string", "contentEncoding": "base64url" },
+            }));
+        }
+        object.insert(
+            "x-keylink-arguments-schema".to_owned(),
+            operation.request.clone(),
+        );
+    }
     if let Some(media) = route.request_media() {
+        // A `send` takes RAW BYTES with the arguments in a header, so rendering
+        // the argument object as the body would document a request the gateway
+        // refuses with `InvalidStreamMetadata` — and every generated client
+        // would send it.
+        let body = if media == "application/octet-stream" {
+            schema::octet_stream_schema()
+        } else {
+            operation.request.clone()
+        };
         object.insert(
             "requestBody".to_owned(),
-            json!({
-                "required": true,
-                "content": { media: { "schema": operation.request.clone() } },
-            }),
+            json!({ "required": true, "content": { media: { "schema": body } } }),
         );
     }
     let mut responses = Map::new();
@@ -572,20 +624,26 @@ fn parameters(template: &str) -> Vec<Value> {
     out
 }
 
-/// Every `$ref` in the document resolves to something the document carries.
-fn check_references(value: &Value) -> Result<(), DocumentError> {
+/// Every `$ref` in a document resolves to something that document carries.
+///
+/// Parameterized on the ref space, because the two published documents have
+/// different ones: an OpenAPI reader resolves `#/components/schemas/`, a JSON
+/// Schema reader resolves `#/$defs/`. One function, two call sites.
+fn check_references(value: &Value, prefix: &str, container: &[&str]) -> Result<(), DocumentError> {
     let mut refs = Vec::new();
     collect_refs(value, &mut refs);
     for reference in refs {
-        let Some(name) = reference.strip_prefix("#/components/schemas/") else {
+        let Some(name) = reference.strip_prefix(prefix) else {
             return Err(DocumentError::UnresolvedReference { reference });
         };
-        let present = value
-            .get("components")
-            .and_then(|components| components.get("schemas"))
-            .and_then(|schemas| schemas.get(name))
-            .is_some();
-        if !present {
+        let mut here = value;
+        for step in container {
+            let Some(next) = here.get(step) else {
+                return Err(DocumentError::UnresolvedReference { reference });
+            };
+            here = next;
+        }
+        if here.get(name).is_none() {
             return Err(DocumentError::UnresolvedReference { reference });
         }
     }

@@ -1187,23 +1187,25 @@
     "/v1/send/Upload": {
       "post": {
         "operationId": "Inventory.singleton.send.Upload",
-        "parameters": [],
+        "parameters": [
+          {
+            "description": "The declared arguments, as base64url with no padding, decoding to the schema this operation's x-keylink-arguments-schema describes.",
+            "in": "header",
+            "name": "keylink-arguments",
+            "required": true,
+            "schema": {
+              "contentEncoding": "base64url",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "additionalProperties": false,
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "name"
-                ],
-                "title": "Request",
-                "type": "object"
+                "contentMediaType": "application/octet-stream",
+                "description": "Raw bytes. Not JSON, and not base64 on the wire.",
+                "type": "string"
               }
             }
           },
@@ -1377,7 +1379,21 @@
         },
         "tags": [
           "Inventory"
-        ]
+        ],
+        "x-keylink-arguments-schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "Request",
+          "type": "object"
+        }
       }
     }
   },

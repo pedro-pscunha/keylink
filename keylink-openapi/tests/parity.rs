@@ -173,3 +173,115 @@ fn an_untagged_enum_describes_alternatives() {
     let decoded: Untagged = serde_json::from_value(json!("x")).expect("serde accepts a string");
     assert_eq!(decoded, Untagged::Label("x".to_owned()));
 }
+
+/// A recursive DTO cannot reach this crate at all, and the refusal is one layer
+/// down.
+///
+/// A review reported that `hoist` mishandles self-reference — correctly, as a
+/// property of that function, measured on hand-fed `schemars` output. The
+/// scenario it drew from that ("any service that declares a tree cannot be
+/// documented") does not hold: `postcard_schema::Schema` is a REQUIRED derive on
+/// every service argument, and deriving it for `struct Node { children: Vec<Node> }`
+/// is a const-evaluation cycle, `E0391`. The wire schema refuses the type before
+/// a document is involved.
+///
+/// Recorded rather than tested, because the test cannot be written: the fixture
+/// does not compile. `hoist` is fixed anyway — an unreachable defect is still a
+/// defect, and the thing keeping it unreachable is a derive in another crate.
+#[test]
+fn a_recursive_dto_is_refused_by_the_wire_schema_not_by_this_crate() {
+    // Nothing to assert at runtime. The measurement is that the commented
+    // fixture below does not compile, and the record above says why.
+    //
+    // #[derive(postcard_schema::Schema)]
+    // pub struct Node { pub label: String, pub children: Vec<Node> }
+    //   error[E0391]: cycle detected when elaborating drops for `<impl>::SCHEMA`
+}
+
+#[derive(
+    Serialize, Deserialize, postcard_schema::Schema, schemars::JsonSchema, Clone, Debug, PartialEq,
+)]
+pub struct Asymmetric {
+    pub both: u64,
+    /// Sent by the server, never accepted from a caller.
+    #[serde(skip_deserializing)]
+    pub server_only: u64,
+    /// Accepted from a caller, never sent back.
+    #[serde(skip_serializing)]
+    pub client_only: u64,
+}
+
+keylink::service! {
+    service Asym;
+    rpc Round(item: Asymmetric) -> Asymmetric;
+}
+
+keylink_openapi::document_service!(asym);
+
+/// A request is described by the DESERIALIZE contract and a response by the
+/// SERIALIZE one, because for an asymmetric DTO they are different documents.
+///
+/// Built from one contract, a response promises a field the runtime never sends
+/// and omits one it always does. A generated client's response struct then
+/// fails to decode a real response — and the document says `writeOnly: true`
+/// inside a response body, which contradicts itself on its face.
+///
+/// Watched red with `scripts/break-once.sh` (row `HL5`) by replacing
+/// `                                    .for_serialize()`
+/// with `.for_deserialize()`. Terminated on
+/// `assertion failed: response_properties.contains_key("server_only")` — the
+/// response stopped describing the field the runtime always sends.
+#[test]
+fn a_request_and_a_response_are_described_by_their_own_contracts() {
+    let surface = HttpSurface::new("/v1", Addressing::Singleton).expect("valid surface");
+    let config = DocumentConfig::new(
+        "Asym",
+        "1.0.0",
+        Security::External {
+            description: "Ahead of the gateway.".to_owned(),
+        },
+    );
+    let document = document::<asym::External>(&surface, &config).expect("a document");
+    let operation = &document.value()["paths"]["/v1/rpc/Round"]["post"];
+
+    let resolve = |value: &Value| -> Value {
+        value.get("$ref").and_then(Value::as_str).map_or_else(
+            || value.clone(),
+            |reference| {
+                let name = reference
+                    .strip_prefix("#/components/schemas/")
+                    .expect("an OpenAPI reference");
+                document.value()["components"]["schemas"][name].clone()
+            },
+        )
+    };
+
+    let request = resolve(
+        &operation["requestBody"]["content"]["application/json"]["schema"]["properties"]["item"],
+    );
+    let response = resolve(&operation["responses"]["200"]["content"]["application/json"]["schema"]);
+
+    let request_properties = request["properties"].as_object().expect("an object");
+    let response_properties = response["properties"].as_object().expect("an object");
+
+    assert!(request_properties.contains_key("client_only"));
+    assert!(
+        !request_properties.contains_key("server_only"),
+        "a skip_deserializing field is not part of a request: {:?}",
+        request_properties.keys().collect::<Vec<_>>()
+    );
+    assert!(response_properties.contains_key("server_only"));
+    assert!(
+        !response_properties.contains_key("client_only"),
+        "a skip_serializing field is not part of a response: {:?}",
+        response_properties.keys().collect::<Vec<_>>()
+    );
+
+    // The cycle: serde agrees, on the same values.
+    let sent: Asymmetric =
+        serde_json::from_value(json!({ "both": 1, "client_only": 2 })).expect("serde accepts it");
+    assert_eq!(sent.server_only, 0, "a request cannot set it");
+    let back = serde_json::to_value(&sent).expect("serializable");
+    assert!(back.get("client_only").is_none(), "a response omits it");
+    assert!(back.get("server_only").is_some());
+}

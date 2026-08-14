@@ -255,6 +255,13 @@ async fn the_document_endpoints_serve_their_exact_media_types() {
 
 /// The four canonical surfaces, byte for byte.
 ///
+/// Watched red with `scripts/break-once.sh` (row `HL6`) by replacing
+/// `        let body = if media == "application/octet-stream" {`
+/// with `if false`, which publishes a `send`'s ARGUMENT OBJECT as its
+/// octet-stream body — the shape every generated client would then POST, and
+/// which the gateway answers with `InvalidStreamMetadata`. Terminated on a
+/// snapshot diff, `selected=1`.
+///
 /// Watched red with `scripts/break-once.sh` (row `HL3`) by replacing the
 /// octet-stream schema's
 /// `        "contentMediaType": "application/octet-stream",`
