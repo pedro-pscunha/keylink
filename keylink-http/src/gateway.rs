@@ -201,9 +201,6 @@ where
         if surface.addressing() != Addressing::Actors {
             return Err(ConfigError::WrongAddressing);
         }
-        if S::METHODS.is_empty() {
-            return Err(ConfigError::MissingRuntimeRoute);
-        }
         install(self, surface)
     }
 }
@@ -219,6 +216,15 @@ trait Mount: Send + Sync + 'static {
     /// parameter on every function that takes a mount.
     type Access: Access;
 
+    /// The generated inventory, readable before any address is decoded.
+    ///
+    /// Here so the empty-inventory refusal is made once. It used to live on
+    /// `ActorGateway::router` alone, while its own comment stated the rule as
+    /// general — and the singleton side can be empty too: `METHODS` carries one
+    /// entry per `rpc`, `send`, `recv` or `blob`, so a service declaring only
+    /// `tell` produces an empty one.
+    fn methods(&self) -> &'static [keylink::ExternalMethod];
+
     /// `None` when the path addresses nothing: on an actor surface a malformed
     /// id, and on a singleton surface never.
     fn surface<'a>(&'a self, path: &str, route_path: &str) -> Option<Surface<'a, Self::Access>>;
@@ -230,6 +236,10 @@ where
     A: Access,
 {
     type Access = A;
+
+    fn methods(&self) -> &'static [keylink::ExternalMethod] {
+        S::METHODS
+    }
 
     fn surface<'a>(&'a self, _path: &str, _route_path: &str) -> Option<Surface<'a, A>> {
         let client = &self.client;
@@ -253,6 +263,10 @@ where
     A: Access,
 {
     type Access = A;
+
+    fn methods(&self) -> &'static [keylink::ExternalMethod] {
+        S::METHODS
+    }
 
     /// The actor is decoded BEFORE anything else, because `Access` is asked
     /// about it and a policy must never be handed a raw path segment. A
@@ -310,6 +324,12 @@ fn install<M: Mount, State>(mount: M, contract: HttpSurface) -> Result<Router<St
 where
     State: Clone + Send + Sync + 'static,
 {
+    // An EMPTY generated inventory is refused here, for both address spaces. A
+    // surface that mounted one would answer per request instead of saying at
+    // startup that there is nothing to serve.
+    if mount.methods().is_empty() {
+        return Err(ConfigError::MissingRuntimeRoute);
+    }
     let Some(rpc) = contract
         .routes()
         .find(|route| route.kind() == RouteKind::Rpc)

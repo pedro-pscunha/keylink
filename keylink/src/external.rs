@@ -171,6 +171,65 @@ pub enum ExternalOutput<O> {
 /// require::<ledger::RegistryClient>();
 /// ```
 ///
+/// Nor does the addressed envelope the registry client sends, which is the
+/// shape an adapter would reach for if it decided to build the routing itself:
+///
+/// ```compile_fail,E0277
+/// use keylink::{Addressed, ExternalActorService};
+/// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalActorService>() {}
+/// require::<Addressed<ledger::Request>>();
+/// ```
+///
+/// Nor the unaddressed request inside it:
+///
+/// ```compile_fail,E0277
+/// use keylink::ExternalActorService;
+/// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalActorService>() {}
+/// require::<ledger::Request>();
+/// ```
+///
+/// Nor the generated reference to one mounted actor, which can call the
+/// service but is not the seam a gateway converts through:
+///
+/// ```compile_fail,E0277
+/// use keylink::ExternalActorService;
+/// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalActorService>() {}
+/// require::<ledger::ActorRef>();
+/// ```
+///
+/// The positive control, so "nothing implements it" is not trivially true —
+/// the generated marker does, and each probe above therefore measures a
+/// specific type's absence rather than an empty trait:
+///
+/// ```
+/// use keylink::ExternalActorService;
+/// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalActorService>() {}
+/// require::<ledger::External>();
+/// ```
+///
+/// Every refusal above is pinned to `E0277`, the unsatisfied-bound error. That
+/// pin is what makes them measurements: a probe naming a type that does not
+/// exist would fail to compile with `E0412` and rustdoc would report the test
+/// as failed, not passed.
+///
+/// And implementing [`crate::Rpc`] by hand does not opt a type in either:
+///
+/// ```compile_fail,E0277
+/// use keylink::{ExternalActorService, Rpc};
+/// struct Manual;
+/// impl Rpc for Manual {
+///     const SERVICE: &'static str = "Manual";
+///     const METHODS: &'static [&'static str] = &["Run"];
+///     fn method(&self) -> &'static str { "Run" }
+/// }
+/// fn require<T: ExternalActorService>() {}
+/// require::<Manual>();
+/// ```
+///
 /// # `send` and `tell` are absent, and that is not an oversight
 ///
 /// [`METHODS`](Self::METHODS) lists `rpc`, `recv` and `blob` only. A keyed

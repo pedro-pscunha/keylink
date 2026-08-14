@@ -121,3 +121,85 @@ fn hidden_contract_exposes_the_runtime_route_and_error_inventories() {
         .iter()
         .all(|kind| !kind.spec().code().is_empty()));
 }
+
+keylink::service! {
+    service Silent;
+    // `tell` is the one declaration that produces NO external method, so this
+    // is a service whose generated inventory is empty on both address spaces.
+    tell Ignored(value: u64) -> ();
+}
+
+#[derive(Clone)]
+struct Quiet;
+
+impl silent::Handler for Quiet {
+    async fn ignored(&self, _cx: &keylink::Context, _value: u64) {}
+}
+
+#[derive(Clone)]
+struct Anyone;
+
+impl keylink_http::Access for Anyone {
+    async fn authorize(
+        &self,
+        _call: keylink_http::Call<'_>,
+    ) -> Result<(), keylink_http::AccessError> {
+        Ok(())
+    }
+}
+
+/// A service with nothing to serve is refused at configuration, not per request.
+///
+/// `METHODS` carries one entry per `rpc`, `send`, `recv` or `blob`, so a
+/// `tell`-only service produces an EMPTY generated inventory. A surface that
+/// mounted one would install `/rpc/{method}` and answer every request from it,
+/// which says at request time what a builder can say at startup.
+///
+/// The refusal used to be written on `ActorGateway::router` alone, while its
+/// own comment stated the rule as general. It lives in `install` now, which
+/// both routers share, and this row is what holds it there — there was no test
+/// for it on either side.
+///
+/// **Only the singleton half is exercised, and the keyed half is unreachable
+/// rather than untested.** `keylink::Registry<M>` implements `Servable` only
+/// for a mailbox type carrying an `Rpc` request, and a `tell`-only service has
+/// none — `registry.service(..)` does not compile for `Silent`. So no keyed
+/// server for such a service can exist, and no `ActorGateway` over it can ever
+/// hold a connected client. The guard the two share is exercised by the half
+/// that can be built.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK45`) by replacing
+/// `    if mount.methods().is_empty() {`
+/// with `    if false {`. The router answered `Ok` where this asserts
+/// `MissingRuntimeRoute`.
+#[tokio::test]
+async fn an_empty_generated_inventory_is_refused_at_configuration() {
+    let server_node = keylink::Node::from_endpoint(
+        iroh::Endpoint::bind(iroh::endpoint::presets::Minimal)
+            .await
+            .expect("local endpoint binds"),
+    );
+    let client_node = keylink::Node::from_endpoint(
+        iroh::Endpoint::bind(iroh::endpoint::presets::Minimal)
+            .await
+            .expect("local endpoint binds"),
+    );
+    let _server = keylink::Server::builder(&server_node)
+        .service(silent::service(Quiet, keylink::Allowlist::anyone()).build())
+        .spawn()
+        .expect("a service with nothing external to serve");
+    let client = silent::Client::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("client connects");
+
+    let router = keylink_http::Gateway::<silent::External, _>::new(
+        client,
+        Anyone,
+        Challenge::new(HeaderValue::from_static("Bearer realm=keylink")).expect("valid challenge"),
+    )
+    .router::<()>(
+        keylink_http::HttpSurface::new("/v1", keylink_http::Addressing::Singleton)
+            .expect("valid singleton surface"),
+    );
+    assert!(matches!(router, Err(ConfigError::MissingRuntimeRoute)));
+}

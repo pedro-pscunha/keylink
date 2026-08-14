@@ -626,6 +626,75 @@ mod tests {
 
     use super::{Addressing, ErrorKind, HttpSurface, Route, RouteKind};
 
+    /// A keyed route differs from its singleton twin in its ADDRESS, and in
+    /// nothing else.
+    ///
+    /// The two halves of `ROUTES` are written by hand, and each keyed row
+    /// restates the verb, the success status, both media types and the
+    /// streaming flag that the singleton row of the same kind already fixed.
+    /// Only `kind` and `template` were compared by any test, so a change to one
+    /// half that was not mirrored onto the other passed the whole suite: change
+    /// the singleton `Recv` row's request media and the keyed one keeps the old
+    /// value, after which `is_media` accepts on one address space and refuses on
+    /// the other, silently.
+    ///
+    /// Task 7 generates the published document from this same table, so a
+    /// divergence would ship as a contract the gateway does not keep.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK46`) by replacing the
+    /// keyed `Recv` row's
+    /// `template: "/{actor}/recv/{method}", method: http::Method::POST, success: http::StatusCode::OK, request_media: Some("application/json"),`
+    /// with the same block carrying `application/cbor`. The literal spans four
+    /// lines because `request_media: Some("application/json"),` alone appears
+    /// in several rows and would resolve ambiguously.
+    ///
+    /// Terminated on `Recv: request_media`, `left: Some("application/cbor")`
+    /// against `right: Some("application/json")`.
+    #[test]
+    fn a_keyed_route_differs_from_its_singleton_twin_only_in_its_address() {
+        let singleton: Vec<&Route> = super::ROUTES
+            .iter()
+            .filter(|route| route.addressing == Addressing::Singleton)
+            .collect();
+        let keyed: Vec<&Route> = super::ROUTES
+            .iter()
+            .filter(|route| route.addressing == Addressing::Actors)
+            .collect();
+        assert!(
+            !keyed.is_empty(),
+            "control: there are keyed rows to compare"
+        );
+
+        let mut compared = 0;
+        for keyed in keyed {
+            let Some(twin) = singleton.iter().find(|route| route.kind == keyed.kind) else {
+                // A keyed kind with no singleton twin is a decision, not a
+                // drift. There is none today; if one appears, it belongs here.
+                panic!(
+                    "{:?} is keyed-only and this row does not cover it",
+                    keyed.kind
+                );
+            };
+            let kind = keyed.kind;
+            assert_eq!(&keyed.method, &twin.method, "{kind:?}: method");
+            assert_eq!(keyed.success, twin.success, "{kind:?}: success");
+            assert_eq!(
+                keyed.request_media, twin.request_media,
+                "{kind:?}: request_media"
+            );
+            assert_eq!(
+                keyed.response_media, twin.response_media,
+                "{kind:?}: response_media"
+            );
+            assert_eq!(keyed.streaming, twin.streaming, "{kind:?}: streaming");
+            // And the one field that MUST differ, so this row cannot be
+            // satisfied by two identical tables.
+            assert_ne!(keyed.template, twin.template, "{kind:?}: template");
+            compared += 1;
+        }
+        assert_eq!(compared, 5, "every keyed row was compared against its twin");
+    }
+
     /// One inventory, two address spaces, and a surface serves exactly one.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK27`) by replacing
