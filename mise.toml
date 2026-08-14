@@ -312,6 +312,11 @@ description = "Every example RUNS. Building one asserts nothing"
 # here, and a reviewer who notices it is missing is the only check there is.
 run = [
     "cargo run -p keylink --example reliable_call",
+    "cargo run -p keylink --example payment_approval",
+    "cargo run -p keylink --example firmware_depot",
+    "cargo run -p keylink --example match_room",
+    "cargo run -p keylink --example trading_desk",
+    "cargo run -p keylink --example substation",
     "cargo run -p keylink --example durable_ledger",
     { task = "http-smoke" },
     { task = "http-smoke-full" },

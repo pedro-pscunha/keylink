@@ -1983,6 +1983,10 @@ impl<M> Registry<M> {
     /// observer's refusal can therefore return `Stopped` while a pre-existing
     /// `ended` subscriber receives `Ended::Observer`.
     ///
+    /// `None` means the id was not mounted, which is a different fact from a
+    /// drain that failed. Discarding it silently turns "there was no such
+    /// actor" into "stopped", so the answer is `#[must_use]`.
+    #[must_use = "None means the id was never mounted, which is not the same as a stop that worked"]
     pub async fn stop(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
         let entry = self.inner.write().remove(id)?;
         let ended = drain(Arc::clone(&self.inner), id.clone(), entry, budget).await;

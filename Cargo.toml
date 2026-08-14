@@ -51,6 +51,17 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 all = { level = "deny", priority = -1 }
 expect_used = "deny"
 unwrap_used = "deny"
+# One module-file layout, held by the gate rather than by habit.
+# `keylink/src/actor/mod.rs` and `keylink/src/compose/mod.rs` are the only
+# directory modules in the workspace, so this is a no-op on the tree as it
+# stands and a refusal on the first `foo.rs` written beside a `foo/`.
+#
+# The name reads backwards from what it sounds like: `self_named_module_files`
+# DENIES `foo.rs` beside `foo/`, which is the layout this workspace does not
+# use. It is in the `restriction` group, which is allow-by-default, so
+# `clippy::all` never sees it and every member picks it up through
+# `[lints] workspace = true`.
+self_named_module_files = "deny"
 
 # ── the dev profile ─────────────────────────────────────────────────────────
 

@@ -177,9 +177,10 @@ client.with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
 client.key_state(key).await?   // Fresh means the ledger holds nothing for this key
 ```
 
-The record is in memory and dies with the process. Composed with a reconnecting
-handle it is effectively-once for one `rpc`, which is the recipe below; RFC-05 has
-the reasoning.
+The record is in memory by default and dies with the process. `Records::Durable`
+puts it on a disk instead, at two `fsync`s per keyed call. Composed with a
+reconnecting handle it is effectively-once for one `rpc`, which is the recipe
+below; RFC-05 has the reasoning.
 
 ### Departure
 
@@ -531,18 +532,37 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    `IdempotentClient`, which has no `tell` method, so this limit is one the
    compiler enforces rather than one you have to remember. Work that has to
    arrive is an `rpc`.
-2. **The ledger is memory, so across a restart the guarantee is yours to keep.**
-   The ledger dies with the process. `keylink-persist` makes an actor's *state*
-   durable and does nothing for the ledger; keylink has no journal and this is not
-   one.
+2. **The ledger is memory by default, so across a restart the guarantee is yours
+   to keep — or you buy it.** `Records::Memory` dies with the process.
+   `Records::Durable` writes each record through `keylink-persist`'s entry port
+   and survives one, which costs two `fsync`s per keyed call: one before the
+   handler is entered and one before its reply is written.
 
-   **Durable state makes that sharper, not milder.** While nothing survived a
-   restart, re-running a retried call was *correct* — a fresh process had a fresh
-   state. It is not correct any more. A process that fsyncs turn *n*, records the
-   reply in the in-memory ledger, and dies before the frame reaches the peer will,
-   on restart, load a state that already contains *n*, find an empty ledger, and
-   run *n* again. The state is durable and the record that would have suppressed
-   the repeat is not.
+   **Durable state is what made the default sharp rather than mild.** While
+   nothing survived a restart, re-running a retried call was *correct* — a fresh
+   process had a fresh state. It stopped being correct the moment state became
+   durable. A process that fsyncs turn *n*, records the reply in an in-memory
+   ledger, and dies before the frame reaches the peer will, on restart, load a
+   state that already contains *n*, find an empty ledger, and run *n* again. That
+   is the pairing `Records::Durable` exists for, and it is why a service with
+   durable state should think twice before leaving the ledger at the default.
+
+   What no store makes durable is the **in-flight** half. A key claimed when the
+   process died comes back `Interrupted` — unknown — because the caller it
+   belonged to held a live stream, and no disk carries one of those forward.
+
+   **A store that refuses a write is answered, not swallowed, and the two
+   refusals are on opposite sides of the handler.** If it cannot write the
+   *claim*, nothing ran and the caller is told `NotClaimed` — the same key is
+   safe to send again. If it cannot write the *settle*, the call ran and its
+   reply is discarded rather than sent, which is `Unrecordable`; a reply this
+   ledger cannot replay is a reply the caller would ask for again. Neither is
+   `Interrupted`, which means the handler produced nothing at all.
+
+   **`Records::Durable` on a service that accepts no idempotency key is refused
+   at startup**, as `ConfigError::DurableWithoutKeys`. No ledger is built, so the
+   store would be held and never written — and its exclusive claim on the log
+   file would refuse the next service that meant to use it.
 
    So **effectively-once is a property of one process's lifetime, not of a key** —
    for as long as the only thing that knows about the key is the ledger.
@@ -585,6 +605,13 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    with no `fsync` behind it is ~13 µs, where 4096 entries is well under a second.
    Measure and divide, and treat the count as the guarantee.
 
+   **That 7.6 ms is a macOS number and it does not carry to Linux.**
+   `std::fs::File::sync_data` issues `F_FULLFSYNC` on macOS, which asks the drive to
+   flush its own write cache — measured at about **12x** a plain `libc::fsync`,
+   5498 µs against 462 µs. On Linux the same call is `fdatasync`, so a Linux
+   deployment is faster by roughly that order and every figure derived from 7.6 ms
+   in this file is pessimistic there. Measure on the platform you will run on.
+
    **And the set is a term in that turn rate, so measure at the bound you mean to
    run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
    costs its entries on every turn whether one changed or not — 4096 entries is
@@ -601,18 +628,21 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    client supplies both, and it is the new work that spends the bound.
 
    **What this does not buy, in full.** The duplicate still *enters the handler*
-   and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
+   and still costs a turn — about 7.6 ms of `fsync` on macOS, less on Linux, on a
+   state it did not change —
    because only a durable ledger could refuse it before dispatch, and that one is
    structural: the record lives in your state, so reaching it means dispatching to
    your state. And the dedupe is yours to write, because the correct version knows
    what your answer is and whether replaying it beats refusing.
 
-   Separately, and *as the tree stands today*: `key_state(key)` answers `Fresh`
-   after a restart, because the ledger it reads is memory. A peer therefore learns
-   nothing about a key your domain is about to dedupe. That is a property of the
-   ledger being volatile rather than a limit of the query — a durable record store
-   would answer it again, with nothing here changing — so read it as the current
-   state and not as a closed door.
+   Separately: `key_state(key)` answers `Fresh` after a restart on a
+   `Records::Memory` service, so a peer learns nothing about a key your domain is
+   about to dedupe. This paragraph used to add *as the tree stands today*, and
+   predicted that "a durable record store would answer it again, with nothing
+   here changing". It does, and nothing here changed: on `Records::Durable` the
+   query answers `Done` after a restart. **What did not come back is the cost
+   above it** — a duplicate entering the handler is a consequence of the record
+   living in your state, and no store on a disk alters that.
 
    **It also rests on the calling peer keeping its identity.** The peer is in the
    hash, so a client that reconnects on a fresh keypair is a different caller, is

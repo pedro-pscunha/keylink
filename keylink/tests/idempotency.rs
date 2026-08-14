@@ -2054,3 +2054,503 @@ async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
         "the turn ran exactly once, which is what the caller could not be told before"
     );
 }
+
+// ────────────────────────────────── the ledger that outlives its own process
+
+// Everything below drives the **real** file store on a temp directory, which is
+// the house rule `keylink/tests/persist.rs` states: a mocked port cannot exhibit
+// the failure these tests are about, because the failure IS a disk.
+//
+// **A module rather than a file**, which is the difference from
+// `keylink/tests/persist.rs` and its `#![cfg(feature = "persist-file")]`. Every
+// test above this line is feature-independent and has to keep compiling at
+// `--no-default-features`, so the condition goes here and not at the top.
+//
+// That is not a preference. `.mise/tasks/features` runs
+// `cargo check -p keylink --all-targets --no-default-features`, and it is what
+// caught this block naming `keylink_persist` unconditionally — five errors, in a
+// gate that had already passed lint, docs and the whole test suite.
+#[cfg(feature = "persist-file")]
+mod stored {
+    use super::*;
+
+    /// A scratch directory that removes itself.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("keylink-idempotency-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The name every durable test stores under.
+    fn ledger_id() -> keylink_persist::StateId {
+        keylink_persist::StateId::new("till/ledger").expect("a valid id")
+    }
+
+    /// `till`, served through a record store on `root`.
+    ///
+    /// **The client's secret is a parameter and the server's is not**, because a
+    /// record is keyed on the peer the *server* proved. A restart that dialled from
+    /// a fresh identity would read `Fresh` whatever the disk held, and would be
+    /// measuring the key rather than the ledger.
+    ///
+    /// `limit` is the adapter's per-record ceiling, which is how these tests make a
+    /// real store refuse a real write.
+    async fn start_durable(
+        root: &std::path::Path,
+        limit: u64,
+        caller: [u8; 32],
+    ) -> (Fixture, Counter) {
+        start_durable_as(root, limit, caller, Limits::default(), false).await
+    }
+
+    /// The same, with the two knobs only one test each needs.
+    ///
+    /// `limits` shrinks a pool so an eviction is one call away instead of a
+    /// thousand. `refusing` puts a layer in front that refuses the first call
+    /// **without calling through**, which is the one path that releases a claim
+    /// rather than settling it.
+    async fn start_durable_as(
+        root: &std::path::Path,
+        limit: u64,
+        caller: [u8; 32],
+        limits: Limits,
+        refusing: bool,
+    ) -> (Fixture, Counter) {
+        let files = keylink_persist::file::Files::open(root)
+            .await
+            .expect("opens")
+            .limit(limit);
+        let records = keylink::DurableRecords::open(&files, &ledger_id())
+            .await
+            .expect("nobody else holds this ledger");
+
+        let reserves = Counter::default();
+        let till = Till {
+            reserves: reserves.clone(),
+            ..Till::default()
+        };
+
+        let server = local_node().await;
+        let client_node = Node::bind_local_with_secret(keylink::SecretKey::from_bytes(&caller))
+            .await
+            .expect("binds");
+        let mut service = till::service(till, Allowlist::anyone())
+            .records(Records::Durable(records))
+            .limits(limits);
+        if refusing {
+            service = service.layer(RefuseOnce(AtomicU64::new(0)));
+        }
+        let running = KeylinkServer::builder(&server)
+            .service(service.build())
+            .spawn()
+            .expect("one service, no duplicate ALPN");
+        let client = till::Client::connect(&client_node, server.endpoint().addr())
+            .await
+            .expect("the client dials the server");
+
+        (
+            Fixture {
+                client,
+                _server: running,
+                _nodes: vec![server, client_node],
+            },
+            reserves,
+        )
+    }
+
+    /// The whole file store's ceiling when a test is not trying to break it.
+    const ROOMY: u64 = 64 * 1024;
+
+    /// The claim record's exact size: nine bytes of framing, a 32-byte peer id, the
+    /// key, and one byte of state.
+    ///
+    /// A ceiling set to exactly this admits every claim and refuses every settled
+    /// record, because a settled record is the same thing with a reply frame after
+    /// it. The two writes are told apart by their size and by nothing else, which is
+    /// what lets a test refuse one of them through the real adapter.
+    const fn claim_record(key: &str) -> u64 {
+        9 + 32 + key.len() as u64 + 1
+    }
+
+    /// A key answered before a restart is still answered after one.
+    #[tokio::test]
+    async fn a_settled_key_survives_the_process_that_settled_it() {
+        let scratch = Scratch::new("survives");
+        let caller = [7_u8; 32];
+
+        let first = {
+            let (fixture, runs) = start_durable(&scratch.0, ROOMY, caller).await;
+            let first = fixture
+                .client
+                .with_idempotency(key("reserve-4471"))
+                .reserve("ADU-014".to_string(), 2)
+                .await
+                .expect("the first call runs");
+            assert_eq!(runs.runs(), 1);
+            first
+        };
+
+        let (fixture, runs) = start_durable(&scratch.0, ROOMY, caller).await;
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("reserve-4471"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Done,
+            "a settled key must not read Fresh after a restart"
+        );
+
+        let again = fixture
+            .client
+            .with_idempotency(key("reserve-4471"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("the repeat is answered");
+        assert_eq!(
+            again, first,
+            "the repeat must be answered from the store, byte for byte"
+        );
+        assert_eq!(
+            runs.runs(),
+            0,
+            "this process's handler must never have been entered"
+        );
+    }
+
+    /// The record is on the disk before the reply is on the wire.
+    ///
+    /// Red-tested by discarding `write_settled`'s error in `Guard::record` — which
+    /// is what "store it afterwards" amounts to from here. The caller is then
+    /// answered `1`, this `expect_err` fires, and the run below it never happens.
+    #[tokio::test]
+    async fn a_reply_is_not_sent_before_its_record_is_stored() {
+        const KEPT_OUT: &str = "kept-out";
+
+        let scratch = Scratch::new("record-first");
+        let (fixture, runs) = start_durable(&scratch.0, claim_record(KEPT_OUT), [8_u8; 32]).await;
+
+        let error = fixture
+            .client
+            .with_idempotency(key(KEPT_OUT))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect_err("the store could not hold the record, so the reply is not sent");
+        assert_eq!(
+            refusal(&error),
+            IdempotencyRefusal::Unrecordable,
+            "it ran and the reply is not something this ledger can hold, which is \
+             Unrecordable word for word - Interrupted says no reply came out at all"
+        );
+
+        // It DID run. That is the whole reason the caller must not be told it
+        // succeeded — and the reason the answer is not a refusal that invites an
+        // immediate retry.
+        assert_eq!(
+            runs.runs(),
+            1,
+            "the handler ran before the record was tried"
+        );
+
+        let again = fixture
+            .client
+            .with_idempotency(key(KEPT_OUT))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect_err("still unknown");
+        assert_eq!(refusal(&again), IdempotencyRefusal::Unrecordable);
+        assert_eq!(
+            runs.runs(),
+            1,
+            "a key whose record failed must not be free to run again"
+        );
+    }
+
+    /// A durable store on a service that accepts no key is refused at startup.
+    ///
+    /// `Keyable::None` builds no ledger, so the store is never read and never
+    /// written — and it holds the exclusive claim on its log file for as long
+    /// as the service lives. The next service configured to use that ledger
+    /// properly is then told `Busy` by one that will never write a record.
+    ///
+    /// `a_second_process_cannot_claim_a_running_actor` in
+    /// `keylink/tests/durable.rs` is the other end of the same rope: it asserts
+    /// the `Busy`, and this asserts that a misconfiguration cannot be the
+    /// reason for one.
+    #[tokio::test]
+    async fn a_durable_store_without_keys_is_refused_at_startup() {
+        let scratch = Scratch::new("durable-without-keys");
+        let files = keylink_persist::file::Files::open(&scratch.0)
+            .await
+            .expect("opens");
+        let records = keylink::DurableRecords::open(&files, &ledger_id())
+            .await
+            .expect("nobody else holds this ledger");
+
+        let server = local_node().await;
+        let service = till::service(Till::default(), Allowlist::anyone())
+            .keyable(Keyable::None)
+            .records(Records::Durable(records))
+            .build();
+
+        let error = KeylinkServer::builder(&server)
+            .service(service)
+            .spawn()
+            .expect_err("a store held and never written must refuse startup");
+
+        assert!(
+            matches!(error, Error::Config(ConfigError::DurableWithoutKeys)),
+            "got {error:?}"
+        );
+    }
+
+    /// A key claimed when the process died comes back `Interrupted`.
+    ///
+    /// Not `Fresh`, which would run the work a second time, and not `Done`, which
+    /// would invent a reply nobody produced.
+    #[tokio::test]
+    async fn an_unsettled_key_recovers_as_interrupted() {
+        let scratch = Scratch::new("unsettled");
+        let caller = [9_u8; 32];
+
+        {
+            let (fixture, _runs) = start_durable(&scratch.0, ROOMY, caller).await;
+            let client = fixture.client.clone();
+            let calling = tokio::spawn(async move {
+                client
+                    .with_idempotency(key("in-flight"))
+                    .slow(600_000)
+                    .await
+            });
+
+            // Polled rather than slept: the claim is what this test is about, so it
+            // waits for the claim itself instead of for a duration that happens to
+            // be long enough on this machine.
+            let mut claimed = false;
+            for _ in 0..200 {
+                if fixture
+                    .client
+                    .key_state(key("in-flight"))
+                    .await
+                    .expect("asks")
+                    == keylink::KeyState::Running
+                {
+                    claimed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(claimed, "the call never reached the ledger");
+
+            // The process ending, as closely as one test can spell it: the caller
+            // stops waiting and the service stops existing, with the handler still
+            // inside its turn.
+            calling.abort();
+            drop(fixture);
+        }
+
+        let (fixture, runs) = start_durable(&scratch.0, ROOMY, caller).await;
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("in-flight"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Interrupted,
+            "a claim that outlived its process is unknown, not vacant"
+        );
+
+        let error = fixture
+            .client
+            .with_idempotency(key("in-flight"))
+            .slow(0)
+            .await
+            .expect_err("the key is not free");
+        assert_eq!(refusal(&error), IdempotencyRefusal::Interrupted);
+        assert_eq!(
+            runs.runs(),
+            0,
+            "nothing about the recovered key may enter a handler"
+        );
+    }
+
+    /// A refusal before dispatch leaves the key claimable, and a restart must not
+    /// take that back.
+    ///
+    /// `keylink/src/idempotency.rs`'s own header promises it: a refusal that never
+    /// reached the handler leaves the key claimable, because that refusal is proof
+    /// nothing ran and nothing is owed. The claim is written to the disk before the
+    /// layer runs, so without a removal the disk outlives the release and the key
+    /// comes back `Interrupted` — permanently unknown, for work that provably never
+    /// happened.
+    ///
+    /// Red-tested by deleting the `pending.push` in `Ledger::release`.
+    #[tokio::test]
+    async fn a_key_released_before_dispatch_is_vacant_after_a_restart() {
+        let scratch = Scratch::new("released");
+        let caller = [11_u8; 32];
+
+        {
+            let (fixture, runs) =
+                start_durable_as(&scratch.0, ROOMY, caller, Limits::default(), true).await;
+            let refused = fixture
+                .client
+                .with_idempotency(key("order-9"))
+                .reserve("ADU-014".to_string(), 2)
+                .await
+                .expect_err("the layer refuses without calling through");
+            assert!(
+                matches!(refused, Error::Remote(RemoteError::Unauthorized(_))),
+                "got {refused:?}"
+            );
+            assert_eq!(runs.runs(), 0, "nothing was dispatched");
+            assert_eq!(
+                fixture
+                    .client
+                    .key_state(key("order-9"))
+                    .await
+                    .expect("asks"),
+                keylink::KeyState::Fresh,
+                "a released key is vacant in memory"
+            );
+        }
+
+        let (fixture, runs) = start_durable(&scratch.0, ROOMY, caller).await;
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("order-9"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Fresh,
+            "and it must still be vacant after a restart"
+        );
+        let ran = fixture
+            .client
+            .with_idempotency(key("order-9"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("the key was never spent");
+        assert_eq!((ran, runs.runs()), (1, 1), "the retry is a first attempt");
+    }
+
+    /// A reply the ledger dropped does not come back from the disk.
+    ///
+    /// **Driven by the TTL and not by `pool_records`, and that is the whole
+    /// design of the test.** A pool eviction is reproducible from the recovered
+    /// set — `Ledger::new` runs `evict` before it answers anything — so a
+    /// version of this test that shrank the pool passed with the durable
+    /// downgrade deleted, and measured recovery's own eviction instead of the
+    /// disk. The age clock cannot be reproduced: `Instant` measures this
+    /// process's uptime, so every recovered entry is stamped `now`. A `Done`
+    /// left on the disk therefore comes back `Done`, which is the difference
+    /// this asserts.
+    ///
+    /// Red-tested by deleting the `pending` extension in `Ledger::expire`: the
+    /// restart then reads `Done` and replays a reply the ledger had dropped.
+    #[tokio::test]
+    async fn a_reply_dropped_by_its_ttl_does_not_come_back_as_done() {
+        let scratch = Scratch::new("forgotten");
+        let caller = [12_u8; 32];
+        let brief = || Limits::default().ttl(Duration::from_millis(50));
+
+        {
+            let (fixture, _runs) =
+                start_durable_as(&scratch.0, ROOMY, caller, brief(), false).await;
+            fixture
+                .client
+                .with_idempotency(key("order-0"))
+                .reserve("ADU-014".to_string(), 2)
+                .await
+                .expect("runs");
+
+            tokio::time::sleep(Duration::from_millis(80)).await;
+
+            // The first claim expires `order-0` and queues its downgrade; the
+            // second drains the queue, because a claim housekeeps before it
+            // claims. Two calls rather than a sleep on the drain, so the test
+            // waits for the mechanism instead of for a duration.
+            for n in 1..3 {
+                fixture
+                    .client
+                    .with_idempotency(key(&format!("order-{n}")))
+                    .reserve("ADU-014".to_string(), 2)
+                    .await
+                    .expect("runs");
+            }
+            assert_eq!(
+                fixture
+                    .client
+                    .key_state(key("order-0"))
+                    .await
+                    .expect("asks"),
+                keylink::KeyState::Forgotten,
+                "the first reply aged out"
+            );
+        }
+
+        let (fixture, runs) = start_durable_as(&scratch.0, ROOMY, caller, brief(), false).await;
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("order-0"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Forgotten,
+            "a dropped reply must not return, and at-most-once must still hold"
+        );
+        let refused = fixture
+            .client
+            .with_idempotency(key("order-0"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect_err("the key is spent");
+        assert_eq!(refusal(&refused), IdempotencyRefusal::Forgotten);
+        assert_eq!(runs.runs(), 0, "a tombstone must not enter a handler");
+    }
+
+    /// The default is unchanged: a service that never names `records` holds its
+    /// replies in memory and loses them with the process.
+    #[tokio::test]
+    async fn a_service_that_names_no_records_still_forgets_on_a_restart() {
+        let fixture = start().await;
+        let first = fixture
+            .client
+            .with_idempotency(key("reserve-4471"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("runs");
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("reserve-4471"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Done
+        );
+        drop(fixture);
+
+        let fixture = start().await;
+        assert_eq!(
+            fixture
+                .client
+                .key_state(key("reserve-4471"))
+                .await
+                .expect("asks"),
+            keylink::KeyState::Fresh,
+            "an unconfigured service keeps the behaviour it had before Durable existed"
+        );
+        assert_eq!(first, 1);
+    }
+}

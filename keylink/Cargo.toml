@@ -255,6 +255,13 @@ workspace = true
 name = "durable_ledger"
 required-features = ["persist-file"]
 
+# The same rule, for the same reason. `payment_approval` stores the treasury
+# through `Persist` and the `Files` adapter, so it needs the half of the feature
+# that brings a filesystem with it.
+[[example]]
+name = "payment_approval"
+required-features = ["persist-file"]
+
 # The authoritative gate combines native integration modules into one libtest
 # process. `test = false` keeps ordinary `cargo test` and `clippy --all-targets`
 # from running/linting the same sources twice; the canonical tasks select it by name.

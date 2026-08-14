@@ -244,6 +244,13 @@ Every `pub` item is a compatibility promise. Before you add one:
   deliberately exhaustive: it names exactly three outcomes — we closed it, the
   peer closed it cleanly, it broke — and the open-ended part lives inside
   `Transport`, which is `#[non_exhaustive]`.
+  - **One exception, and it is about features rather than about errors:**
+    an enum with a **feature-gated variant** is `#[non_exhaustive]` whatever
+    else it is. `Records` is the case — its `Durable` variant is behind
+    `persist`. Cargo unifies features across a build, so a downstream crate
+    matching it exhaustively compiles while nothing enables `persist` and stops
+    compiling when an unrelated crate in the same build turns it on. That break
+    is not the downstream author's to cause or to prevent.
 - One way to build a thing. `RpcService::new` and the crate-root `serve` were
   removed because they were a second construction path that could not take
   middleware layers, so the shorter door quietly did less than the longer one.

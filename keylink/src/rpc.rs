@@ -407,9 +407,21 @@ async fn claim_key(
     if let Err(error) = idem.key().validate() {
         return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
+    // Before the claim rather than after, so that the one place a caller is
+    // already waiting to start work is the place that pays for the store's
+    // housekeeping — and never the path that is holding a finished reply.
+    //
+    // It reports nothing on purpose, and its own doc says why.
+    //
+    // Here and not inside `claim_durably`, which is also reached by the two
+    // ATTACH paths below. An attaching caller never receives `Claim::Fresh`, so
+    // it is not the caller the paragraph above describes — and `housekeep`
+    // takes the same store lock `Guard::record` needs, so an attacher's
+    // housekeeping could block the very settle it is parked waiting for.
+    ledger.housekeep().await;
     let key = idem.key().clone();
 
-    let notify = match ledger.claim(peer, key.clone()) {
+    let notify = match ledger.claim_durably(peer, key.clone()).await {
         Claim::Running(notify) => notify,
         settled => return resolve(settled),
     };
@@ -461,14 +473,14 @@ async fn claim_key(
     // under load.
     notified.as_mut().enable();
 
-    match ledger.claim(peer, key.clone()) {
+    match ledger.claim_durably(peer, key.clone()).await {
         Claim::Running(_) => {}
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
-    resolve(ledger.claim(peer, key))
+    resolve(ledger.claim_durably(peer, key).await)
 }
 
 /// Write a recorded reply again, byte for byte.
@@ -705,11 +717,17 @@ where
     // nothing about ids. Neither could record this on its own, which is why the
     // reply carries the address back here through `Granting` rather than the
     // store being threaded down into dispatch.
-    if let (Some(blobs), Outcome::Ok(response)) = (&blobs, &outcome) {
-        if let Some(id) = response.granted() {
-            blobs.grant(&admitted, id);
-        }
-    }
+    //
+    // **Read here and recorded after the ledger settles**, which is a
+    // consequence of a durable ledger being able to refuse. A grant written
+    // above and a record refused below would leave the far side holding a live
+    // grant for an address this reply never carried — reachable only since
+    // `record` gained a failure, and closed by moving the write rather than by
+    // narrowing it.
+    let granting = match (&blobs, &outcome) {
+        (Some(_), Outcome::Ok(response)) => response.granted(),
+        _ => None,
+    };
 
     let frame = wire::encode_header(
         body.declared_len(),
@@ -727,15 +745,36 @@ where
     // A reply with a payload behind it is recorded as unrecordable rather than
     // as itself. Bodies are streamed and never held, and a header replayed
     // without its payload decodes into a body that never arrives.
+    //
+    // A durable ledger is the one that can REFUSE to settle. Its `record` does
+    // not resolve until the record is on the disk, and if it cannot be, the
+    // reply below is never written: a reply this service cannot replay is a
+    // reply the caller will ask for again, and answering it once would be
+    // exactly the double execution the key was sent to prevent.
     if let Some(guard) = keyed {
         match progress.reached() {
-            Reached::Completed => guard.record(&frame, body.declared_len() != Some(0)),
-            // A layer said no without calling through; or the work was entered,
-            // or merely reached a mailbox, and produced nothing. Dropping the
-            // guard is what settles those, and it settles them the same way
-            // whether this task returned or was aborted.
-            Reached::NotDispatched | Reached::Dispatched => drop(guard),
+            Reached::Completed => {
+                if let Err(refusal) = guard.record(&frame, body.declared_len() != Some(0)).await {
+                    return refuse::<Resp>(&mut send, refusal).await;
+                }
+            }
+            // A layer said no WITHOUT calling through. Nothing ran and nothing
+            // is owed, so the key goes back — and on a durable service the
+            // store has to hear that before this refusal reaches the caller,
+            // for the same reason a settle does. Queuing it would be enough
+            // only if another call followed, and a refused call is often the
+            // last thing a process does.
+            Reached::NotDispatched => guard.give_back_durably().await,
+            // The work was entered, or merely reached a mailbox, and produced
+            // nothing. Dropping the guard settles that, and settles it the same
+            // way whether this task returned or was aborted. The disk already
+            // holds the claim, and a claim is what recovers as `Interrupted`,
+            // so the two agree with no write at all.
+            Reached::Dispatched => drop(guard),
         }
+    }
+    if let (Some(blobs), Some(id)) = (&blobs, granting) {
+        blobs.grant(&admitted, id);
     }
     wire::write_frame(&mut send, frame).await?;
     body.write_to(&mut send).await?;
@@ -1705,7 +1744,10 @@ where
     ///
     /// # It is not free, and [`Records`] is where the cost is written
     ///
-    /// The key state never leaves memory whatever this says. **What
+    /// The key state never leaves memory under either of the first two
+    /// settings, and [`Records::Durable`] is the third — the one that puts it on
+    /// a disk, and the one that charges two `fsync`s per keyed call to do it.
+    /// **What
     /// [`Records::None`] does shorten is the at-most-once *window*, by about a
     /// ninth**, because a settled key skips the record pool and enters the tombstone
     /// pool directly. That lands on the one degradation a caller cannot detect: past
@@ -1771,6 +1813,18 @@ where
                     service: Req::SERVICE,
                     named: named.to_owned(),
                 });
+        // A service that accepts no key builds no ledger, so nothing ever takes
+        // the recovered records or writes one. The `DurableRecords` still lives
+        // in `Keys` and still holds the exclusive claim on the log file, so a
+        // correctly configured second service on the same `StateId` is told
+        // `Busy` by a service that will never use it.
+        //
+        // A second statement rather than an `.or_else` on the chain above,
+        // because the chain's `.first_unknown` line is a registered break
+        // anchor and growing the expression makes the formatter re-indent it.
+        let held_and_unused = !self.keyable.needs_a_ledger() && self.records.stores_durably();
+        let configuration =
+            configuration.or_else(|| held_and_unused.then_some(ConfigError::DurableWithoutKeys));
         let mut chain = self.base;
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);

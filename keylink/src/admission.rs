@@ -74,7 +74,7 @@ use iroh::EndpointId;
 use crate::{AdmittedPeer, Allowlist, ProvenPeer, Subscribers, Watch};
 
 /// The close code for a peer a policy refused.
-const REFUSED: u32 = 1;
+pub(crate) const REFUSED: u32 = 1;
 
 /// The close code for a peer whose policy could not be reached.
 ///
@@ -82,7 +82,43 @@ const REFUSED: u32 = 1;
 /// list" retries never, and one that is told "ask again" retries later, and
 /// giving them the same code makes an outage look like a revocation to every
 /// peer at once.
-const UNAVAILABLE: u32 = 2;
+pub(crate) const UNAVAILABLE: u32 = 2;
+
+/// Why the far side's admission policy closed a connection.
+///
+/// Admission runs one layer above the handshake, so a refused peer *connects*
+/// and then fails on its first call. Both outcomes reach the caller as
+/// [`Error::Transport`](crate::Error::Transport) and read exactly like a lost
+/// link. [`Error::refusal`](crate::Error::refusal) is what tells them apart.
+///
+/// The two variants are separate for the reason the `UNAVAILABLE` close code is
+/// separate from `REFUSED`: one means stop, and the other means try later.
+/// Collapsing them makes an outage look like a revocation to every peer at once.
+///
+/// Exhaustive, and for [`Admittance`]'s reason rather than by omission: these
+/// are the two answers that policy produces, a caller has to act differently on
+/// each, and a wildcard arm is exactly the collapse the type exists to prevent.
+/// The `Option` around it already carries "not an admission decision".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The policy said no. **Stop.** Retrying changes nothing until the policy
+    /// does, and the caller needs access rather than a backoff.
+    Denied,
+    /// The policy could not be reached. **Try later.** Nothing was decided
+    /// about this caller.
+    Unavailable,
+}
+
+impl Refusal {
+    /// Read one back off a QUIC application-close code.
+    pub(crate) const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            c if c == REFUSED as u64 => Some(Self::Denied),
+            c if c == UNAVAILABLE as u64 => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
 
 /// What a policy says about a proven peer.
 ///

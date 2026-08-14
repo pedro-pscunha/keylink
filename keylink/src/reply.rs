@@ -139,9 +139,13 @@ pub enum RemoteError {
     /// nothing in keylink matches on it.
     ///
     /// **The one in-crate exception is named here rather than left in a comment
-    /// four thousand lines away**, which is where it lived and where no reader of
-    /// this variant would meet it: `turns.rs`'s `deliver_unkeyed` answers a
-    /// `Failed` on its `NotQueued::Reentrant` arm, carrying
+    /// four thousand lines away**, which is where it lived and where no reader
+    /// of this variant would meet it. There were two: `write_claim`'s is gone,
+    /// minted as [`IdempotencyRefusal::NotClaimed`](crate::IdempotencyRefusal)
+    /// once the ALPN argument that forbade it was repealed.
+    ///
+    /// `turns.rs`'s `deliver_unkeyed` answers a `Failed` on its
+    /// `NotQueued::Reentrant` arm, carrying
     /// [`Unanswered`](crate::Unanswered)'s own sentence. A peer cannot produce a
     /// re-entrant call — its request arrives on a connection's task, which has run
     /// no turn — so that arm is written to be right rather than to fire.

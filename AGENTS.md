@@ -30,6 +30,19 @@ separate acts.
   `CONTRIBUTING.md` lists. "The gate is slow" is not one of them.
 - A `mise` gate's grandchildren survive a process-group kill, so a kill is
   unreliable as well as wasteful.
+- **Three steps are the ONLY place a given thing is compiled or read**, so a
+  defect in any of them survives every earlier step: `features` is the only step
+  that compiles a test binary at `--no-default-features`, `docs` is the only one
+  that resolves intra-doc links, and `examples` is the only one that *runs* an
+  example. Before pushing a change that adds a test, a doc link or a feature
+  gate, run those three by hand — a full gate to find one of them costs minutes.
+- **The gate cannot see a doc link to a `#[doc(hidden)]` item.** rustdoc
+  generates no page for such an item, emits the raw Markdown, and does **not**
+  warn — `broken_intra_doc_links` does not fire for a hidden target, so
+  `mise run docs` passes under `-D warnings` while the rendered page shows
+  `[Thing]` in literal square brackets. There is no step that will ever report
+  it. Check the built HTML under `target/doc` when you link to something the
+  crate hides.
 
 ## Reporting, if you are a subagent
 
@@ -95,6 +108,13 @@ said an ALPN move costs nothing.
 
 - **State a SHA, a count or a literal only after reading it in the same turn.**
   Twenty-seven claims were retracted in one session.
+- **Re-measuring is not the same as carrying the number back.** A branch was
+  told to re-measure everything it changed. It did: the A/B ran, in the right
+  worktree, with the right repeat count. It ran **three minutes after** the
+  commit message and the rustdoc were written, and neither was updated — so the
+  code shipped the figure the work had set out with, wrong by 2.3x, with a log
+  on disk refuting it. Write the number **from** the run, and if the run comes
+  second, go back and edit what you already wrote.
 - **Verify an infrastructure claim against the infrastructure, never against the
   prose describing it.** `mise.toml` said "CI runs these same tasks". Thirty
   statements repeated it. Nobody queried a CI run, and the trigger named a
