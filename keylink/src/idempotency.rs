@@ -847,6 +847,13 @@ impl Records {
     /// Separate from [`store`](Self::store) because `evict` runs under the
     /// ledger's lock, where a `&DurableRecords` it cannot await on would be a
     /// borrow it has no use for.
+    ///
+    /// **That sentence is true and it is not the reason the split is forced.**
+    /// [`store`](Self::store) is `#[cfg(feature = "persist")]` and `evict`,
+    /// `release` and `expire` are not, so without that feature they cannot call
+    /// it at all — an `E0599` at `--no-default-features`, which
+    /// `.mise/tasks/features` is the only gate step to reach. Uselessness is
+    /// the softer half of the argument; not compiling is the binding one.
     pub(crate) fn stores_durably(&self) -> bool {
         match self {
             Self::Memory | Self::None => false,

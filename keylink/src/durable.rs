@@ -36,6 +36,15 @@
 //! per second whatever its connection count. An operator sizing a desk needs
 //! that sentence and not only the per-call one.
 //!
+//! **That 7.6 ms is a macOS figure and it does not carry to Linux.**
+//! `std::fs::File::sync_data` issues `F_FULLFSYNC` on macOS, which asks the
+//! drive to flush its own write cache — measured here at about **12x a plain
+//! `libc::fsync`**, 5498 µs against 462 µs. On Linux the same call is
+//! `fdatasync`, so the per-call cost is lower by roughly that order and the
+//! throughput above is correspondingly pessimistic. `sync_data` is still the
+//! right call for the promise this ledger makes, and is not changing: the
+//! figure needs a platform beside it, not a weaker flush.
+//!
 //! # Three ways a key leaves memory, and the disk is told about all of them
 //!
 //! A settle writes its own record. Everything else — a released claim, a reply
@@ -479,6 +488,19 @@ impl DurableRecords {
     /// attempt reads and encodes the whole log before failing. So the counter is
     /// reset either way, and a failed rewrite waits another `live` entries like
     /// any other.
+    ///
+    /// **What one rewrite costs, and how often it is paid.** Measured at **10
+    /// to 20 ms**, and it did not grow with the live count over a 144x range —
+    /// so two `fsync`s and a rename dominate, not the copy. With
+    /// [`COMPACTION_SLACK`] at 64 it fires once every `live + 64` writes: about
+    /// one call in 4640 at a full default ledger, where `live` is 9216.
+    ///
+    /// **Open question, and it is the small end that raises it.** At a ledger
+    /// holding 10 live entries it fires about once in 37 calls, and a 10-to-20
+    /// ms rewrite one call in 37 is a different proposition from one in 4640.
+    /// Nothing measured says that is wrong — a small log is also the cheapest
+    /// one to rewrite — and nothing measured says the floor is the right shape
+    /// either. No code change is made on this.
     pub(crate) async fn compact_if_worthwhile(&self, live: usize) {
         let written = self.store.since_compaction.load(Ordering::Relaxed);
         let Ok(live) = u64::try_from(live) else {
