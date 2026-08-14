@@ -221,38 +221,25 @@ where
         route: &'static Route,
         route_path: &str,
     ) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let admitted = match self
-            .admit(&parts, route, route_path, keylink::ExternalKind::Rpc)
-            .await
-        {
-            Ok(admitted) => admitted,
-            Err(response) => return response,
-        };
-        let Admitted { method, principal } = admitted;
-        if !is_media(&parts.headers, route.request_media()) {
-            return GatewayError::UnsupportedMediaType.response(None);
-        }
-        let key = match derived_key(&parts.headers, &principal) {
-            Ok(key) => key,
-            Err(error) => return error.response(None),
-        };
-        let body = match bounded_json(body, self.limits.request.get()).await {
-            Ok(body) => body,
-            Err(error) => return error.response(None),
-        };
-        let invocation = S::invoke(
-            &self.client,
-            method,
-            &body,
-            keylink::ExternalCall::Rpc { key },
-            JsonCodec::new(self.limits.response.get()),
-        );
-        match invocation.await {
-            Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
-            Ok(_) => GatewayError::UpstreamError.response(None),
-            Err(error) => GatewayError::from_external(error).response(None),
-        }
+        let client = &self.client;
+        let limit = self.limits.response.get();
+        handle_rpc(
+            request,
+            route,
+            route_path,
+            &Surface {
+                access: &self.access,
+                challenge: &self.challenge,
+                limits: self.limits,
+                service: S::SERVICE,
+                methods: S::METHODS,
+                actor: None,
+                invoke: &move |method, body, call| {
+                    S::invoke(client, method, body, call, JsonCodec::new(limit))
+                },
+            },
+        )
+        .await
     }
 
     /// `POST /blob/{method}`: invoke, record a ticket, and answer with the
@@ -618,6 +605,227 @@ where
 }
 
 /// A `recv` reply: the declared value in one header, the payload as the body.
+/// A gateway onto one node's KEYED actors.
+///
+/// A separate type rather than a mode of [`Gateway`], and not by preference:
+/// `Gateway` holds `S::Client` and this holds
+/// `<S as keylink::ExternalActorService>::Client`, which is the generated
+/// `RegistryClient`. One struct cannot own both, and `new` fixes which one it
+/// owns.
+///
+/// Everything else is shared. The prelude, the path decoders, the response
+/// builders and the handler bodies are free functions both surfaces call, so
+/// the address space is the only thing that differs — which is what
+/// [`Surface`] carries.
+pub struct ActorGateway<S, A>
+where
+    S: keylink::ExternalActorService,
+    A: Access,
+{
+    client: S::Client,
+    access: A,
+    challenge: Challenge,
+    limits: JsonLimits,
+    service: PhantomData<fn() -> S>,
+}
+
+impl<S, A> ActorGateway<S, A>
+where
+    S: keylink::ExternalActorService,
+    A: Access,
+{
+    /// Build a keyed gateway with mandatory access and a validated challenge.
+    #[must_use]
+    pub fn new(client: S::Client, access: A, challenge: Challenge) -> Self {
+        Self {
+            client,
+            access,
+            challenge,
+            limits: JsonLimits::default(),
+            service: PhantomData,
+        }
+    }
+
+    /// Replace the bounded JSON ceilings.
+    #[must_use]
+    pub fn limits(mut self, limits: JsonLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Install the actor routes this surface selects.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::WrongAddressing`] for a singleton surface, and
+    /// [`ConfigError::MissingRuntimeRoute`] when the inventory carries no
+    /// actor rpc route.
+    ///
+    /// An EMPTY generated inventory is also refused. A service declaring only
+    /// `send` and `tell` implements the actor seam with nothing in it, and a
+    /// surface that mounted it would answer `404` per request instead of
+    /// saying at startup that there is nothing to serve.
+    pub fn router<State>(self, surface: HttpSurface) -> Result<Router<State>, ConfigError>
+    where
+        State: Clone + Send + Sync + 'static,
+    {
+        if surface.addressing() != Addressing::Actors {
+            return Err(ConfigError::WrongAddressing);
+        }
+        if S::METHODS.is_empty() {
+            return Err(ConfigError::MissingRuntimeRoute);
+        }
+        let Some(rpc) = surface
+            .routes()
+            .find(|route| route.kind() == RouteKind::Rpc)
+        else {
+            return Err(ConfigError::MissingRuntimeRoute);
+        };
+        let path = format!("{}{}", surface.prefix(), rpc.template());
+        let handler_path = path.clone();
+        let gateway = Arc::new(self);
+        let router = Router::new().route(
+            &path,
+            any(move |request: Request<Body>| {
+                let gateway = Arc::clone(&gateway);
+                let path = handler_path.clone();
+                async move { gateway.handle_rpc(request, rpc, &path).await }
+            }),
+        );
+        Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
+    }
+
+    async fn handle_rpc(
+        &self,
+        request: Request<Body>,
+        route: &'static Route,
+        route_path: &str,
+    ) -> Response<Body> {
+        // The actor is decoded BEFORE the prelude, because `Access` is asked
+        // about it and a policy must never be handed a raw path segment. A
+        // malformed id is the same `404` a missing method is: telling them
+        // apart says which ids are well formed.
+        let Some(actor) = decode_actor(request.uri().path(), route_path) else {
+            return GatewayError::MethodNotFound.response(None);
+        };
+        let client = &self.client;
+        let limit = self.limits.response.get();
+        let addressed = actor.clone();
+        handle_rpc(
+            request,
+            route,
+            route_path,
+            &Surface {
+                access: &self.access,
+                challenge: &self.challenge,
+                limits: self.limits,
+                service: S::SERVICE,
+                methods: S::METHODS,
+                actor: Some(&actor),
+                invoke: &move |method, body, call| {
+                    S::invoke_at(
+                        client,
+                        &addressed,
+                        method,
+                        body,
+                        call,
+                        JsonCodec::new(limit),
+                    )
+                },
+            },
+        )
+        .await
+    }
+}
+
+/// How a handler reaches the generated client, and everything else it needs
+/// that is not the request.
+///
+/// **One handler body, two address spaces.** The singleton and actor surfaces
+/// hold DIFFERENT client types — `S::Client` against `RegistryClient` — so one
+/// struct cannot own both and a second gateway is unavoidable. What is
+/// avoidable is a second copy of every handler, and this is what avoids it: the
+/// only thing the two surfaces disagree about is which generated function the
+/// invocation goes through, so that is the one thing passed in.
+///
+/// The codec is not a parameter because the gateway has exactly one: every call
+/// site builds a `JsonCodec` from the same response limit.
+struct Surface<'a, A: Access> {
+    access: &'a A,
+    challenge: &'a Challenge,
+    limits: JsonLimits,
+    service: &'static str,
+    methods: &'static [keylink::ExternalMethod],
+    /// `None` on a singleton surface. The validated id on an actor one, passed
+    /// to `Access` before the call is made.
+    actor: Option<&'a keylink::ActorId>,
+    invoke: &'a Invoke<'a>,
+}
+
+/// The one generated call a handler makes, already bound to its client.
+type Invoke<'a> = dyn Fn(&'static str, &[u8], keylink::ExternalCall) -> keylink::ExternalFuture<JsonCodec>
+    + Send
+    + Sync
+    + 'a;
+
+impl<A: Access> Surface<'_, A> {
+    async fn admit(
+        &self,
+        parts: &http::request::Parts,
+        route: &'static Route,
+        route_path: &str,
+        kind: keylink::ExternalKind,
+    ) -> Result<Admitted, Response<Body>> {
+        admit(
+            self.access,
+            self.challenge,
+            self.service,
+            self.methods,
+            parts,
+            route,
+            route_path,
+            kind,
+            self.actor,
+        )
+        .await
+    }
+}
+
+/// `POST /rpc/{method}` and `POST /{actor}/rpc/{method}`: bounded JSON in,
+/// bounded JSON out.
+async fn handle_rpc<A: Access>(
+    request: Request<Body>,
+    route: &'static Route,
+    route_path: &str,
+    surface: &Surface<'_, A>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let admitted = match surface
+        .admit(&parts, route, route_path, keylink::ExternalKind::Rpc)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let Admitted { method, principal } = admitted;
+    if !is_media(&parts.headers, route.request_media()) {
+        return GatewayError::UnsupportedMediaType.response(None);
+    }
+    let key = match derived_key(&parts.headers, &principal) {
+        Ok(key) => key,
+        Err(error) => return error.response(None),
+    };
+    let body = match bounded_json(body, surface.limits.request.get()).await {
+        Ok(body) => body,
+        Err(error) => return error.response(None),
+    };
+    match (surface.invoke)(method, &body, keylink::ExternalCall::Rpc { key }).await {
+        Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
+        Ok(_) => GatewayError::UpstreamError.response(None),
+        Err(error) => GatewayError::from_external(error).response(None),
+    }
+}
+
 /// Everything every route does before it looks at a request body.
 ///
 /// A FREE function, not a method, because the actor surface holds a different
@@ -765,6 +973,36 @@ fn json_response(json: Vec<u8>, route: &Route) -> Response<Body> {
     response
 }
 
+/// The raw text of one `{name}` placeholder in a route template.
+///
+/// **Segment-wise, and the segment count must match.** The three decoders this
+/// replaces each stripped a literal prefix, which works only for the template
+/// shapes they were written against: `/v1/{actor}/rpc/{method}` fed to a
+/// method decoder that expected `{method}` to follow a literal produced a
+/// `404` for every keyed call. Measured, on the first end-to-end actor row.
+///
+/// Requiring equal segment counts is also what refuses `/v1/a/b/rpc/Sum`,
+/// where a prefix strip would have yielded the actor `a` and left `/b` behind.
+///
+/// The text is RAW. Axum's own extractors percent-decode first, which would
+/// turn `%2F` into a separator and change what was addressed.
+fn raw_segment<'a>(path: &'a str, template: &str, name: &str) -> Option<&'a str> {
+    let path: Vec<&str> = path.split('/').collect();
+    let template: Vec<&str> = template.split('/').collect();
+    if path.len() != template.len() {
+        return None;
+    }
+    let mut found = None;
+    for (segment, part) in path.iter().zip(template.iter()) {
+        if *part == name {
+            found = Some(*segment);
+        } else if !(part.starts_with('{') && part.ends_with('}')) && segment != part {
+            return None;
+        }
+    }
+    found.filter(|segment| !segment.is_empty())
+}
+
 /// Decode the method segment against an inventory the caller names.
 ///
 /// Both surfaces have their own `METHODS`, and the actor one is a strict
@@ -776,26 +1014,7 @@ fn decode_method_in(
     route_path: &str,
     kind: keylink::ExternalKind,
 ) -> Result<String, GatewayError> {
-    // Split on the placeholder rather than requiring the template to END with
-    // it. `/rpc/{method}` and `/blob/{method}/{id}` both name a method segment,
-    // and a decoder that only understood the first shape answered `404` for
-    // every byte route — measured, before the first byte-route row was green.
-    let (before, after) = route_path
-        .split_once("{method}")
-        .ok_or(GatewayError::MethodNotFound)?;
-    let rest = path
-        .strip_prefix(before)
-        .ok_or(GatewayError::MethodNotFound)?;
-    let encoded = if after.is_empty() {
-        rest
-    } else {
-        // The segment runs to the separator the template puts after it.
-        let stop = rest.find('/').ok_or(GatewayError::MethodNotFound)?;
-        &rest[..stop]
-    };
-    if encoded.is_empty() || encoded.contains('/') {
-        return Err(GatewayError::MethodNotFound);
-    }
+    let encoded = raw_segment(path, route_path, "{method}").ok_or(GatewayError::MethodNotFound)?;
     let max_bytes = methods
         .iter()
         .filter(|method| method.kind() == kind)
@@ -804,6 +1023,37 @@ fn decode_method_in(
         .unwrap_or(0);
     crate::raw_path::parse(encoded, crate::raw_path::Shape::Segment { max_bytes })
         .map_err(|_| GatewayError::InvalidRequest)
+}
+
+/// The `{actor}` segment of an actor-route path, decoded once.
+///
+/// Bounded before it is decoded, so an attacker's megabyte of `%41` is refused
+/// without being allocated, and constructed through [`keylink::ActorId::new`],
+/// so a policy downstream is handed a validated id rather than a string that
+/// looks like one.
+///
+/// **The decode bound is not watched, and it cannot be from here.** Raising it
+/// past `MAX_KEY_LEN` came back GREEN at `exit=0`: `ActorId::new` refuses the
+/// oversized id one line later, so a test that reads a return value sees the
+/// same answer either way. What the bound buys is refusing before allocating,
+/// and that is invisible to an assertion. Recorded rather than claimed.
+fn decode_actor(path: &str, route_path: &str) -> Option<keylink::ActorId> {
+    let encoded = raw_segment(path, route_path, "{actor}")?;
+    let decoded = crate::raw_path::parse(
+        encoded,
+        crate::raw_path::Shape::Segment {
+            max_bytes: keylink::MAX_KEY_LEN,
+        },
+    )
+    .ok()?;
+    keylink::ActorId::new(decoded).ok()
+}
+
+/// The `{id}` segment of a byte-route path, as raw text.
+///
+/// A malformed address is the same `404` as a well formed one nobody holds.
+fn decode_blob_address(path: &str, route_path: &str) -> Option<crate::blob::Address> {
+    crate::blob::Address::parse(raw_segment(path, route_path, "{id}")?)
 }
 
 /// What a byte resource is keyed on, in ONE place.
@@ -838,72 +1088,6 @@ fn is_empty_body(headers: &HeaderMap) -> bool {
         None => true,
         Some(value) => value.to_str().is_ok_and(|value| value.trim() == "0"),
     }
-}
-
-/// The `{actor}` segment of an actor-route path, decoded once.
-///
-/// **Read off the RAW path.** Axum's own extractor percent-decodes before
-/// keylink sees a value, so an id carrying `%2F` would arrive already split
-/// into two segments — and the gateway would address the first half on a path
-/// that no longer matches its own template. Task 1 settled that the raw path is
-/// the input; this keeps that true for the segment that names WHO is being
-/// addressed.
-///
-/// Bounded before it is decoded, so an oversized encoded form costs no
-/// allocation, and constructed through [`keylink::ActorId::new`], so a caller
-/// downstream is handed a validated id rather than a string that looks like
-/// one.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the actor handlers, the next slice of Task 6.                   `expect` rather than `allow`: it fires as an unfulfilled                   expectation the moment they land, so the marker cannot                   outlive its reason"
-    )
-)]
-fn decode_actor(path: &str, route_path: &str) -> Option<keylink::ActorId> {
-    let (before, after) = route_path.split_once("{actor}")?;
-    let rest = path.strip_prefix(before)?;
-    let stop = if after.is_empty() {
-        rest.len()
-    } else {
-        rest.find('/')?
-    };
-    let encoded = rest.get(..stop)?;
-    if encoded.is_empty() {
-        return None;
-    }
-    // The literal the template puts AFTER the segment must actually follow it.
-    // Without this, `/v1/a/b/rpc/Sum` yields the actor `a` and a path that no
-    // longer matches its own route — measured, and the first red this row
-    // produced. Axum's router would not route that path here, so this is
-    // defence in depth on the one segment that names who is addressed.
-    let literal = after.split('{').next().unwrap_or(after);
-    if !rest.get(stop..)?.starts_with(literal) {
-        return None;
-    }
-    let decoded = crate::raw_path::parse(
-        encoded,
-        crate::raw_path::Shape::Segment {
-            max_bytes: keylink::MAX_KEY_LEN,
-        },
-    )
-    .ok()?;
-    keylink::ActorId::new(decoded).ok()
-}
-
-/// The `{id}` segment of a byte-route path, as raw text.
-///
-/// Axum's own path extractor percent-decodes before keylink sees the value,
-/// which would turn `%2F` into a separator and change what was addressed. The
-/// raw path is the input here, exactly as Task 1 settled for method segments.
-fn decode_blob_address(path: &str, route_path: &str) -> Option<crate::blob::Address> {
-    let prefix = route_path.strip_suffix("{method}/{id}")?;
-    let rest = path.strip_prefix(prefix)?;
-    let (_method, id) = rest.split_once('/')?;
-    if id.is_empty() || id.contains('/') {
-        return None;
-    }
-    crate::blob::Address::parse(id)
 }
 
 /// `304`, carrying only what a cache validator needs.
@@ -1421,11 +1605,15 @@ mod tests {
     /// is refused before it is allocated, and this row cannot see an
     /// allocation. Recorded rather than claimed.
     ///
-    /// Watched red with `scripts/break-once.sh` (row `HK31`) by replacing
-    /// `if !rest.get(stop..)?.starts_with(literal) {`
-    /// with `if false {`, which yields `Some(ActorId("a"))` for
-    /// `/v1/a/b/rpc/Sum` — the actor `a` on a path that no longer matches its
-    /// own route.
+    /// Watched red with `scripts/break-once.sh` (row `HK32`) by replacing
+    /// `} else if !(part.starts_with('{') && part.ends_with('}')) && segment != part {`
+    /// with `} else if false {`, which yields an actor for a path whose
+    /// literals do not match its own route.
+    ///
+    /// The segment-count check beside it came back GREEN and is recorded
+    /// rather than registered: for every input here the literal comparison
+    /// already refuses first. It earns its place on a path SHORTER than the
+    /// template, which this router cannot receive and a future one might.
     #[test]
     fn the_actor_segment_is_decoded_once_from_the_raw_path() {
         let route = "/v1/{actor}/rpc/{method}";

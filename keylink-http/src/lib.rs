@@ -65,5 +65,5 @@ mod stream;
 pub use __contract::{Addressing, HttpSurface};
 pub use access::{Access, AccessError, Call, Challenge, Principal};
 pub use error::ConfigError;
-pub use gateway::Gateway;
+pub use gateway::{ActorGateway, Gateway};
 pub use limits::{JsonLimits, StreamingLimits};
