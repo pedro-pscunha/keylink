@@ -1303,7 +1303,8 @@ impl Inner {
     /// **What that measurement does NOT cover.** It is O(peers x slots) on
     /// every [`Ledger::lock`], which is every keyed path, and the suite never
     /// approaches the shipped bounds — a bucket set may hold
-    /// [`MAX_RECORDS`] + [`MAX_TOMBSTONES`] slots, so a debug-profile service
+    /// [`MAX_RECORDS`] + [`MAX_TOMBSTONES`] + [`MAX_RUNNING`] slots, so a
+    /// debug-profile service
     /// near them walks orders of magnitude more per call than any test here.
     /// `debug_assertions` is off in release, so no shipped binary pays it, and
     /// a debug build at production scale will.
@@ -2520,7 +2521,13 @@ impl Ledger {
             let Some(key) = bucket.held.pop_front() else {
                 break;
             };
+            // Here and not at the bottom of the loop. The `continue` below also
+            // pops, so a flag set only on the full move would let a changed
+            // queue skip the `refile` — the exact drift `Inner::agrees` exists
+            // to report. The flag means "the queue changed", not "a key
+            // completed the move".
             inner.held = inner.held.saturating_sub(1);
+            moved = true;
             let Some(freed) = freed else {
                 continue;
             };
@@ -2533,7 +2540,6 @@ impl Ledger {
             bucket.spent.push_back(key);
             inner.bytes = inner.bytes.saturating_sub(freed);
             inner.spent += 1;
-            moved = true;
         }
         // One call for the whole loop: it moves keys between two queues of the
         // same peer, and nothing reads the indexes until it returns.
@@ -2773,7 +2779,7 @@ pub(crate) struct Guard {
     /// has been dispatched under, so the default belongs on that side.
     ///
     /// The default is written in [`Drop`] rather than by handing `claim` a
-    /// fresh [`Progress`] to hold, which is how this was first fixed:
+    /// fresh `Progress` to hold, which is how this was first fixed:
     /// `Progress` is an `Arc<AtomicU8>`, so that spent one allocation on every
     /// keyed call to name a state, and `serve_one` overwrote it unused a moment
     /// later.
