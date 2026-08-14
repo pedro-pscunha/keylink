@@ -491,6 +491,35 @@ pub enum IdempotencyRefusal {
         /// The method a key was attached to, `CamelCase` as `service!` wrote it.
         method: String,
     },
+
+    /// This service records keys durably and could not write this one, so the
+    /// handler was never entered.
+    ///
+    /// The one fact a caller most wants after a refusal — *nothing ran, send it
+    /// again* — and it used to arrive as prose inside [`RemoteError`]'s untyped
+    /// variant, whose own doc says it is not a discriminator. Both this file
+    /// and `reply.rs` justified that on the grounds that minting a variant
+    /// would shift the contract hash. `AGENTS.md` rules such a move free until
+    /// keylink has a stable version, so the justification is repealed and both
+    /// copies of it are deleted.
+    ///
+    /// **Here rather than on [`RemoteError`]**, because this file and
+    /// `reply.rs` both rule that this vocabulary belongs to one enum: one
+    /// variant on `RemoteError` rather than six, because `RemoteError` belongs
+    /// to every service keylink will ever carry and this belongs to one
+    /// feature.
+    ///
+    /// **Appended rather than inserted.** `reply.rs` rules that an insert
+    /// renumbers every later variant, which turns one refusal into another on a
+    /// peer built against the old order.
+    ///
+    /// Told apart from [`Interrupted`](Self::Interrupted) by which side of the
+    /// handler the failure is on: this one is before it, so the work provably
+    /// did not happen. `Interrupted` is after, where it is unknowable.
+    #[error(
+        "this service could not record the key, so nothing ran - the same key is safe to send again"
+    )]
+    NotClaimed,
 }
 
 impl From<IdempotencyRefusal> for RemoteError {
@@ -2162,18 +2191,15 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// [`RemoteError::Failed`] naming the store, because there is no wire
-    /// variant for "the serving side could not write its own ledger" and
-    /// inventing one would move the ALPN. The sentence is what the caller acts
-    /// on: nothing ran, and the same key is safe to send again.
+    /// [`IdempotencyRefusal::NotClaimed`], which says the one thing the caller
+    /// can act on: nothing ran, and the same key is safe to send again. The
+    /// store's own error is not carried, because it names a disk the caller has
+    /// no access to and cannot do anything about.
     async fn write_claim(&self, peer: EndpointId, key: &IdempotencyKey) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if let Err(err) = store.claimed(peer, key).await {
-                return Err(RemoteError::Failed(format!(
-                    "this service records idempotency keys durably and could not write one, \
-                     so the call was not run: {err}"
-                )));
+            if store.claimed(peer, key).await.is_err() {
+                return Err(IdempotencyRefusal::NotClaimed.into());
             }
         }
         #[cfg(not(feature = "persist"))]
@@ -3065,13 +3091,14 @@ mod tests {
         }
     }
 
-    /// What an **aborted** serving task leaves behind, on the two paths that
-    /// await a disk.
+    /// What a durable write leaves behind when it does not succeed — because
+    /// the serving task was **aborted** while it was parked, or because the
+    /// store **refused** it.
     ///
-    /// A peer disconnect aborts every in-flight call, so both of these run in
+    /// A peer disconnect aborts every in-flight call, so the first two run in
     /// production the first time a caller's connection drops mid-call. Neither
     /// can be reached with a store that answers: the abort has to land while a
-    /// write is still parked, so the store here never answers one.
+    /// write is still parked, so `Stalling` never answers one.
     #[cfg(feature = "persist")]
     mod aborts {
         use std::future::Future;
@@ -3138,11 +3165,52 @@ mod tests {
             }
         }
 
-        fn stalling() -> Arc<Ledger> {
+        /// A store that accepts a claim, holds nothing, and refuses every write.
+        struct Refusing;
+
+        struct Refused;
+
+        impl Entries for Refusing {
+            type Held = Refused;
+
+            async fn claim(&self, _id: &StateId) -> keylink_persist::Result<Refused> {
+                Ok(Refused)
+            }
+        }
+
+        impl Held for Refused {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                Err(keylink_persist::Error::TooLarge {
+                    offered: 1,
+                    limit: 0,
+                })
+            }
+
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                Err(keylink_persist::Error::TooLarge {
+                    offered: 1,
+                    limit: 0,
+                })
+            }
+
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn ledger_on<E: Entries>(store: &E) -> Arc<Ledger> {
             let id = StateId::new("test/ledger").expect("a valid id");
-            let records = now(crate::durable::DurableRecords::open(&Stalling, &id))
+            let records = now(crate::durable::DurableRecords::open(store, &id))
                 .expect("nobody else holds this ledger");
             Ledger::new(Limits::default(), Records::Durable(records))
+        }
+
+        fn stalling() -> Arc<Ledger> {
+            ledger_on(&Stalling)
         }
 
         fn dispatched() -> Progress {
@@ -3175,6 +3243,19 @@ mod tests {
             abort(ledger.claim_durably(peer(A), key("k")));
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Fresh);
+        }
+
+        /// A store that refuses the claim refuses the call, and the caller is
+        /// told the one thing it can act on: nothing ran.
+        ///
+        /// The refusal used to be [`RemoteError`]'s untyped variant carrying
+        /// that sentence as prose, which no caller can match on.
+        #[test]
+        fn a_store_that_refuses_the_claim_says_nothing_ran() {
+            let ledger = ledger_on(&Refusing);
+            let claim = now(ledger.claim_durably(peer(A), key("k")));
+
+            assert_eq!(refusal(claim), IdempotencyRefusal::NotClaimed);
         }
     }
 
