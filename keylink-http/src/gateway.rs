@@ -276,6 +276,25 @@ where
     }
 }
 
+/// The verb, then the address this path names.
+///
+/// Both refusals belong to the router rather than the prelude, and in this
+/// order. The verb is a fact about the ROUTE, knowable with no address at all;
+/// the address is what the prelude then hands `Access`.
+fn addressed<'a, M: Mount>(
+    mount: &'a M,
+    request: &Request<Body>,
+    route: &Route,
+    route_path: &str,
+) -> Result<Surface<'a, M::Access>, GatewayError> {
+    if request.method() != route.method() {
+        return Err(GatewayError::MethodNotAllowed);
+    }
+    mount
+        .surface(request.uri().path(), route_path)
+        .ok_or(GatewayError::MethodNotFound)
+}
+
 /// Every route one surface serves, installed from the generated inventory.
 ///
 /// Written once for both address spaces. A keyed surface serves the same route
@@ -307,8 +326,9 @@ where
             let mount = Arc::clone(&rpc_mount);
             let path = handler_path.clone();
             async move {
-                let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                    return GatewayError::MethodNotFound.response(None);
+                let surface = match addressed(&*mount, &request, rpc, &path) {
+                    Ok(surface) => surface,
+                    Err(error) => return error.response(None),
                 };
                 handle_rpc(request, rpc, &path, &surface).await
             }
@@ -328,8 +348,9 @@ where
                     let mount = Arc::clone(&mount);
                     let path = handler_path.clone();
                     async move {
-                        let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                            return GatewayError::MethodNotFound.response(None);
+                        let surface = match addressed(&*mount, &request, route, &path) {
+                            Ok(surface) => surface,
+                            Err(error) => return error.response(None),
                         };
                         handle_send(request, route, &path, limits, &surface).await
                     }
@@ -338,8 +359,9 @@ where
                     let mount = Arc::clone(&mount);
                     let path = handler_path.clone();
                     async move {
-                        let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                            return GatewayError::MethodNotFound.response(None);
+                        let surface = match addressed(&*mount, &request, route, &path) {
+                            Ok(surface) => surface,
+                            Err(error) => return error.response(None),
                         };
                         handle_recv(request, route, &path, limits, &surface).await
                     }
@@ -366,8 +388,9 @@ where
                         let tickets = Arc::clone(&tickets);
                         let path = handler_path.clone();
                         async move {
-                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                                return GatewayError::BlobNotFound.response(None);
+                            let surface = match addressed(&*mount, &request, route, &path) {
+                                Ok(surface) => surface,
+                                Err(_) => return GatewayError::BlobNotFound.response(None),
                             };
                             handle_blob_bytes(request, route, &path, limits, &tickets, &surface)
                                 .await
@@ -378,8 +401,9 @@ where
                         let tickets = Arc::clone(&head_tickets);
                         let path = head_path.clone();
                         async move {
-                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                                return GatewayError::BlobNotFound.response(None);
+                            let surface = match addressed(&*mount, &request, head, &path) {
+                                Ok(surface) => surface,
+                                Err(_) => return GatewayError::BlobNotFound.response(None),
                             };
                             handle_blob_bytes(request, head, &path, limits, &tickets, &surface)
                                 .await
@@ -393,8 +417,9 @@ where
                         let tickets = Arc::clone(&tickets);
                         let path = handler_path.clone();
                         async move {
-                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
-                                return GatewayError::MethodNotFound.response(None);
+                            let surface = match addressed(&*mount, &request, route, &path) {
+                                Ok(surface) => surface,
+                                Err(error) => return error.response(None),
                             };
                             handle_blob_lookup(request, route, &path, &tickets, &surface).await
                         }
@@ -463,7 +488,7 @@ async fn handle_recv<A: Access>(
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
     let admitted = match surface
-        .admit(&parts, route, route_path, keylink::ExternalKind::Recv)
+        .admit(&parts, route_path, keylink::ExternalKind::Recv)
         .await
     {
         Ok(admitted) => admitted,
@@ -515,25 +540,78 @@ async fn handle_recv<A: Access>(
 }
 
 impl<A: Access> Surface<'_, A> {
+    /// Everything every route does before it looks at a request body.
+    ///
+    /// On the [`Surface`], because that is the whole of what it needs: the policy,
+    /// the challenge, the inventory, the service name and the address. A prelude
+    /// copied into the second gateway is the duplication that has already cost this
+    /// branch two anchors, `HJ9` and `HJ3`, and there is one surface type for both
+    /// address spaces precisely so there is one of these.
+    ///
+    /// The order is a guarantee, and a narrower one than it looks. A method nobody
+    /// serves is refused before the principal, and the principal before `Access`.
+    /// What that buys is that **`Access` is never asked about a route that does not
+    /// exist**.
+    ///
+    /// The verb is checked earlier still, in [`addressed`], because it has to
+    /// precede the ADDRESS. A `GET` at a keyed path whose actor segment is
+    /// malformed answers `405`, not the `404` the malformed id produces — refusing
+    /// on the id first would make the verb refusal unreachable for exactly the
+    /// callers most likely to be probing.
+    ///
+    /// It does NOT hide which methods exist: because the method check precedes the
+    /// principal check, an unauthenticated caller separates a real method (`401`)
+    /// from a missing one (`404`), and a forbidden caller separates them the same
+    /// way. That is the Task 1 shape and it is deliberate — enumerating method
+    /// names off a generated inventory is low value — but the reason written here
+    /// used to claim the opposite, which is the kind of wrong reason that survives
+    /// review and gets defended.
+    ///
+    /// Takes the request PARTS rather than the request. `axum::body::Body` is
+    /// `Send` and not `Sync`, so a `&Request<Body>` held across the `Access` await
+    /// would make every handler future non-`Send` and no route would install.
     async fn admit(
         &self,
         parts: &http::request::Parts,
-        route: &'static Route,
         route_path: &str,
         kind: keylink::ExternalKind,
     ) -> Result<Admitted, Response<Body>> {
-        admit(
-            self.access,
-            self.challenge,
-            self.service,
-            self.methods,
-            parts,
-            route,
-            route_path,
-            kind,
-            self.actor.as_ref(),
-        )
-        .await
+        let decoded = decode_method_in(self.methods, parts.uri.path(), route_path, kind)
+            .map_err(|error| error.response(None))?;
+        let Some(method) = self
+            .methods
+            .iter()
+            .copied()
+            .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
+            .map(keylink::ExternalMethod::name)
+        else {
+            return Err(GatewayError::MethodNotFound.response(None));
+        };
+        let Some(principal) = parts.extensions.get::<Principal>().cloned() else {
+            return Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())));
+        };
+        match self
+            .access
+            .authorize(Call {
+                extensions: &parts.extensions,
+                headers: &parts.headers,
+                principal: &principal,
+                service: self.service,
+                method,
+                actor: self.actor.as_ref(),
+            })
+            .await
+        {
+            Ok(()) => Ok(Admitted { method, principal }),
+            Err(AccessError::Unauthenticated) => {
+                Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())))
+            }
+            // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
+            // { method, principal })` lets a denied caller reach the ticket
+            // lookup, after which a resource it holds and one that never existed
+            // stop answering alike.
+            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),
+        }
     }
 }
 
@@ -551,7 +629,7 @@ async fn handle_send<A: Access>(
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
     let admitted = match surface
-        .admit(&parts, route, route_path, keylink::ExternalKind::Send)
+        .admit(&parts, route_path, keylink::ExternalKind::Send)
         .await
     {
         Ok(admitted) => admitted,
@@ -616,7 +694,7 @@ async fn handle_blob_lookup<A: Access>(
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
     let admitted = match surface
-        .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
+        .admit(&parts, route_path, keylink::ExternalKind::Blob)
         .await
     {
         Ok(admitted) => admitted,
@@ -708,7 +786,7 @@ async fn handle_blob_bytes<A: Access>(
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
     let admitted = match surface
-        .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
+        .admit(&parts, route_path, keylink::ExternalKind::Blob)
         .await
     {
         Ok(admitted) => admitted,
@@ -848,7 +926,7 @@ async fn handle_rpc<A: Access>(
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
     let admitted = match surface
-        .admit(&parts, route, route_path, keylink::ExternalKind::Rpc)
+        .admit(&parts, route_path, keylink::ExternalKind::Rpc)
         .await
     {
         Ok(admitted) => admitted,
@@ -877,84 +955,6 @@ async fn handle_rpc<A: Access>(
         Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
         Ok(_) => GatewayError::UpstreamError.response(None),
         Err(error) => GatewayError::from_external(error).response(None),
-    }
-}
-
-/// Everything every route does before it looks at a request body.
-///
-/// A FREE function, not a method, because the actor surface holds a different
-/// client type and therefore cannot be the same struct — and a prelude copied
-/// into a second gateway is the duplication that has already cost this branch
-/// two anchors, `HJ9` and `HJ3`. The inventory and the service name arrive as
-/// arguments so both surfaces pass their own.
-///
-/// The order is a guarantee, and a narrower one than it looks. A method nobody
-/// serves is refused before the verb, the verb before the principal, and the
-/// principal before `Access`. What that buys is that **`Access` is never asked
-/// about a route that does not exist**.
-///
-/// It does NOT hide which methods exist: because the method check precedes the
-/// principal check, an unauthenticated caller separates a real method (`401`)
-/// from a missing one (`404`), and a forbidden caller separates them the same
-/// way. That is the Task 1 shape and it is deliberate — enumerating method
-/// names off a generated inventory is low value — but the reason written here
-/// used to claim the opposite, which is the kind of wrong reason that survives
-/// review and gets defended.
-///
-/// Takes the request PARTS rather than the request. `axum::body::Body` is
-/// `Send` and not `Sync`, so a `&Request<Body>` held across the `Access` await
-/// would make every handler future non-`Send` and no route would install.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "every argument is one fact the caller owns and this function must               not: two of them are the caller's own inventory, and folding them               into a struct would put the singleton and actor surfaces back               into one type, which is what this split exists to avoid"
-)]
-async fn admit<A: Access>(
-    access: &A,
-    challenge: &Challenge,
-    service: &'static str,
-    methods: &'static [keylink::ExternalMethod],
-    parts: &http::request::Parts,
-    route: &'static Route,
-    route_path: &str,
-    kind: keylink::ExternalKind,
-    actor: Option<&keylink::ActorId>,
-) -> Result<Admitted, Response<Body>> {
-    let decoded = decode_method_in(methods, parts.uri.path(), route_path, kind)
-        .map_err(|error| error.response(None))?;
-    let Some(method) = methods
-        .iter()
-        .copied()
-        .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
-        .map(keylink::ExternalMethod::name)
-    else {
-        return Err(GatewayError::MethodNotFound.response(None));
-    };
-    if parts.method != route.method() {
-        return Err(GatewayError::MethodNotAllowed.response(None));
-    }
-    let Some(principal) = parts.extensions.get::<Principal>().cloned() else {
-        return Err(GatewayError::Unauthenticated.response(Some(challenge.header())));
-    };
-    match access
-        .authorize(Call {
-            extensions: &parts.extensions,
-            headers: &parts.headers,
-            principal: &principal,
-            service,
-            method,
-            actor,
-        })
-        .await
-    {
-        Ok(()) => Ok(Admitted { method, principal }),
-        Err(AccessError::Unauthenticated) => {
-            Err(GatewayError::Unauthenticated.response(Some(challenge.header())))
-        }
-        // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
-        // { method, principal })` lets a denied caller reach the ticket
-        // lookup, after which a resource it holds and one that never existed
-        // stop answering alike.
-        Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),
     }
 }
 

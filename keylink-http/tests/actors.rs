@@ -480,3 +480,40 @@ async fn a_blob_ticket_is_bound_to_the_actor_that_minted_it() {
         "a grant minted for one actor is not a grant under another"
     );
 }
+
+/// A wrong verb is answered before the actor segment is even read.
+///
+/// Both refusals are cheap and both are `4xx`, so the order looks like it
+/// cannot matter. It does: a caller whose verb is wrong and whose actor id is
+/// also malformed would be told only about the id, and would keep retrying a
+/// request whose method was never going to be accepted. The verb is a fact
+/// about the route and is knowable with no address at all, so it is decided
+/// first.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK39`) by replacing
+/// `    if request.method() != route.method() {`
+/// with `    if false {`. The row failed on the first case: `404` where it
+/// asserts `405`, the malformed id having answered instead.
+#[tokio::test]
+async fn a_wrong_verb_is_refused_before_the_actor_is_decoded() {
+    let running = start().await;
+
+    // Malformed id AND wrong verb. The verb answers.
+    let response = running.get("/v1/a%2/rpc/Count").await;
+    assert_eq!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers()[http::header::ALLOW], "POST");
+
+    // Control: the same verb on a well formed id answers the same way, so the
+    // `405` above is about the verb and not about the id.
+    let response = running.get("/v1/one/rpc/Count").await;
+    assert_eq!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+
+    // And with the right verb, the malformed id is what answers.
+    let response = running.post("/v1/a%2/rpc/Count", r#"{"value":1}"#).await;
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+
+    assert!(
+        running.seen().is_empty(),
+        "no policy was asked about any of them"
+    );
+}

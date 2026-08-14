@@ -2227,6 +2227,8 @@ ANCHORS = [
      "            @actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]"),
     ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
      "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
+    ("HK39", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "    if request.method() != route.method() {"),
     ("HK37", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
      "            .map_or(b\"\", |id| id.as_str().as_bytes()),"),
     ("HK38", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
@@ -3928,7 +3930,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 318
+RECORD_BLOCKS = 319
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
