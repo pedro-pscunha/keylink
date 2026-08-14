@@ -120,6 +120,7 @@ async fn local_node() -> Node {
 
 struct Running {
     address: std::net::SocketAddr,
+    system: ledger::Registry,
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
     asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     denied: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -153,6 +154,10 @@ async fn start() -> Running {
     let lazy_ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let factory_ticks = std::sync::Arc::clone(&lazy_ticks);
     let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never)
+        // Three eager mounts plus room for exactly ONE lazy build, so a second
+        // lazy id meets the cap. A capacity a test cannot reach is a capacity
+        // nothing measures.
+        .capacity(4)
         .spawn_with(move |id| {
             factory_asked
                 .lock()
@@ -189,6 +194,7 @@ async fn start() -> Running {
     let server = keylink::Server::builder(&server_node)
         .service(
             system
+                .clone()
                 .service(Allowlist::anyone())
                 .with_blobs(&blobs)
                 .build(),
@@ -227,6 +233,7 @@ async fn start() -> Running {
     let task = tokio::spawn(async move { axum::serve(listener, app).await });
     Running {
         address,
+        system,
         seen,
         asked,
         denied,
@@ -904,4 +911,152 @@ async fn no_refusal_repeats_the_actor_id_back() {
             "{case}: a header repeated the actor id — {headers}"
         );
     }
+}
+
+/// A stopped actor is a missing one, and a lazy registry rebuilds it.
+///
+/// The three states a keyed call meets — mounted, stopped, missing — are one
+/// state machine, so they are measured in one run rather than three fixtures
+/// that could each be right about a different registry.
+///
+/// The last probe is the one that is easy to get wrong. `one` was mounted
+/// eagerly and the factory only builds ids starting with `lazy`, so stopping
+/// `one` is permanent; stopping `lazy` is not, because the next call rebuilds
+/// it. A test that only stopped an eagerly mounted actor would report
+/// "stopped means gone" as a property of the registry when it is a property of
+/// that mount.
+#[tokio::test]
+async fn a_stopped_actor_answers_as_missing_until_something_remounts_it() {
+    let running = start().await;
+    let budget = std::time::Duration::from_secs(2);
+
+    let alive = running.post("/v1/one/rpc/Whoami", "{}").await;
+    assert_eq!(alive.status(), http::StatusCode::OK);
+    assert_eq!(alive.text().await.expect("a body"), r#""one""#);
+
+    running
+        .system
+        .stop(&keylink::ActorId::new("one").expect("a valid id"), budget)
+        .await
+        .expect("the actor was running");
+
+    let stopped = running.post("/v1/one/rpc/Whoami", "{}").await;
+    assert_eq!(
+        stopped.status(),
+        http::StatusCode::NOT_FOUND,
+        "a stopped actor answers exactly as one that was never mounted"
+    );
+    let never = running.post("/v1/never-mounted/rpc/Whoami", "{}").await;
+    assert_eq!(never.status(), stopped.status());
+
+    // A lazily built actor comes back, because the factory is what mounts it.
+    let built = running.post("/v1/lazy/rpc/Whoami", "{}").await;
+    assert_eq!(built.status(), http::StatusCode::OK);
+    running
+        .system
+        .stop(&keylink::ActorId::new("lazy").expect("a valid id"), budget)
+        .await
+        .expect("the actor was running");
+    let rebuilt = running.post("/v1/lazy/rpc/Whoami", "{}").await;
+    assert_eq!(
+        rebuilt.status(),
+        http::StatusCode::OK,
+        "stopping a lazily built actor removes the mount, not the ability to mount"
+    );
+    assert_eq!(rebuilt.text().await.expect("a body"), r#""lazy""#);
+}
+
+/// Concurrent keyed calls do not cross actors.
+///
+/// One gateway, one registry, many in-flight requests. `Whoami` answers the id
+/// its actor was mounted under, so a call that resolved another actor's mount
+/// says so in its own body — which is what makes this a routing test rather
+/// than a throughput one.
+#[tokio::test]
+async fn concurrent_keyed_calls_each_reach_their_own_actor() {
+    let running = std::sync::Arc::new(start().await);
+    let ids = ["one", "obra/4471", "lazy"];
+
+    let mut calls = Vec::new();
+    for round in 0..8 {
+        for id in ids {
+            let running = std::sync::Arc::clone(&running);
+            let encoded = id.replace('/', "%2F");
+            calls.push(tokio::spawn(async move {
+                let path = format!("/v1/{encoded}/rpc/Whoami");
+                let response = running.post(&path, "{}").await;
+                (
+                    round,
+                    id,
+                    response.status(),
+                    response.text().await.expect("a body"),
+                )
+            }));
+        }
+    }
+
+    for call in calls {
+        let (round, id, status, body) = call.await.expect("the request task completes");
+        assert_eq!(status, http::StatusCode::OK, "{id} in round {round}");
+        assert_eq!(
+            body,
+            format!("\"{id}\""),
+            "{id} in round {round} was answered by another actor"
+        );
+    }
+}
+
+/// A registry at capacity refuses a new actor without saying it exists.
+///
+/// The fixture holds three eager mounts and room for one lazy build, so the
+/// SECOND lazy id meets the cap.
+///
+/// The refusal is `503`, not `404`: the id is perfectly good and a caller
+/// retrying later may well get it. And while the registry is full, an id the
+/// factory would REFUSE answers `503` too — measured, not assumed, because the
+/// first draft of this row asserted `404` there and the run said `503`. The cap
+/// is checked before the factory is asked, so a full registry answers nothing
+/// at all about which ids exist. That is the stronger property and it was not
+/// the one this row was written to expect.
+#[tokio::test]
+async fn a_registry_at_capacity_refuses_without_an_existence_answer() {
+    let running = start().await;
+
+    let first = running.post("/v1/lazy-a/rpc/Whoami", "{}").await;
+    assert_eq!(first.status(), http::StatusCode::OK, "the last free slot");
+
+    let full = running.post("/v1/lazy-b/rpc/Whoami", "{}").await;
+    assert_eq!(
+        full.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "a full registry is a temporary condition, not a missing actor"
+    );
+
+    // An id the factory would REFUSE, asked while the registry is full. Same
+    // answer, so a full registry separates nothing.
+    let refused = running.post("/v1/unbuildable/rpc/Whoami", "{}").await;
+    assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+    // And the cap really is what refused `lazy-b`: freeing a slot lets it in.
+    running
+        .system
+        .stop(
+            &keylink::ActorId::new("lazy-a").expect("a valid id"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("the actor was running");
+    // With the slot free and still free, the unbuildable id goes back to `404`,
+    // which is what makes the `503` above a fact about the cap rather than
+    // about that id. Probed BEFORE `lazy-b` is retried, because `lazy-b` takes
+    // the freed slot and fills the registry again.
+    let refused = running.post("/v1/unbuildable/rpc/Whoami", "{}").await;
+    assert_eq!(refused.status(), http::StatusCode::NOT_FOUND);
+
+    let retried = running.post("/v1/lazy-b/rpc/Whoami", "{}").await;
+    assert_eq!(
+        retried.status(),
+        http::StatusCode::OK,
+        "the refusal was the cap, not the id"
+    );
 }
