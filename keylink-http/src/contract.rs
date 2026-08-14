@@ -210,6 +210,64 @@ const ROUTES: &[Route] = &[
         response_media: Some("application/octet-stream"),
         streaming: true,
     },
+    // The actor surface. The same families, addressed per actor, minus `send`:
+    // a keyed upload would stream a body to an actor that four refusals can
+    // reject after the bytes are on the wire, and no generated `ActorRef`
+    // method exists for it either — so there is nothing here to route to.
+    //
+    // The actor segment LEADS. `/{actor}/rpc/{method}` cannot be shadowed by a
+    // singleton prefix, and the two address spaces never share a router
+    // because `HttpSurface` serves one or the other.
+    Route {
+        kind: RouteKind::Rpc,
+        addressing: Addressing::Actors,
+        template: "/{actor}/rpc/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::OK,
+        request_media: Some("application/json"),
+        response_media: Some("application/json"),
+        streaming: false,
+    },
+    Route {
+        kind: RouteKind::Recv,
+        addressing: Addressing::Actors,
+        template: "/{actor}/recv/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::OK,
+        request_media: Some("application/json"),
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
+    Route {
+        kind: RouteKind::BlobLookup,
+        addressing: Addressing::Actors,
+        template: "/{actor}/blob/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::CREATED,
+        request_media: Some("application/json"),
+        response_media: Some("application/json"),
+        streaming: true,
+    },
+    Route {
+        kind: RouteKind::BlobGet,
+        addressing: Addressing::Actors,
+        template: "/{actor}/blob/{method}/{id}",
+        method: http::Method::GET,
+        success: http::StatusCode::OK,
+        request_media: None,
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
+    Route {
+        kind: RouteKind::BlobHead,
+        addressing: Addressing::Actors,
+        template: "/{actor}/blob/{method}/{id}",
+        method: http::Method::HEAD,
+        success: http::StatusCode::OK,
+        request_media: None,
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
 ];
 
 #[cfg(test)]
@@ -568,6 +626,15 @@ mod tests {
 
     use super::{Addressing, ErrorKind, HttpSurface, Route, RouteKind};
 
+    /// One inventory, two address spaces, and a surface serves exactly one.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK27`) by replacing
+    /// `route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())`
+    /// with `!route.streaming || self.streaming.is_some()`, which lets an
+    /// actor route onto a singleton surface: `left: 2, right: 1`. A gateway
+    /// that mounted both would answer `/rpc/{method}` and
+    /// `/{actor}/rpc/{method}` from one router, with one `Access` policy that
+    /// was written for whichever the deployment chose.
     #[test]
     fn configured_surface_filters_the_single_runtime_route_inventory() {
         let singleton =
@@ -578,9 +645,6 @@ mod tests {
         assert_eq!(routes[0].template(), "/rpc/{method}");
         assert_eq!(routes[0].request_media(), Some("application/json"));
         assert_eq!(routes[0].response_media(), Some("application/json"));
-
-        let actors = HttpSurface::new("/v1", Addressing::Actors).expect("valid actor surface");
-        assert_eq!(actors.routes().count(), 0);
 
         let limits = crate::StreamingLimits::new(1, 1, 1, 1).expect("positive limits");
         let streaming_singleton = HttpSurface::new("/v1", Addressing::Singleton)
@@ -614,10 +678,52 @@ mod tests {
             None,
             "a byte route takes no request body at all"
         );
+        // The actor surface is the singleton one addressed per actor, minus
+        // `send`: a keyed upload would stream a body to an actor that four
+        // refusals can reject after the bytes are on the wire, and there is no
+        // generated `ActorRef` method for it either.
+        let actors_only = HttpSurface::new("/v1", Addressing::Actors).expect("valid actor surface");
+        assert_eq!(
+            actors_only.routes().map(Route::kind).collect::<Vec<_>>(),
+            [RouteKind::Rpc],
+            "without streaming limits, an actor surface serves rpc alone"
+        );
+        assert_eq!(
+            actors_only.routes().next().map(Route::template),
+            Some("/{actor}/rpc/{method}")
+        );
+
         let streaming_actors = HttpSurface::new("/v1", Addressing::Actors)
             .expect("valid actor surface")
             .with_streaming(limits);
-        assert_eq!(streaming_actors.routes().count(), 0);
+        assert_eq!(
+            streaming_actors
+                .routes()
+                .map(Route::kind)
+                .collect::<Vec<_>>(),
+            [
+                RouteKind::Rpc,
+                RouteKind::Recv,
+                RouteKind::BlobLookup,
+                RouteKind::BlobGet,
+                RouteKind::BlobHead,
+            ],
+            "and no `Send` route exists on an actor surface at all"
+        );
+        assert_eq!(
+            streaming_actors
+                .routes()
+                .map(Route::template)
+                .collect::<Vec<_>>(),
+            [
+                "/{actor}/rpc/{method}",
+                "/{actor}/recv/{method}",
+                "/{actor}/blob/{method}",
+                "/{actor}/blob/{method}/{id}",
+                "/{actor}/blob/{method}/{id}",
+            ],
+            "the actor segment leads, so one prefix cannot shadow another"
+        );
     }
 
     #[test]

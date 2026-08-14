@@ -55,6 +55,15 @@ pub struct Call<'a> {
     pub service: &'static str,
     /// Validated generated RPC method name.
     pub method: &'static str,
+    /// The actor this call addresses, on an actor surface.
+    ///
+    /// `None` on a singleton surface, and that is the whole difference an
+    /// `Access` implementation sees between the two. It is a validated
+    /// [`keylink::ActorId`] rather than the raw path segment, so a policy
+    /// cannot be handed something that failed decoding — and it arrives BEFORE
+    /// the call is made, so a policy that refuses an actor refuses it without
+    /// the registry ever learning the id was asked about.
+    pub actor: Option<&'a keylink::ActorId>,
 }
 
 /// Mandatory edge authorization refusal.

@@ -2218,6 +2218,8 @@ ANCHORS = [
      "    tickets.remove(ticket, generation);"),
     ("HK24", "keylink-http/tests/blobs.rs", "keylink-http/src/blob.rs",
      "            .is_none_or(|(live, _)| *live != generation)"),
+    ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
+     "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
     ("HK25", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
      "        // Silently ignoring a caller's replay key is worse than refusing it.\n"
      "        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
@@ -3907,7 +3909,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 311
+RECORD_BLOCKS = 312
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

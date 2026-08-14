@@ -222,6 +222,10 @@ where
                 principal: &principal,
                 service: S::SERVICE,
                 method,
+                // Singleton surface. Task 6's actor routes pass the validated
+                // id here, and `Access` sees the difference in one field
+                // rather than in a second trait.
+                actor: None,
             })
             .await
         {
