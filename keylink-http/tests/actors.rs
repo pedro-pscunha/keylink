@@ -34,7 +34,13 @@ struct Book {
 }
 
 impl ledger::Actor for Book {
+    /// A non-zero `value` is how long to hold the actor's loop, in
+    /// milliseconds. An actor that is busy is the only way to fill a mailbox,
+    /// and one message is what an actor is processing while the next queue.
     async fn count(&mut self, _cx: Caller<'_>, value: u64) -> u64 {
+        if value > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(value)).await;
+        }
         value + 1
     }
 
@@ -154,6 +160,10 @@ async fn start() -> Running {
     let lazy_ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let factory_ticks = std::sync::Arc::clone(&lazy_ticks);
     let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never)
+        // One in flight, one queued. Any larger depth needs more concurrent
+        // requests than a test can reliably keep in flight at once, and a
+        // saturation row that cannot saturate proves nothing.
+        .mailbox_depth(std::num::NonZeroUsize::new(1).expect("positive"))
         // Three eager mounts plus room for exactly ONE lazy build, so a second
         // lazy id meets the cap. A capacity a test cannot reach is a capacity
         // nothing measures.
@@ -341,6 +351,18 @@ async fn a_keyed_call_reaches_the_actor_its_path_names() {
 }
 
 /// `Access` is asked about the actor, and is asked before the registry is.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK48`) by replacing
+/// `                actor: self.actor.as_ref(),`
+/// with `                actor: None,`, which is a policy handed a keyed call
+/// it cannot tell from a singleton one. Terminated on `the policy was handed
+/// the validated id, not a raw segment`, `left: [None]` against
+/// `right: [Some("one")]`.
+///
+/// The BEFORE half of the name is held by the `forbidden` against
+/// `forbidden-absent` parity below, and by
+/// `a_denied_caller_never_reaches_the_lazy_factory`. This row's own recorder
+/// cannot see order — see the note on `Watching`.
 #[tokio::test]
 async fn access_sees_the_validated_actor_before_the_call() {
     let running = start().await;
@@ -1059,4 +1081,60 @@ async fn a_registry_at_capacity_refuses_without_an_existence_answer() {
         http::StatusCode::OK,
         "the refusal was the cap, not the id"
     );
+}
+
+/// A saturated mailbox makes callers WAIT. It does not refuse them.
+///
+/// This row was written to assert a `503`, on the reading that a full mailbox
+/// maps to `UpstreamUnavailable` the way a full registry does. It measured
+/// `refused 0 of 12`: keylink parks a sender on a full mailbox rather than
+/// rejecting it, so `MailboxFull` is not reachable through this gateway path at
+/// all. The row asserts what actually happens, and the assertion that would
+/// have been written instead is recorded here because it is the one a reader
+/// will reach for next.
+///
+/// What that means for the surface: mailbox pressure on a keyed actor is
+/// latency, not an error category. A deployment that needs it to become one
+/// has to bound the wait somewhere above this gateway.
+///
+/// One actor, a mailbox one deep, twelve calls each holding the loop 40ms. The
+/// time bound is a LOWER bound and nothing else — a slow machine only makes it
+/// larger, so it cannot flake in the direction that matters.
+#[tokio::test]
+async fn a_saturated_mailbox_makes_callers_wait_rather_than_refusing_them() {
+    let running = std::sync::Arc::new(start().await);
+    const CALLS: usize = 12;
+    const HOLD_MS: u64 = 40;
+
+    let started = tokio::time::Instant::now();
+    let mut calls = Vec::new();
+    for _ in 0..CALLS {
+        let running = std::sync::Arc::clone(&running);
+        calls.push(tokio::spawn(async move {
+            running
+                .post("/v1/one/rpc/Count", r#"{"value":40}"#)
+                .await
+                .status()
+        }));
+    }
+    for call in calls {
+        let status = call.await.expect("the request task completes");
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "a queued call is served, not refused"
+        );
+    }
+    let elapsed = started.elapsed();
+
+    // Serialised through one actor: at least CALLS - 1 holds must have elapsed.
+    // Anything concurrent would finish in about one hold.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(HOLD_MS * (CALLS as u64 - 1)),
+        "the calls queued rather than ran together — {elapsed:?}"
+    );
+
+    let after = running.post("/v1/one/rpc/Whoami", "{}").await;
+    assert_eq!(after.status(), http::StatusCode::OK);
+    assert_eq!(after.text().await.expect("a body"), r#""one""#);
 }
