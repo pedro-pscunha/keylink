@@ -126,6 +126,10 @@ async fn local_node() -> Node {
 
 struct Running {
     address: std::net::SocketAddr,
+    /// A second gateway over a registry whose Keylink allowlist does NOT admit
+    /// this node. Every call through it is refused by the BACKEND rather than
+    /// by the HTTP policy.
+    unwelcome: std::net::SocketAddr,
     system: ledger::Registry,
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
     asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -133,6 +137,8 @@ struct Running {
     ticks: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     _server: keylink::Server,
+    _closed_server: keylink::Server,
+    _closed_task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     _nodes: Vec<Node>,
 }
 
@@ -241,8 +247,68 @@ async fn start() -> Running {
         .expect("listener binds");
     let address = listener.local_addr().expect("listener address");
     let task = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    // A second node serving the SAME kind of registry behind an allowlist that
+    // names nobody, so its Keylink layer refuses this client. The HTTP policy
+    // in front of it permits everything, which is what makes a refusal through
+    // this address a statement about the backend and nothing else.
+    let closed_node = local_node().await;
+    let closed: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never).build();
+    closed
+        .mount(
+            keylink::ActorId::new("one").expect("a valid id"),
+            ledger::spawn(Book {
+                name: "one".to_owned(),
+                blob: (
+                    blobs
+                        .add_bytes(b"unreachable".to_vec())
+                        .await
+                        .expect("stores"),
+                    11,
+                ),
+                ticks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }),
+        )
+        .expect("mounts");
+    let closed_server = keylink::Server::builder(&closed_node)
+        .service(
+            closed
+                .service(Allowlist::only([]))
+                .with_blobs(&blobs)
+                .build(),
+        )
+        .spawn()
+        .expect("a keyed system nobody may reach");
+    let closed_client =
+        ledger::RegistryClient::connect(&client_node, closed_node.endpoint().addr())
+            .await
+            .expect("the transport connects even where the allowlist refuses");
+    let closed_gateway = ActorGateway::<ledger::External, _>::new(
+        closed_client,
+        Watching {
+            seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            denied: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        },
+        Challenge::new(http::HeaderValue::from_static("Bearer realm=keylink"))
+            .expect("valid challenge"),
+    )
+    .router::<()>(
+        HttpSurface::new("/v1", Addressing::Actors)
+            .expect("valid actor surface")
+            .with_streaming(StreamingLimits::new(32, 64, 64, 1).expect("positive limits")),
+    )
+    .expect("actor surface builds");
+    let closed_app: Router<()> = Router::new()
+        .merge(closed_gateway)
+        .layer(middleware::from_fn(authenticate));
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let unwelcome = closed_listener.local_addr().expect("listener address");
+    let closed_task = tokio::spawn(async move { axum::serve(closed_listener, closed_app).await });
     Running {
         address,
+        unwelcome,
         system,
         seen,
         asked,
@@ -250,7 +316,9 @@ async fn start() -> Running {
         ticks,
         task,
         _server: server,
-        _nodes: vec![server_node, client_node],
+        _closed_server: closed_server,
+        _closed_task: closed_task,
+        _nodes: vec![server_node, client_node, closed_node],
     }
 }
 
@@ -1174,4 +1242,58 @@ async fn a_queue_of_keyed_calls_waits_and_is_never_refused() {
     let after = running.post("/v1/one/rpc/Whoami", "{}").await;
     assert_eq!(after.status(), http::StatusCode::OK);
     assert_eq!(after.text().await.expect("a body"), r#""one""#);
+}
+
+/// A Keylink refusal is not an HTTP refusal, and the gateway does not merge
+/// them.
+///
+/// Two gateways, two registries, one client node. The second registry's
+/// allowlist admits nobody, so its Keylink layer refuses this client while the
+/// HTTP policy in front of it permits everything. Every checkbox above this one
+/// exercises the HTTP `Access` policy; this is the only row where the BACKEND
+/// is what says no.
+///
+/// **The answer is `503`, and that is a finding rather than a design.** This
+/// row was written to assert `403`, because `error.rs` maps
+/// `RemoteError::Unauthorized` to `Forbidden` and an allowlist rejection is an
+/// authorization decision. It measured `503`: a peer the allowlist does not
+/// admit does not receive an authorization error, it loses the connection, and
+/// `Transport | Closed` maps to `UpstreamUnavailable`.
+///
+/// The consequence is real and it is not this task's to fix. A permanent
+/// decision is presented to the caller as a temporary condition, so a
+/// well-behaved client retries a refusal that will never change. Turning it
+/// into `403` means keylink answering an allowlist rejection rather than
+/// closing on it, which is core behaviour outside this task's blast radius.
+/// Recorded here, asserted as it is, so the next change to that mapping has
+/// something that moves.
+///
+/// No break. What the row rests on is `error.rs`'s mapping table, which Task 6
+/// does not modify and whose rows are watched where they live. What this row
+/// adds is that the keyed path reaches that table at all.
+#[tokio::test]
+async fn a_backend_refusal_reaches_the_caller_as_a_refusal() {
+    let running = start().await;
+
+    // Control: the same request, the same actor, the welcoming registry.
+    let allowed = running.post("/v1/one/rpc/Whoami", "{}").await;
+    assert_eq!(allowed.status(), http::StatusCode::OK);
+    assert_eq!(allowed.text().await.expect("a body"), r#""one""#);
+
+    let refused = reqwest::Client::new()
+        .post(format!("http://{}/v1/one/rpc/Whoami", running.unwelcome))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("the request completes");
+    assert_eq!(
+        refused.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "an allowlist rejection reaches the caller as a temporary condition"
+    );
+    // And it is NOT `502`: the gateway did not collapse it into a generic
+    // upstream fault, which is the difference between a retryable answer and
+    // an opaque one.
+    assert_ne!(refused.status(), http::StatusCode::BAD_GATEWAY);
 }
