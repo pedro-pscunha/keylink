@@ -550,7 +550,10 @@ impl From<IdempotencyRefusal> for RemoteError {
 /// there, so nobody should reach it by leaving a field out; the default lives in
 /// `ServiceBuilder::new`, where it is written once and is visible. And
 /// `CONTRIBUTING.md` reserves `#[non_exhaustive]` for error enums rather than for
-/// ones a caller constructs, which is what this is.
+/// ones a caller constructs, which is what this is. [`Records`] is the one
+/// exception in this file and its own doc says why: a feature-gated variant
+/// makes an exhaustive match break on a feature the matching crate did not turn
+/// on. Every variant here is unconditional, so that reason does not reach it.
 ///
 /// # Why this is not called `Keyed`
 ///
@@ -771,7 +774,23 @@ impl Keyable {
 /// — an `Arc<dyn ..>` — rather than a discriminant. `Copy` today would have to be
 /// withdrawn then, and withdrawing a trait impl is a breaking change no attribute
 /// covers.
+/// # Why this one IS `#[non_exhaustive]` when the rule says otherwise
+///
+/// The rule — in `CONTRIBUTING.md`, and restated on [`Keyable`] and
+/// [`KeyState`] — reserves the attribute for error enums rather than for ones a
+/// caller constructs and matches. This is one a caller constructs, and it is
+/// still the exception, because **one of its variants is feature-gated**.
+///
+/// Cargo unifies features across a build. A downstream crate that matches this
+/// exhaustively compiles while nothing enables `persist`, and stops compiling
+/// the moment an unrelated crate in the same build turns it on — a break its
+/// author did not cause and cannot prevent. `#[non_exhaustive]` costs that
+/// author a `_ =>` arm and removes the trap.
+///
+/// It does **not** block constructing the existing variants, so the argument
+/// above about a caller building one of these is untouched.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Records {
     /// Memory, bounded by [`MAX_RECORDS`], [`MAX_RECORDED_BYTES`] and
     /// [`RECORD_TTL`] — the three that evict — and by [`MAX_RECORDED_FRAME`], which
@@ -871,7 +890,10 @@ impl Records {
 ///
 /// Exhaustive on purpose. `#[non_exhaustive]` would be contradictory three ways:
 /// this crate reserves that attribute for error enums rather than for ones a
-/// caller matches; `postcard_schema` derives from the variant list and ignores
+/// caller matches — [`Records`] is the one exception, and only because a
+/// feature-gated variant makes an exhaustive match break on a feature the
+/// matching crate did not turn on, which is not true of anything here;
+/// `postcard_schema` derives from the variant list and ignores
 /// the attribute, so a seventh variant moves the ALPN and breaks every handshake
 /// anyway — the attribute would advertise source compatibility on a hard wire
 /// break; and it forces the `_ =>` arm this crate spent eleven catch-all-free
