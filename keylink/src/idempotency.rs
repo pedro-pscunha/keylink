@@ -2211,10 +2211,11 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// [`IdempotencyRefusal::Interrupted`], which is the truth and not an
-    /// approximation of it: the handler ran, and this ledger cannot promise the
-    /// record, so whether the work took effect is exactly what the caller must
-    /// now decide out of band.
+    /// [`IdempotencyRefusal::Unrecordable`], which is what happened word for
+    /// word: the handler ran, and its reply is not something this ledger can
+    /// hold. It is **not** [`Interrupted`](IdempotencyRefusal::Interrupted),
+    /// whose own doc says the handler produced no reply — here it produced one
+    /// and the ledger is discarding it.
     async fn write_settled(
         &self,
         peer: EndpointId,
@@ -2224,7 +2225,7 @@ impl Ledger {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
             if store.write(peer, key, slot).await.is_err() {
-                return Err(IdempotencyRefusal::Interrupted.into());
+                return Err(IdempotencyRefusal::Unrecordable.into());
             }
         }
         #[cfg(not(feature = "persist"))]
@@ -2377,6 +2378,18 @@ impl Ledger {
             inner.spent += 1;
         }
         self.evict(inner);
+    }
+
+    /// Ask the next [`housekeep`](Ledger::housekeep) to make the disk agree with
+    /// memory about this key.
+    ///
+    /// Beside [`release`](Ledger::release)'s own queueing and for the same
+    /// reason: this runs where nothing can await, and the store is told what
+    /// memory says now rather than what happened.
+    fn queue_reconcile(&self, peer: EndpointId, key: &IdempotencyKey) {
+        if self.records.stores_durably() {
+            self.lock().pending.push_back((peer, key.clone()));
+        }
     }
 
     /// Give a claimed key back, because nothing ran under it.
@@ -2710,7 +2723,7 @@ impl Guard {
     ///
     /// # Errors
     ///
-    /// [`IdempotencyRefusal::Interrupted`] when a durable store refused the
+    /// [`IdempotencyRefusal::Unrecordable`] when a durable store refused the
     /// record. The caller must not be sent its reply then, because a reply this
     /// ledger cannot replay is a reply the caller will ask for again.
     /// `Records::Memory` and `Records::None` cannot fail and this is always
@@ -2776,9 +2789,20 @@ impl Guard {
         let stored = self.ledger.write_settled(self.peer, &self.key, &slot).await;
         self.settled = true;
         if let Err(refusal) = stored {
-            // It ran, and this ledger cannot promise the record. `Interrupted`
-            // is not an approximation of that — it is the definition.
-            self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
+            // It RAN and produced a reply this ledger cannot hold, which is
+            // `Slot::Unrecordable` word for word. NOT `Slot::Interrupted`,
+            // whose own doc says the handler was entered and no reply came out
+            // — here one came out and is being discarded.
+            self.ledger.settle(self.peer, &self.key, Slot::Unrecordable);
+            // The disk still holds `TAG_CLAIMED`, which recovers as
+            // `Interrupted`, so leaving it there would give a live retry and a
+            // post-restart retry two different answers for one event. Queued
+            // rather than written: the write that just failed is the one that
+            // would have to be retried, and the next `housekeep` is where a
+            // store gets its next chance. If the process dies before then the
+            // disk still says `Interrupted`, which is the conservative
+            // direction to be wrong in.
+            self.ledger.queue_reconcile(self.peer, &self.key);
             return Err(refusal);
         }
         self.ledger.settle(self.peer, &self.key, slot);

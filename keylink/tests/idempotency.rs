@@ -2249,13 +2249,14 @@ mod stored {
             .expect_err("the store could not hold the record, so the reply is not sent");
         assert_eq!(
             refusal(&error),
-            IdempotencyRefusal::Interrupted,
-            "it ran and the record is not held, which is exactly what Interrupted means"
+            IdempotencyRefusal::Unrecordable,
+            "it ran and the reply is not something this ledger can hold, which is \
+             Unrecordable word for word - Interrupted says no reply came out at all"
         );
 
         // It DID run. That is the whole reason the caller must not be told it
-        // succeeded — and the reason the answer is `Interrupted` rather than a
-        // refusal that invites an immediate retry.
+        // succeeded — and the reason the answer is not a refusal that invites an
+        // immediate retry.
         assert_eq!(
             runs.runs(),
             1,
@@ -2268,7 +2269,7 @@ mod stored {
             .reserve("ADU-014".to_string(), 2)
             .await
             .expect_err("still unknown");
-        assert_eq!(refusal(&again), IdempotencyRefusal::Interrupted);
+        assert_eq!(refusal(&again), IdempotencyRefusal::Unrecordable);
         assert_eq!(
             runs.runs(),
             1,
