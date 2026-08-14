@@ -177,6 +177,16 @@ fn the_component_digest_matches_its_recorded_vector() {
 
 /// Every documented endpoint serves its exact media type, and HEAD says the
 /// same thing without a body.
+///
+/// Watched red with `scripts/break-once.sh`, once per media type, because one
+/// break cannot show that the two are told apart:
+///
+/// - row `HL1` — `const OPENAPI_MEDIA: &str = "application/vnd.oai.openapi+json;version=3.1";`
+///   set to `application/json`. Terminated on `left: "application/json"`
+///   against `right: "application/vnd.oai.openapi+json;version=3.1"`.
+/// - row `HL2` — `const SCHEMA_MEDIA: &str = "application/schema+json";` set to
+///   `application/json`. Terminated on `left: "application/json"` against
+///   `right: "application/schema+json"`.
 #[tokio::test]
 async fn the_document_endpoints_serve_their_exact_media_types() {
     use axum::body::Body;
@@ -244,6 +254,12 @@ async fn the_document_endpoints_serve_their_exact_media_types() {
 }
 
 /// The four canonical surfaces, byte for byte.
+///
+/// Watched red with `scripts/break-once.sh` (row `HL3`) by replacing the
+/// octet-stream schema's
+/// `        "contentMediaType": "application/octet-stream",`
+/// with `application/json` — the shape that tells a generator to PARSE a byte
+/// stream. Terminated on a snapshot diff, `selected=1`.
 ///
 /// Snapshots rather than field assertions, because what a document publishes IS
 /// its bytes: a caller's generator reads all of them, so a change to any is a
@@ -339,4 +355,43 @@ fn a_fresh_process_renders_identical_bytes() {
 
 fn fingerprint(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Two different schemas under one component name is refused, not resolved by
+/// whichever the iteration reached second.
+///
+/// The failure this prevents is quiet: a document that kept the last writer
+/// would publish one of two contracts, chosen by hash order, and would keep
+/// doing it consistently enough to look deliberate.
+///
+/// Watched red with `scripts/break-once.sh` (row `HL4`) by giving
+/// `        Some(_) => Err(DocumentError::ComponentCollision {`
+/// an `Ok(())` arm ahead of it. Terminated on `left: Ok(())` against
+/// `right: Err(ComponentCollision { name: "Item" })`.
+#[test]
+fn a_component_written_twice_with_two_shapes_is_refused() {
+    use keylink_openapi::DocumentError;
+
+    // The same shape twice is one contract described twice, which is ordinary
+    // and must NOT be an error — the control that stops the check from being
+    // "refuse every repeat".
+    let mut table = std::collections::BTreeMap::new();
+    let first =
+        keylink_openapi::__register(&mut table, "Item", serde_json::json!({"type":"object"}));
+    let same =
+        keylink_openapi::__register(&mut table, "Item", serde_json::json!({"type":"object"}));
+    assert!(first.is_ok());
+    assert!(
+        same.is_ok(),
+        "one contract described twice is not a collision"
+    );
+
+    let other =
+        keylink_openapi::__register(&mut table, "Item", serde_json::json!({"type":"string"}));
+    assert_eq!(
+        other,
+        Err(DocumentError::ComponentCollision {
+            name: "Item".to_owned()
+        })
+    );
 }

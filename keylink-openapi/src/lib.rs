@@ -204,7 +204,7 @@ pub fn document<D: Documented>(
     let mut ids: BTreeMap<String, ()> = BTreeMap::new();
 
     let envelope = schema::error_envelope();
-    register(&mut components, "ErrorEnvelope", envelope)?;
+    __register(&mut components, "ErrorEnvelope", envelope)?;
 
     let keyed = surface.addressing() == Addressing::Actors;
     for mut operation in D::operations() {
@@ -278,7 +278,7 @@ pub fn document<D: Documented>(
 /// [`DocumentError::ComponentCollision`] when two contracts claim one name.
 pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, DocumentError> {
     let mut defs: BTreeMap<String, Value> = BTreeMap::new();
-    register(&mut defs, "ErrorEnvelope", schema::error_envelope())?;
+    __register(&mut defs, "ErrorEnvelope", schema::error_envelope())?;
     let keyed = surface.addressing() == Addressing::Actors;
     for mut operation in D::operations() {
         if keyed && !operation.keyed {
@@ -288,12 +288,12 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
         // JSON Schema reader looks. Same hoist, different destination.
         hoist(&mut operation.request, &mut defs, "#/$defs")?;
         hoist(&mut operation.response, &mut defs, "#/$defs")?;
-        register(
+        __register(
             &mut defs,
             &format!("{}.{}.request", D::SERVICE, operation.method),
             operation.request.clone(),
         )?;
-        register(
+        __register(
             &mut defs,
             &format!("{}.{}.response", D::SERVICE, operation.method),
             operation.response.clone(),
@@ -339,7 +339,7 @@ fn hoist(
         let component = format!("{logical}_{}", digest::component_name(&logical));
         // Depth first: a definition can reference another definition.
         rewrite_refs(&mut definition, into, &names);
-        register(components, &component, definition)?;
+        __register(components, &component, definition)?;
         names.insert(logical, component);
     }
     // A second pass, so a definition registered early can reference one
@@ -382,7 +382,14 @@ fn rewrite_refs(value: &mut Value, into: &str, names: &BTreeMap<String, String>)
     }
 }
 
-fn register(
+/// Register one schema under one name, or refuse.
+///
+/// `#[doc(hidden)]` and public only so a test can drive it directly: the
+/// collision it guards is reachable through `document()` only by constructing
+/// two services that disagree, and a row built that way would measure the
+/// fixture more than the guard.
+#[doc(hidden)]
+pub fn __register(
     into: &mut BTreeMap<String, Value>,
     name: &str,
     schema: Value,
