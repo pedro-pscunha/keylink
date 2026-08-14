@@ -328,6 +328,10 @@ pub const MAX_WAITING: usize = 1024;
 /// than the noise. 12 clears it by a third. The backlog still goes: 12 drains
 /// about 11 entries per call after the reconcile, so 2616 of them are gone in
 /// about 240 keyed calls, against the 2000 this was accepted at.
+///
+/// Gated, because the queue it bounds is only ever non-empty on a service with
+/// a store, and `--no-default-features` builds one that cannot have one.
+#[cfg(feature = "persist")]
 const DRAIN_PER_CLAIM: usize = 12;
 
 /// Why a call carrying an idempotency key was refused without being run.
@@ -2682,7 +2686,6 @@ impl Guard {
         frame: &Bytes,
         carries_body: bool,
     ) -> Result<(), RemoteError> {
-        self.settled = true;
         // Three causes, one slot, and that is the whole of Wave 2's wire cost:
         // nothing. `Slot::Unrecordable` reads "the handler ran, and its reply is
         // not something this ledger can hold", which is true word for word of a
@@ -2725,7 +2728,20 @@ impl Guard {
         // reply went out puts the caller back on a `Fresh` key, and the work
         // runs a second time. That is the failure this whole setting exists to
         // remove, so the await is here rather than after the write.
-        if let Err(refusal) = self.ledger.write_settled(self.peer, &self.key, &slot).await {
+        //
+        // **`settled` is set after this await and not before it.** A serving
+        // task can be aborted while parked here — `rpc.rs` shuts down every
+        // in-flight call when its connection ends — and that drops this guard.
+        // A guard that had already set the flag returns from `Drop` having
+        // settled nothing, so the slot stays [`Slot::Running`], which is never
+        // evicted. The key would answer `InFlight` for the life of the process,
+        // and after `running` such aborts the service refuses every keyed call.
+        //
+        // Bound rather than written one line lower, because the await sits
+        // inside the `if let` head below and there is no position between them.
+        let stored = self.ledger.write_settled(self.peer, &self.key, &slot).await;
+        self.settled = true;
+        if let Err(refusal) = stored {
             // It ran, and this ledger cannot promise the record. `Interrupted`
             // is not an approximation of that — it is the definition.
             self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
@@ -3038,6 +3054,108 @@ mod tests {
         #[test]
         fn a_snake_case_name_matches_nothing() {
             assert!(!Keyable::Only(&["reserve"]).accepts("Reserve"));
+        }
+    }
+
+    /// What an **aborted** serving task leaves behind, on the two paths that
+    /// await a disk.
+    ///
+    /// A peer disconnect aborts every in-flight call, so both of these run in
+    /// production the first time a caller's connection drops mid-call. Neither
+    /// can be reached with a store that answers: the abort has to land while a
+    /// write is still parked, so the store here never answers one.
+    #[cfg(feature = "persist")]
+    mod aborts {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        use keylink_persist::{Entries, EntryKey, Held, StateId};
+
+        use super::*;
+
+        /// A store that accepts a claim, holds nothing, and never finishes a
+        /// write.
+        struct Stalling;
+
+        struct Stalled;
+
+        impl Entries for Stalling {
+            type Held = Stalled;
+
+            async fn claim(&self, _id: &StateId) -> keylink_persist::Result<Stalled> {
+                Ok(Stalled)
+            }
+        }
+
+        impl Held for Stalled {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                std::future::pending().await
+            }
+
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                std::future::pending().await
+            }
+
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A future polled once and dropped, which is what an abort does.
+        ///
+        /// It asserts the poll parked, so a store that quietly answered would
+        /// fail here rather than turn the test below green for the wrong
+        /// reason.
+        fn abort<F: Future>(future: F) {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                future.as_mut().poll(&mut cx).is_pending(),
+                "the store answered, so nothing was aborted mid-write"
+            );
+        }
+
+        /// A future driven to completion, for the parts of the setup that do
+        /// answer.
+        fn now<F: Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => value,
+                Poll::Pending => panic!("the setup parked"),
+            }
+        }
+
+        fn stalling() -> Arc<Ledger> {
+            let id = StateId::new("test/ledger").expect("a valid id");
+            let records = now(crate::durable::DurableRecords::open(&Stalling, &id))
+                .expect("nobody else holds this ledger");
+            Ledger::new(Limits::default(), Records::Durable(records))
+        }
+
+        fn dispatched() -> Progress {
+            let progress = Progress::new();
+            progress.dispatched();
+            progress
+        }
+
+        /// The handler ran, the record write parked, and the task was killed.
+        /// The key must not be left claimed forever.
+        #[test]
+        fn an_abort_during_the_settle_does_not_leak_a_running_slot() {
+            let ledger = stalling();
+            // Dispatched on purpose, and not the marker `claim` builds: this
+            // test is about the call that DID enter the handler, and a
+            // `NotDispatched` guard releases instead, which would be green for
+            // the wrong reason.
+            let claimed = guard(ledger.claim(peer(A), key("k"))).watching(dispatched());
+            abort(claimed.record(&frame(16), false));
+
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Interrupted);
         }
     }
 
