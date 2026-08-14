@@ -1297,3 +1297,152 @@ async fn a_backend_refusal_reaches_the_caller_as_a_refusal() {
     // an opaque one.
     assert_ne!(refused.status(), http::StatusCode::BAD_GATEWAY);
 }
+
+/// A keyed client that hangs up drops the invocation the adapter owns.
+///
+/// The singleton row for this lives in `gateway.rs`; the keyed path goes
+/// through a different generated function — `invoke_at` rather than `invoke` —
+/// so it needs its own measurement. Nothing about the singleton result carries
+/// over: the two seams are separate traits.
+///
+/// The wrapper reports when the adapter's future is dropped, and `Count` holds
+/// the actor's loop long enough for the socket to be gone before the answer
+/// exists. The raw socket is what makes this measurable at all — `reqwest`
+/// will not hang up mid-response on request.
+///
+/// Red-tested by perturbing the FIXTURE rather than production, because the
+/// property is about what the caller does: replacing `drop(socket);` with
+/// `let _held = socket;` keeps the connection open, and the row terminates on
+/// `the invocation is dropped when the caller hangs up, before it could
+/// finish: Elapsed(())`. That is the measurement the tight bound buys —
+/// `SignalDrop` fires when the future ends for ANY reason, so a generous
+/// timeout would have been satisfied by the call merely completing.
+#[tokio::test]
+async fn a_keyed_client_that_hangs_up_drops_the_invocation() {
+    use tokio::io::AsyncWriteExt as _;
+
+    #[derive(Clone)]
+    struct WatchedClient {
+        inner: ledger::RegistryClient,
+        dropped: tokio::sync::watch::Sender<bool>,
+    }
+
+    struct Watched;
+
+    impl keylink::ExternalActorService for Watched {
+        const SERVICE: &'static str = <ledger::External as keylink::ExternalActorService>::SERVICE;
+        const METHODS: &'static [keylink::ExternalMethod] =
+            <ledger::External as keylink::ExternalActorService>::METHODS;
+        type Client = WatchedClient;
+
+        fn invoke_at<C: keylink::ServiceCodec>(
+            client: &Self::Client,
+            actor: &keylink::ActorId,
+            method: &str,
+            body: &[u8],
+            call: keylink::ExternalCall,
+            codec: C,
+        ) -> keylink::ExternalFuture<C> {
+            let future =
+                ledger::External::invoke_at(&client.inner, actor, method, body, call, codec);
+            let dropped = client.dropped.clone();
+            Box::pin(async move {
+                struct SignalDrop {
+                    signal: tokio::sync::watch::Sender<bool>,
+                }
+                impl Drop for SignalDrop {
+                    fn drop(&mut self) {
+                        let _ = self.signal.send(true);
+                    }
+                }
+                let _signal = SignalDrop { signal: dropped };
+                future.await
+            })
+        }
+    }
+
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+    let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never).build();
+    let blobs = Blobs::memory();
+    let id = blobs.add_bytes(b"held".to_vec()).await.expect("stores");
+    system
+        .mount(
+            keylink::ActorId::new("held").expect("a valid id"),
+            ledger::spawn(Book {
+                name: "held".to_owned(),
+                blob: (id, 4),
+                ticks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }),
+        )
+        .expect("mounts");
+    let _server = keylink::Server::builder(&server_node)
+        .service(
+            system
+                .service(Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
+        )
+        .spawn()
+        .expect("a keyed system");
+    let inner = ledger::RegistryClient::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("dials the keyed system");
+
+    let (dropped_tx, mut dropped_rx) = tokio::sync::watch::channel(false);
+    let gateway = ActorGateway::<Watched, _>::new(
+        WatchedClient {
+            inner,
+            dropped: dropped_tx,
+        },
+        Watching {
+            seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            denied: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        },
+        Challenge::new(http::HeaderValue::from_static("Bearer realm=keylink"))
+            .expect("valid challenge"),
+    )
+    .router::<()>(HttpSurface::new("/v1", Addressing::Actors).expect("valid actor surface"))
+    .expect("actor surface builds");
+    let app: Router<()> = Router::new()
+        .merge(gateway)
+        .layer(middleware::from_fn(authenticate));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let address = listener.local_addr().expect("listener address");
+    let served = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mut socket = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("raw client connects");
+    let body = r#"{"value":3000}"#;
+    let request = format!(
+        "POST /v1/held/rpc/Count HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("the request is written");
+    socket.flush().await.expect("the request is flushed");
+
+    // The actor holds its loop for three seconds, so this hangs up long before
+    // an answer exists. Without the wait the socket could close before the
+    // handler has started and the drop would prove nothing about cancellation.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(socket);
+
+    // Bounded WELL under the actor's 3s hold, and that bound is the whole
+    // measurement. `SignalDrop` fires when the future ends for ANY reason, so a
+    // generous timeout would be satisfied by the call simply completing — the
+    // row would pass with cancellation entirely absent. Arriving within 1.2s of
+    // a hang-up at 200ms is only possible if the hang-up is what ended it.
+    tokio::time::timeout(std::time::Duration::from_millis(1200), dropped_rx.changed())
+        .await
+        .expect("the invocation is dropped when the caller hangs up, before it could finish")
+        .expect("the watch channel is live");
+    assert!(*dropped_rx.borrow(), "the adapter released its future");
+    served.abort();
+}
