@@ -68,9 +68,10 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Claim, Error, Result, Snapshots, StateId};
+use crate::{Claim, Entries, EntryFault, Error, Held, RecordKey, Result, Snapshots, StateId};
 
 /// Snapshots as files under one directory.
 #[derive(Debug, Clone)]
@@ -128,37 +129,42 @@ impl Files {
         self
     }
 
-    /// Where this state's files live. Built from segments the constructor
-    /// already validated, so there is nothing to escape and nothing to check.
+    /// Where this state lives, and the lock that guards it.
+    ///
+    /// Built from segments the constructor already validated, so there is
+    /// nothing to escape and nothing to check. The suffix is the caller's:
+    /// `.snapshot` for one whole value, `.log` for a set of entries.
+    ///
+    /// **One lock for the base rather than one per suffix**, so a name cannot be
+    /// claimed twice by asking for it through two different ports. Both ports
+    /// mean "this state, written by one process", and that is one claim.
     fn paths(&self, id: &StateId) -> (PathBuf, PathBuf) {
         let mut base = self.root.clone();
         for segment in id.segments() {
             base.push(segment);
         }
-        let mut snapshot = base.clone().into_os_string();
-        snapshot.push(".snapshot");
-        let mut lock = base.into_os_string();
+        let mut lock = base.clone().into_os_string();
         lock.push(".lock");
-        (PathBuf::from(snapshot), PathBuf::from(lock))
+        (base, PathBuf::from(lock))
     }
-}
 
-impl Snapshots for Files {
-    type Claim = FileClaim;
-
-    async fn claim(&self, id: &StateId) -> Result<FileClaim> {
-        let (snapshot, lock) = self.paths(id);
-        let parent = snapshot
+    /// Take the lock, which is the first thing both ports do.
+    ///
+    /// Returns the locked file — whose existence *is* the claim — with the base
+    /// path and the directory holding it, because every caller needs all three
+    /// and computing them twice is how they drift.
+    async fn locked(&self, id: &StateId) -> Result<(std::fs::File, PathBuf, PathBuf)> {
+        let (base, lock) = self.paths(id);
+        let parent = base
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.root.clone());
         tokio::fs::create_dir_all(&parent).await?;
 
         let id = id.clone();
-        let limit = self.limit;
         // Opening and locking are blocking calls. `try_lock` in particular parks
         // nothing, but the open can, on a cold or networked filesystem.
-        tokio::task::spawn_blocking(move || {
+        let file = tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -166,19 +172,31 @@ impl Snapshots for Files {
                 .write(true)
                 .open(&lock)?;
             match file.try_lock() {
-                Ok(()) => Ok(FileClaim {
-                    _lock: file,
-                    snapshot,
-                    parent,
-                    limit,
-                }),
+                Ok(()) => Ok(file),
                 // Every other kind of failure is an I/O fault and says so.
                 Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy { id }),
                 Err(std::fs::TryLockError::Error(err)) => Err(Error::Io(err)),
             }
         })
         .await
-        .map_err(|join| Error::Io(std::io::Error::other(join)))?
+        .map_err(|join| Error::Io(std::io::Error::other(join)))??;
+        Ok((file, base, parent))
+    }
+}
+
+impl Snapshots for Files {
+    type Claim = FileClaim;
+
+    async fn claim(&self, id: &StateId) -> Result<FileClaim> {
+        let (lock, base, parent) = self.locked(id).await?;
+        let mut snapshot = base.into_os_string();
+        snapshot.push(".snapshot");
+        Ok(FileClaim {
+            _lock: lock,
+            snapshot: PathBuf::from(snapshot),
+            parent,
+            limit: self.limit,
+        })
     }
 }
 
@@ -246,25 +264,359 @@ impl Claim for FileClaim {
             // 4: the step people skip. Without it the rename can be lost to a
             // power cut and the previous snapshot comes back — which is not
             // corruption, but it is weaker than what this module claims.
-            //
-            // Opening a directory as a file is a POSIX behaviour. On a platform
-            // without it, steps 1 to 3 still hold and only the durability of the
-            // rename itself is at the mercy of the filesystem.
-            #[cfg(unix)]
-            {
-                std::fs::File::open(&parent)?.sync_all()?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = &parent;
-            }
-            Ok(())
+            sync_dir(&parent)
         })
         .await
         .map_err(|join| Error::Io(std::io::Error::other(join)))??;
 
         Ok(())
     }
+}
+
+// ───────────────────────────────────────────── entries, as one append-only log
+
+/// What a set of entries starts with, so that anything else is a loud error
+/// rather than a payload read as garbage. The trailing byte is the layout
+/// version: change the layout, change the byte.
+const LOG_MAGIC: [u8; 8] = *b"keylink\x01";
+
+/// This entry replaces whatever was under its key.
+const OP_PUT: u8 = 1;
+
+/// This entry's key holds nothing from here on.
+const OP_REMOVE: u8 = 2;
+
+/// One operation byte and two big-endian `u32` lengths.
+const RECORD_HEADER: usize = 1 + 4 + 4;
+
+/// One record's bytes: the operation, the two lengths, then the two payloads.
+fn encode(op: u8, key: &RecordKey, value: &[u8]) -> Vec<u8> {
+    let key = key.as_bytes();
+    let mut record = Vec::with_capacity(RECORD_HEADER + key.len() + value.len());
+    record.push(op);
+    // `as` is wrong here and `try_from` is right: a length that did not fit
+    // would be written truncated and read back as a different record.
+    // `RecordKey::MAX_LEN` and `Files::limit` both bound this well below
+    // `u32::MAX`, so the fallback is unreachable and still typed.
+    record.extend_from_slice(&u32::try_from(key.len()).unwrap_or(u32::MAX).to_be_bytes());
+    record.extend_from_slice(&u32::try_from(value.len()).unwrap_or(u32::MAX).to_be_bytes());
+    record.extend_from_slice(key);
+    record.extend_from_slice(value);
+    record
+}
+
+/// Read a log back into the set it describes.
+///
+/// Last write wins, a remove takes its key out, and the surviving entries come
+/// back in the order they were last written in.
+///
+/// **A short read at the end stops the walk in silence.** That is a `put` that
+/// was interrupted by the loss of the process, and the caller's `put` never
+/// resolved, so the caller already treats it as unwritten. Refusing the whole
+/// log for it would turn every crash into an unrecoverable state, which is the
+/// opposite of what a log is for.
+fn replay(id: &StateId, bytes: &[u8]) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fault = |fault| Error::NotALog {
+        id: id.clone(),
+        fault,
+    };
+    if bytes.len() < LOG_MAGIC.len() || bytes[..LOG_MAGIC.len()] != LOG_MAGIC {
+        return Err(fault(EntryFault::WrongMagic));
+    }
+
+    // Tombstoned in place rather than removed, so one pass stays linear: a key
+    // written twice frees its first slot and takes a new one at the end.
+    let mut slots: Vec<Option<(RecordKey, Vec<u8>)>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut at = LOG_MAGIC.len();
+
+    while at + RECORD_HEADER <= bytes.len() {
+        let op = bytes[at];
+        let key_len = read_len(&bytes[at + 1..at + 5]);
+        let value_len = read_len(&bytes[at + 5..at + 9]);
+        let body = at + RECORD_HEADER;
+        let end = body + key_len + value_len;
+        if end > bytes.len() {
+            break;
+        }
+        let key = RecordKey::new(&bytes[body..body + key_len])
+            .map_err(|reason| fault(EntryFault::BadKey(reason)))?;
+        let taken = index.insert(key.as_bytes().to_vec(), slots.len());
+        if let Some(previous) = taken {
+            slots[previous] = None;
+        }
+        match op {
+            OP_PUT => slots.push(Some((key, bytes[body + key_len..end].to_vec()))),
+            OP_REMOVE => {
+                index.remove(key.as_bytes());
+                slots.push(None);
+            }
+            other => return Err(fault(EntryFault::UnknownOperation { op: other })),
+        }
+        at = end;
+    }
+
+    Ok(slots.into_iter().flatten().collect())
+}
+
+/// One big-endian `u32`, as a `usize`.
+///
+/// The slice is always four bytes at every call site, and `unwrap_or` rather
+/// than `expect` because this crate denies both `expect` and `unwrap` outside
+/// tests. A malformed length cannot be produced here: it is read back exactly as
+/// [`encode`] wrote it, and a short read is caught by the bounds check above.
+fn read_len(four: &[u8]) -> usize {
+    let mut bytes = [0_u8; 4];
+    bytes.copy_from_slice(&four[..4]);
+    u32::from_be_bytes(bytes) as usize
+}
+
+/// Entries as append-only logs under one directory, one log per state.
+///
+/// The [`Entries`] adapter, and [`Files`] is the [`Snapshots`] one. They share a
+/// root, a lock protocol and a limit, and they are **two types rather than one
+/// type with two impls** for a reason that was measured rather than guessed:
+/// both traits name their operation `claim`, so a single type carrying both
+/// makes `files.claim(&id)` ambiguous the moment a caller has imported both
+/// traits — which this module's own tests did, and which no amount of
+/// documentation makes pleasant.
+///
+/// The two can share one root safely. A state's lock guards its base name, so
+/// `treasury/ledger` claimed here excludes `treasury/ledger` claimed through
+/// [`Files`], which is the answer a caller wants: one state, one writer.
+#[derive(Debug, Clone)]
+pub struct EntryFiles(Files);
+
+impl EntryFiles {
+    /// Store entry logs under `root`, creating it if it is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the directory cannot be created.
+    pub async fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self(Files::open(root).await?))
+    }
+
+    /// Refuse a single entry larger than this. The default is
+    /// [`Files::DEFAULT_LIMIT`].
+    ///
+    /// Counted on **one record** — the operation byte, the two lengths, the key
+    /// and the value — rather than on the log, which grows without a ceiling
+    /// until [`compact`](Held::compact) is called. A caller that needs the file
+    /// bounded compacts it; there is no setting that makes an append-only log
+    /// refuse an append because of its own length, because the record that
+    /// would be refused is the one carrying the caller's newest fact.
+    #[must_use]
+    pub fn limit(self, bytes: u64) -> Self {
+        Self(self.0.limit(bytes))
+    }
+}
+
+impl Entries for EntryFiles {
+    type Held = FileLog;
+
+    /// Claim this state's entry log, creating it if it is not there.
+    async fn claim(&self, id: &StateId) -> Result<FileLog> {
+        let (lock, base, parent) = self.0.locked(id).await?;
+        let mut log = base.into_os_string();
+        log.push(".log");
+        let log = PathBuf::from(log);
+
+        let opening = log.clone();
+        let creating = parent.clone();
+        let handle = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            use std::io::Write as _;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&opening)?;
+            // A fresh log gets its magic, and both the magic and the directory
+            // entry that holds it reach the disk before the first entry does.
+            if file.metadata()?.len() == 0 {
+                file.write_all(&LOG_MAGIC)?;
+                file.sync_all()?;
+                sync_dir(&creating)?;
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|join| Error::Io(std::io::Error::other(join)))??;
+
+        Ok(FileLog {
+            _lock: lock,
+            id: id.clone(),
+            log,
+            parent,
+            limit: self.0.limit,
+            handle: Some(handle),
+        })
+    }
+}
+
+/// One state's entries, as an append-only log under a held lock.
+///
+/// ```text
+/// <root>/treasury/ledger.log      the entries, newest last
+/// <root>/treasury/ledger.lock     the claim, held by an open file
+/// ```
+///
+/// # Why a log and not a file per entry
+///
+/// A key here is a caller's bytes, and a caller's bytes are not a filename.
+/// One file per entry would need an escaping scheme, would put a directory
+/// entry's cost on every record, and would make recovery a directory walk. A
+/// log length-prefixes both halves, so there is nothing to escape, one `fsync`
+/// per write, and recovery is one sequential read.
+///
+/// The cost is that removed and replaced entries stay on the disk until
+/// [`compact`](Held::compact) rewrites the file. That is what `compact` is for,
+/// and it is why the port says calling it is never required for correctness.
+#[derive(Debug)]
+pub struct FileLog {
+    /// Never read. Its existence *is* the claim: dropping it unlocks.
+    _lock: std::fs::File,
+    id: StateId,
+    log: PathBuf,
+    parent: PathBuf,
+    limit: u64,
+    /// The append handle, taken while a blocking write owns it and put back
+    /// whether that write succeeded or failed — a failed `put` must leave a
+    /// store that can still be written to.
+    handle: Option<std::fs::File>,
+}
+
+impl FileLog {
+    /// Append one record and put it on the disk.
+    async fn append(&mut self, record: Vec<u8>) -> Result<()> {
+        let offered = record.len() as u64;
+        if offered > self.limit {
+            return Err(Error::TooLarge {
+                offered,
+                limit: self.limit,
+            });
+        }
+        let Some(mut file) = self.handle.take() else {
+            // Unreachable: every path below puts the handle back. Typed rather
+            // than unwrapped, because "unreachable" is a claim about today's
+            // call sites and `unwrap` would be a claim about every future one.
+            return Err(Error::Io(std::io::Error::other(
+                "the entry log's write handle was not returned by an earlier write",
+            )));
+        };
+
+        let (file, wrote) = tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+
+            let wrote = file.write_all(&record).and_then(|()| file.sync_data());
+            (file, wrote)
+        })
+        .await
+        .map_err(|join| Error::Io(std::io::Error::other(join)))?;
+
+        self.handle = Some(file);
+        wrote.map_err(Error::Io)
+    }
+}
+
+impl Held for FileLog {
+    async fn load(&self) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+        let bytes = match tokio::fs::read(&self.log).await {
+            Ok(bytes) => bytes,
+            // Never written is not a failure. It is the first run.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        replay(&self.id, &bytes)
+    }
+
+    async fn put(&mut self, key: &RecordKey, bytes: &[u8]) -> Result<()> {
+        self.append(encode(OP_PUT, key, bytes)).await
+    }
+
+    async fn remove(&mut self, key: &RecordKey) -> Result<()> {
+        self.append(encode(OP_REMOVE, key, &[])).await
+    }
+
+    /// Rewrite the log holding only what is still there.
+    ///
+    /// The four steps [`Claim::store`] takes, for the same reason: write a
+    /// temporary file, put it on the disk, rename it over the log, and put the
+    /// rename on the disk. A crash at any point leaves the previous log, which
+    /// is a longer file saying the same thing.
+    async fn compact(&mut self) -> Result<()> {
+        let live = self.load().await?;
+        let mut rewritten = Vec::from(LOG_MAGIC);
+        for (key, value) in &live {
+            rewritten.extend_from_slice(&encode(OP_PUT, key, value));
+        }
+
+        let mut temp = self.log.clone().into_os_string();
+        temp.push(format!(".tmp.{}", std::process::id()));
+        let temp = PathBuf::from(temp);
+        let log = self.log.clone();
+        let parent = self.parent.clone();
+        // Dropped inside the blocking task, so the old handle is closed before
+        // the rename rather than left pointing at an unlinked file.
+        let previous = self.handle.take();
+
+        let handle = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            use std::io::Write as _;
+
+            drop(previous);
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(&rewritten)?;
+            file.sync_all()?;
+            drop(file);
+
+            if let Err(err) = std::fs::rename(&temp, &log) {
+                // Leave nothing behind on a failed replace.
+                let _ = std::fs::remove_file(&temp);
+                return Err(err);
+            }
+            sync_dir(&parent)?;
+
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&log)
+        })
+        .await
+        .map_err(|join| Error::Io(std::io::Error::other(join)))?;
+
+        match handle {
+            Ok(file) => {
+                self.handle = Some(file);
+                Ok(())
+            }
+            // The log on the disk is intact either way — the rename is atomic
+            // and the reopen changes nothing — but this handle can no longer
+            // write, and `append` says so rather than pretending.
+            Err(err) => Err(Error::Io(err)),
+        }
+    }
+}
+
+/// The step people skip: without it a rename can be lost to a power cut.
+///
+/// Opening a directory as a file is a POSIX behaviour. On a platform without
+/// it, the write and the rename still hold and only the durability of the
+/// rename itself is at the mercy of the filesystem.
+fn sync_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,6 +768,231 @@ mod tests {
             Some(&b"small"[..]),
             "a refused store must not disturb what was there"
         );
+    }
+
+    // ─────────────────────────────────────────────────────── the entry log
+
+    async fn logs(name: &str) -> (Scratch, EntryFiles) {
+        let scratch = Scratch::new(name);
+        let files = EntryFiles::open(&scratch.0).await.expect("opens");
+        (scratch, files)
+    }
+
+    fn record(text: &str) -> RecordKey {
+        RecordKey::new(text.as_bytes()).expect("a valid key")
+    }
+
+    /// Everything a log holds, as pairs a test can compare against a literal.
+    async fn entries(log: &FileLog) -> Vec<(Vec<u8>, Vec<u8>)> {
+        log.load()
+            .await
+            .expect("loads")
+            .into_iter()
+            .map(|(key, value)| (key.as_bytes().to_vec(), value))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_log_that_was_never_written_loads_as_nothing() {
+        let (_scratch, files) = logs("empty").await;
+        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        assert_eq!(entries(&log).await, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_second_put_under_one_key_replaces_the_first() {
+        let (_scratch, files) = logs("replace").await;
+        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+
+        log.put(&record("order-1"), b"paid").await.expect("puts");
+        log.put(&record("order-2"), b"held").await.expect("puts");
+        log.put(&record("order-1"), b"refunded")
+            .await
+            .expect("puts");
+
+        assert_eq!(
+            entries(&log).await,
+            vec![
+                (b"order-2".to_vec(), b"held".to_vec()),
+                (b"order-1".to_vec(), b"refunded".to_vec()),
+            ],
+            "a replaced key keeps one entry, and takes its place at the end"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_entry_is_gone_and_its_neighbours_are_not() {
+        let (_scratch, files) = logs("remove").await;
+        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+
+        log.put(&record("order-1"), b"paid").await.expect("puts");
+        log.put(&record("order-2"), b"held").await.expect("puts");
+        log.remove(&record("order-1")).await.expect("removes");
+
+        assert_eq!(
+            entries(&log).await,
+            vec![(b"order-2".to_vec(), b"held".to_vec())]
+        );
+
+        // And removing what is not there is not an error.
+        log.remove(&record("order-9")).await.expect("removes");
+    }
+
+    /// What a caller reads after the process died mid-`put`. The entry being
+    /// written is dropped and everything before it survives, which is the whole
+    /// reason a partial record is not [`Error::NotALog`].
+    #[tokio::test]
+    async fn a_record_cut_in_half_is_dropped_and_the_rest_survives() {
+        let (scratch, files) = logs("truncated").await;
+        let path = scratch.0.join("treasury").join("ledger.log");
+        {
+            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            log.put(&record("order-1"), b"paid").await.expect("puts");
+            log.put(&record("order-2"), b"half-written")
+                .await
+                .expect("puts");
+        }
+
+        let whole = std::fs::metadata(&path).expect("reads").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("opens")
+            .set_len(whole - 5)
+            .expect("truncates");
+
+        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        assert_eq!(
+            entries(&log).await,
+            vec![(b"order-1".to_vec(), b"paid".to_vec())],
+            "the interrupted record goes and the settled one stays"
+        );
+    }
+
+    /// Made red by deleting the magic check: the garbage then reads as an empty
+    /// log, which is the silent-success failure the magic exists to prevent.
+    #[tokio::test]
+    async fn bytes_that_are_not_a_log_are_refused_rather_than_read() {
+        let (scratch, files) = logs("garbage").await;
+        std::fs::create_dir_all(scratch.0.join("treasury")).expect("creates");
+        std::fs::write(
+            scratch.0.join("treasury").join("ledger.log"),
+            b"written by something else entirely",
+        )
+        .expect("writes");
+
+        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let error = log.load().await.expect_err("not a log this build reads");
+        assert!(
+            matches!(
+                error,
+                Error::NotALog {
+                    fault: EntryFault::WrongMagic,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compacting_shortens_the_file_and_changes_nothing_it_holds() {
+        let (scratch, files) = logs("compact").await;
+        let path = scratch.0.join("treasury").join("ledger.log");
+        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+
+        for round in 0..20_u32 {
+            log.put(&record("order-1"), &round.to_be_bytes())
+                .await
+                .expect("puts");
+        }
+        log.put(&record("order-2"), b"held").await.expect("puts");
+        log.remove(&record("order-2")).await.expect("removes");
+
+        let before = std::fs::metadata(&path).expect("reads").len();
+        let held = entries(&log).await;
+        log.compact().await.expect("compacts");
+        let after = std::fs::metadata(&path).expect("reads").len();
+
+        assert_eq!(entries(&log).await, held, "compaction is not a change");
+        assert!(after < before, "{after} is not shorter than {before}");
+
+        // And the handle still writes afterwards, which is the half a rewrite
+        // is most likely to lose.
+        log.put(&record("order-3"), b"new").await.expect("puts");
+        assert_eq!(entries(&log).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_claim_on_one_log_is_refused() {
+        let (_scratch, files) = logs("busy-log").await;
+        let held = files.claim(&id("treasury/ledger")).await.expect("claims");
+
+        let error = files
+            .claim(&id("treasury/ledger"))
+            .await
+            .expect_err("somebody already holds it");
+        assert!(matches!(error, Error::Busy { .. }), "got {error:?}");
+
+        drop(held);
+        files
+            .claim(&id("treasury/ledger"))
+            .await
+            .expect("the claim was released");
+    }
+
+    /// The two ports share one lock per state, so a name claimed through one is
+    /// not available through the other.
+    #[tokio::test]
+    async fn a_snapshot_claim_and_a_log_claim_on_one_name_exclude_each_other() {
+        let scratch = Scratch::new("both-ports");
+        let snapshots = Files::open(&scratch.0).await.expect("opens");
+        let logs = EntryFiles::open(&scratch.0).await.expect("opens");
+
+        let held = Snapshots::claim(&snapshots, &id("treasury/ledger"))
+            .await
+            .expect("claims");
+        let error = Entries::claim(&logs, &id("treasury/ledger"))
+            .await
+            .expect_err("the snapshot port holds it");
+        assert!(matches!(error, Error::Busy { .. }), "got {error:?}");
+
+        drop(held);
+        Entries::claim(&logs, &id("treasury/ledger"))
+            .await
+            .expect("the claim was released");
+    }
+
+    #[tokio::test]
+    async fn an_entry_over_the_limit_is_refused_and_the_log_survives() {
+        let (_scratch, files) = logs("log-limit").await;
+        let files = files.limit(32);
+        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        log.put(&record("order-1"), b"paid").await.expect("puts");
+
+        let error = log
+            .put(&record("order-2"), &[0_u8; 64])
+            .await
+            .expect_err("over the limit");
+        assert!(matches!(error, Error::TooLarge { .. }), "got {error:?}");
+
+        assert_eq!(
+            entries(&log).await,
+            vec![(b"order-1".to_vec(), b"paid".to_vec())],
+            "a refused put must not disturb what was there"
+        );
+        // And the store still works, which a taken-and-not-returned handle
+        // would have broken.
+        log.put(&record("order-3"), b"ok").await.expect("puts");
+    }
+
+    #[test]
+    fn a_record_key_is_bounded_and_never_empty() {
+        assert!(RecordKey::new(Vec::new()).is_err());
+        assert!(RecordKey::new(vec![b'x'; RecordKey::MAX_LEN]).is_ok());
+        assert!(RecordKey::new(vec![b'x'; RecordKey::MAX_LEN + 1]).is_err());
+        // Arbitrary bytes, on purpose: a key is not a path and needs no escape.
+        assert!(RecordKey::new(vec![0, 255, b'/', b'.']).is_ok());
     }
 
     /// The id is a path, and the path stays under the root. This is the test
