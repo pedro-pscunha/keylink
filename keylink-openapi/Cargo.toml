@@ -3,11 +3,12 @@ name = "keylink-openapi"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/pedrocunha/keylink"
+description = "OpenAPI 3.1 and JSON Schema documents for a keylink-http surface"
 
 [dependencies]
-keylink = { path = "../keylink" }
-keylink-http = { path = "../keylink-http" }
+keylink = { path = "../keylink", version = "0.1.0", default-features = false }
+keylink-http = { path = "../keylink-http", version = "0.1.0" }
 # Draft 2020-12 by default, which is the dialect OpenAPI 3.1 requires. This
 # dependency and the JSON model below live HERE and nowhere else: a `service!`
 # user who wants no documents pays for neither.
