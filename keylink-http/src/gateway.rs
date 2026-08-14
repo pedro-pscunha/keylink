@@ -782,6 +782,57 @@ fn is_empty_body(headers: &HeaderMap) -> bool {
     }
 }
 
+/// The `{actor}` segment of an actor-route path, decoded once.
+///
+/// **Read off the RAW path.** Axum's own extractor percent-decodes before
+/// keylink sees a value, so an id carrying `%2F` would arrive already split
+/// into two segments — and the gateway would address the first half on a path
+/// that no longer matches its own template. Task 1 settled that the raw path is
+/// the input; this keeps that true for the segment that names WHO is being
+/// addressed.
+///
+/// Bounded before it is decoded, so an oversized encoded form costs no
+/// allocation, and constructed through [`keylink::ActorId::new`], so a caller
+/// downstream is handed a validated id rather than a string that looks like
+/// one.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the actor handlers, the next slice of Task 6.                   `expect` rather than `allow`: it fires as an unfulfilled                   expectation the moment they land, so the marker cannot                   outlive its reason"
+    )
+)]
+fn decode_actor(path: &str, route_path: &str) -> Option<keylink::ActorId> {
+    let (before, after) = route_path.split_once("{actor}")?;
+    let rest = path.strip_prefix(before)?;
+    let stop = if after.is_empty() {
+        rest.len()
+    } else {
+        rest.find('/')?
+    };
+    let encoded = rest.get(..stop)?;
+    if encoded.is_empty() {
+        return None;
+    }
+    // The literal the template puts AFTER the segment must actually follow it.
+    // Without this, `/v1/a/b/rpc/Sum` yields the actor `a` and a path that no
+    // longer matches its own route — measured, and the first red this row
+    // produced. Axum's router would not route that path here, so this is
+    // defence in depth on the one segment that names who is addressed.
+    let literal = after.split('{').next().unwrap_or(after);
+    if !rest.get(stop..)?.starts_with(literal) {
+        return None;
+    }
+    let decoded = crate::raw_path::parse(
+        encoded,
+        crate::raw_path::Shape::Segment {
+            max_bytes: keylink::MAX_KEY_LEN,
+        },
+    )
+    .ok()?;
+    keylink::ActorId::new(decoded).ok()
+}
+
 /// The `{id}` segment of a byte-route path, as raw text.
 ///
 /// Axum's own path extractor percent-decodes before keylink sees the value,
@@ -1293,6 +1344,68 @@ mod tests {
     /// unrelated `400`, and `polls == 0` held because nothing reached the
     /// body. It now asserts the error CODE, and the service has a `Fetch`
     /// blob method so the request gets that far.
+    /// The actor segment is read off the RAW path, so `%2F` stays one id.
+    ///
+    /// Axum's own path extractor percent-decodes before keylink sees a value.
+    /// An id containing an encoded slash would arrive already split, and the
+    /// gateway would address `a` on a route it thinks is `/a/b/rpc/...` —
+    /// wrong actor, and a path that no longer matches its own template.
+    ///
+    /// Bounded before it is decoded, and decoded once. `MAX_KEY_LEN` is 128, so
+    /// an encoded form is refused past 384 bytes without allocating for it.
+    ///
+    /// **That bound is not watched, and it cannot be from here.** Raising it
+    /// past `MAX_KEY_LEN` came back GREEN at `exit=0`: `ActorId::new` refuses
+    /// the oversized id one line later, so the length assertions below hold
+    /// either way. What the bound buys is that an attacker's megabyte of `%41`
+    /// is refused before it is allocated, and this row cannot see an
+    /// allocation. Recorded rather than claimed.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK31`) by replacing
+    /// `if !rest.get(stop..)?.starts_with(literal) {`
+    /// with `if false {`, which yields `Some(ActorId("a"))` for
+    /// `/v1/a/b/rpc/Sum` — the actor `a` on a path that no longer matches its
+    /// own route.
+    #[test]
+    fn the_actor_segment_is_decoded_once_from_the_raw_path() {
+        let route = "/v1/{actor}/rpc/{method}";
+
+        assert_eq!(
+            super::decode_actor("/v1/tenant-a/rpc/Sum", route).map(|id| id.as_str().to_owned()),
+            Some("tenant-a".to_owned())
+        );
+        assert_eq!(
+            super::decode_actor("/v1/obra%2F4471/rpc/Sum", route).map(|id| id.as_str().to_owned()),
+            Some("obra/4471".to_owned()),
+            "an encoded slash decodes to one id, not to two segments"
+        );
+        assert_eq!(
+            super::decode_actor("/v1/a%20b/rpc/Sum", route).map(|id| id.as_str().to_owned()),
+            Some("a b".to_owned())
+        );
+
+        for wrong in [
+            "/v1//rpc/Sum",
+            "/v1/a/b/rpc/Sum",
+            "/v1/a%2/rpc/Sum",
+            "/v1/a%zz/rpc/Sum",
+            "/v2/a/rpc/Sum",
+        ] {
+            assert_eq!(super::decode_actor(wrong, route), None, "{wrong}");
+        }
+
+        let long = "x".repeat(keylink::MAX_KEY_LEN);
+        assert!(
+            super::decode_actor(&format!("/v1/{long}/rpc/Sum"), route).is_some(),
+            "the longest valid id is still an id"
+        );
+        assert_eq!(
+            super::decode_actor(&format!("/v1/{long}x/rpc/Sum"), route),
+            None,
+            "and one byte past the cap is not"
+        );
+    }
+
     #[tokio::test]
     async fn blob_lookup_refuses_on_headers_before_any_body_poll() {
         let invoked = Arc::new(Mutex::new(Vec::new()));
