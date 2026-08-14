@@ -23,6 +23,9 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# The imported-service fixture: a service DEFINED in another crate, so the
+# generated actor seam is exercised across a crate boundary.
+imported-ledger = { path = "../fixtures/imported-ledger" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 iroh = { workspace = true, features = ["test-utils"] }

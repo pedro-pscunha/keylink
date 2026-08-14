@@ -1,5 +1,5 @@
 [workspace]
-members = ["keylink", "keylink-persist", "keylink-http", "demo"]
+members = ["keylink", "keylink-persist", "keylink-http", "demo", "fixtures/imported-ledger"]
 resolver = "2"
 
 [workspace.dependencies]

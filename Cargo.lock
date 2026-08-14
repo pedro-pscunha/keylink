@@ -1700,6 +1700,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "imported-ledger"
+version = "0.1.0"
+dependencies = [
+ "keylink",
+ "postcard-schema",
+ "serde",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2192,6 +2201,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "imported-ledger",
  "iroh",
  "iroh-blobs",
  "keylink",
