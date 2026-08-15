@@ -245,8 +245,12 @@ fn close_code(rendered: &str) -> Option<u64> {
 pub enum Error {
     /// The connection failed, was refused, or dropped.
     ///
-    /// A schema mismatch surfaces here as "peer doesn't support any known
-    /// protocol" — the ALPN gate rejecting a peer built against different types.
+    /// A schema mismatch is **not** here: `classify_connect` in `rpc.rs`
+    /// narrows the TLS `no_application_protocol` alert into
+    /// [`SchemaMismatch`](Self::SchemaMismatch), so a caller matching this arm
+    /// for a contract disagreement matches nothing. It reaches here only when
+    /// the alert is rendered in a form that narrowing does not recognise, which
+    /// is the deliberate fallback rather than the expected path.
     #[error("transport: {0}")]
     Transport(#[from] Transport),
 
@@ -693,7 +697,11 @@ pub enum Transport {
     /// Binding the local endpoint failed.
     #[error(transparent)]
     Bind(#[from] BindError),
-    /// Dialing the peer failed. A schema mismatch lands here.
+    /// Dialing the peer failed.
+    ///
+    /// A recognised schema mismatch is narrowed out of here into
+    /// [`Error::SchemaMismatch`] before a caller sees it. An unrecognised one
+    /// arrives here, which is why narrowing is written to be narrow.
     #[error(transparent)]
     Connect(#[from] ConnectError),
     /// An established connection failed or was closed.

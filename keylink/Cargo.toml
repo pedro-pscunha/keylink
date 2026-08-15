@@ -206,6 +206,12 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 # `browser.rs` needs both of these and gets both of them.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# For `examples/bridge.rs` and nothing else. The external-service seam takes a
+# method name and a BYTE BODY, so a worked example of it needs a wire format the
+# outside world actually speaks — and keylink's own is postcard, which would
+# demonstrate the mechanism while hiding the motive. A dev-dependency, so it
+# reaches examples and tests and never a published build.
+serde_json = { workspace = true }
 # `test-utils` ships iroh's relay and its pkarr/DNS server as libraries, so
 # `keylink/tests/relay.rs` can run both in-process. Without it every test in this
 # repo binds `presets::Minimal`, and the relay and discovery paths — the ones
@@ -262,6 +268,14 @@ required-features = ["persist-file"]
 name = "payment_approval"
 required-features = ["persist-file"]
 
+# `persist` and NOT `persist-file`, and the difference is the example's subject.
+# `replay_guard` writes its own `Snapshots` adapter over a `Vec<u8>`, so it needs
+# the port and never the filesystem half. Declaring the wider feature would work
+# and would misreport what the file depends on.
+[[example]]
+name = "replay_guard"
+required-features = ["persist"]
+
 # The authoritative gate combines native integration modules into one libtest
 # process. `test = false` keeps ordinary `cargo test` and `clippy --all-targets`
 # from running/linting the same sources twice; the canonical tasks select it by name.
@@ -269,3 +283,25 @@ required-features = ["persist-file"]
 name = "gate"
 path = "gate-tests/gate.rs"
 test = false
+
+# `blobs-fs` is NOT a default feature, so `mise run examples` runs this one with
+# an explicit `--features blobs-fs`. Declared here so that a build without the
+# feature SKIPS the target rather than failing inside iroh-blobs.
+[[example]]
+name = "cold_store"
+required-features = ["blobs-fs", "fs"]
+
+# `gatehouse` reads its allowlist and one node identity out of the environment,
+# which is exactly what the `env` feature is. It is a default feature, so this
+# changes nothing for `mise run examples` and everything for
+# `.mise/tasks/features`, which builds every target at `--no-default-features`.
+[[example]]
+name = "gatehouse"
+required-features = ["env"]
+
+# The synchronous API is a default feature, and `toolroom` is the only target
+# that exercises it. Declared so that `--no-default-features` skips it rather
+# than failing on a module that is not compiled.
+[[example]]
+name = "toolroom"
+required-features = ["blocking"]

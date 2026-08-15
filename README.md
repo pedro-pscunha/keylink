@@ -73,7 +73,31 @@ deep inside a dependency, and `persist-file` stops earlier still, inside tokio.
 - [`keylink-openapi/README.md`](keylink-openapi/README.md) — generating an OpenAPI 3.1 document from a mounted surface
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — the gate, the wire-contract pin, the public API rules, and when `--no-verify` is legitimate
 - `mise run docs` builds the rustdoc, which is the complete API reference
-- Examples: [`reliable_call`](keylink/examples/reliable_call.rs), [`durable_ledger`](keylink/examples/durable_ledger.rs), [`inventory`](keylink-http/examples/inventory.rs), [`gateway`](keylink-openapi/examples/gateway.rs) — commands under [Try it](#try-it)
+- Examples — every one of them is **run** by `mise run gate`, so each is the shape that works rather than the shape a document remembers. The authoritative list is `[tasks.examples]` in [`mise.toml`](mise.toml); commands are under [Try it](#try-it).
+
+| example | what it is about |
+|---|---|
+| [`reliable_call`](keylink/examples/reliable_call.rs) | effectively-once, composed from a key, a `Peer` and `attaching_for` |
+| [`payment_approval`](keylink/examples/payment_approval.rs) | `#[defer]`, `Allowlist::only`, and both durability ports of one store |
+| [`replay_guard`](keylink/examples/replay_guard.rs) | the retry a memory ledger cannot see, and `Applied` inside the state |
+| [`durable_ledger`](keylink/examples/durable_ledger.rs) | `Persist` as an observer, storing inside every turn |
+| [`firmware_depot`](keylink/examples/firmware_depot.rs) | `blob`, `send` and `tell` in one service |
+| [`cold_store`](keylink/examples/cold_store.rs) | a blob store on a disk, and the flush that commits it |
+| [`match_room`](keylink/examples/match_room.rs) | a keyed registry, two callers on one parked reply, and a `feed` clock |
+| [`substation`](keylink/examples/substation.rs) | supervision, and what a caller parked across a restart is told |
+| [`trading_desk`](keylink/examples/trading_desk/main.rs) | one scenario, run locally and over QUIC, against two backpressure policies |
+| [`foundry`](keylink/examples/foundry.rs) | the `compose` patterns: pool, factory, keyed topic, names, group, schedule |
+| [`gatehouse`](keylink/examples/gatehouse.rs) | admission, per-method rules from TOML, and revoking a live connection |
+| [`toll_booth`](keylink/examples/toll_booth.rs) | middleware, and the two budgets that answer alike and mean opposite things |
+| [`control_room`](keylink/examples/control_room.rs) | events, an inspector and a console reading a node over QUIC |
+| [`noticeboard`](keylink/examples/noticeboard.rs) | pushing to peers, which is the direction a request cannot travel |
+| [`bridge`](keylink/examples/bridge.rs) | driving a service from a wire keylink did not design, over one hand-written codec |
+| [`toolroom`](keylink/examples/toolroom.rs) | the synchronous API, from a `main` with no runtime in sight |
+| [`waypoint`](keylink/examples/waypoint.rs) | a hand-written `Dial`, and a handle that finds a peer that moved |
+| [`wire_contract`](keylink/examples/wire_contract.rs) | what moves the ALPN hash, what does not, and what a move costs at dial time |
+| [`fault_lines`](keylink/examples/fault_lines.rs) | eight error types, one condition, and the vocabulary above them |
+| [`inventory`](keylink-http/examples/inventory.rs) | the HTTP gateway on one singleton surface |
+| [`gateway`](keylink-openapi/examples/gateway.rs) | every served surface at once, plus the OpenAPI documents |
 
 The RFCs carry the design reasoning, including the decisions that were reversed.
 

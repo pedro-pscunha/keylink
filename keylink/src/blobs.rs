@@ -470,6 +470,53 @@ impl Blobs {
         Ok(BlobId::from_hash(tag.hash))
     }
 
+    /// Commit everything this store holds, so that it survives the process.
+    ///
+    /// # Why a store needs this at all
+    ///
+    /// iroh-blobs' metadata actor keeps one redb write transaction open across
+    /// a **batch** of commands and commits when the batch ends, which is after
+    /// one second of idle or when a top-level command forces it. So an awaited
+    /// [`add_bytes`](Self::add_bytes) or
+    /// [`fetch_into`](BlobHandle::fetch_into) has been *accepted* rather than
+    /// *committed*, and a process that exits promptly loses it. Measured on a
+    /// 58-byte payload, ten process pairs per arm: dropping the store committed
+    /// it 2 times out of 10, and this call committed it 10 out of 10.
+    ///
+    /// A payload under iroh-blobs' 16 KiB inline threshold lives entirely in
+    /// redb, so losing the transaction loses the content outright rather than
+    /// leaving a recoverable data file.
+    ///
+    /// # The one path that already flushed, and why it is not enough
+    ///
+    /// A store handed to a service through
+    /// [`with_blobs`](crate::ServiceBuilder::with_blobs) is committed by
+    /// [`Server::shutdown`](crate::Server::shutdown), through iroh's router. A
+    /// store that is only a fetch *target* is mounted on nothing, so before this
+    /// method no public call could commit one — which made
+    /// [`Retention::Forever`]'s promise reachable only by inventing a service to
+    /// hang the store on.
+    ///
+    /// # It leaves the store usable
+    ///
+    /// Deliberately `sync_db` and not `shutdown`. Both commit; only one lets the
+    /// caller carry on. A caller that wants the store closed drops it after
+    /// this.
+    ///
+    /// On a [`memory`](Self::memory) store this is a no-op that succeeds, so a
+    /// caller writes the same line either way.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the commit fails. What was already committed is
+    /// intact.
+    pub async fn flush(&self) -> Result<()> {
+        self.store()
+            .sync_db()
+            .await
+            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
+    }
+
     /// Record that an admitted peer may fetch `id`.
     ///
     /// Takes an [`AdmittedPeer`] rather than a connection or an id. A

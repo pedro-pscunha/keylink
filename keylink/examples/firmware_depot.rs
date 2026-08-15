@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use keylink::{Allowlist, BlobId, Blobs, Body, BodyReader, Context, Node, Server};
+use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Node, Server};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -170,7 +170,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // ── 2. Two devices, one image. The address is the same because the bytes
     //       are, and the depot stores one copy however many peers ask.
-    let (kiln_release, kiln_image) = kiln.image("stable".to_string()).await?;
+    //  A `blob` method answers the declared value AND a `BlobHandle`, which is
+    //  a content address plus the node that holds it. That pairing is why the
+    //  call site below names no second ALPN and dials nothing by hand: the
+    //  handle knows both halves and opens the blobs connection itself.
+    let (kiln_release, kiln_image): (Release, BlobHandle) =
+        kiln.image("stable".to_string()).await?;
     let (press_release, press_image) = press.image("stable".to_string()).await?;
     assert_eq!(kiln_release, press_release);
     assert_eq!(

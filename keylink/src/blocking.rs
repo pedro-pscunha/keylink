@@ -157,6 +157,36 @@ impl Node {
         Ok(Self { inner, runtime })
     }
 
+    /// Bind with no relay and no discovery, for a LAN or a test.
+    ///
+    /// The synchronous twin of [`crate::Node::bind_local`]. It was missing, and
+    /// its absence was the one thing that made a synchronous *example*
+    /// impossible: every offline example in this repository binds this way, and
+    /// without it a blocking program had to publish to pkarr and dial n0's
+    /// relays to say hello to a peer on loopback.
+    ///
+    /// This module's own contract is that every type here mirrors its async
+    /// twin method for method, and the list of what is deliberately not
+    /// mirrored names only the streaming `send` and `recv` methods. So the
+    /// omission was an oversight rather than a decision.
+    pub fn bind_local() -> Result<Self> {
+        let runtime = Arc::new(Runtime::new()?);
+        let inner = runtime.run(crate::Node::bind_local())??;
+        Ok(Self { inner, runtime })
+    }
+
+    /// [`Self::bind_local`] with a fixed identity.
+    ///
+    /// Needed more often than its online twin rather than less, for
+    /// [`crate::Node::bind_local_with_secret`]'s reason: with no discovery a
+    /// peer must be allowlisted by an id somebody knew in advance, and a random
+    /// identity per run cannot be.
+    pub fn bind_local_with_secret(secret: SecretKey) -> Result<Self> {
+        let runtime = Arc::new(Runtime::new()?);
+        let inner = runtime.run(crate::Node::bind_local_with_secret(secret))??;
+        Ok(Self { inner, runtime })
+    }
+
     /// Bind using a 64-hex secret from an environment variable.
     ///
     /// Gated on `env` as well as `blocking`: the synchronous API does not need
@@ -217,12 +247,25 @@ impl Node {
     /// # Drop it before you use anything else here
     ///
     /// The guard sets the thread-local that [`Runtime::run`] checks, so while it
-    /// is held **every other method in this module returns
-    /// [`Error::BlockingInAsync`]** — including [`Node::serve`] and every
-    /// generated blocking client call. That is not a bug in the check: blocking
-    /// on a runtime from a thread that runtime considers its own is the
-    /// deadlock this module exists to refuse, and it cannot tell a borrowed
-    /// context from a real one.
+    /// is held **every method in this module that goes through `Runtime::run`
+    /// returns [`Error::BlockingInAsync`]** — every generated blocking client
+    /// call among them. That is not a bug in the check: blocking on a runtime
+    /// from a thread that runtime considers its own is the deadlock this module
+    /// exists to refuse, and it cannot tell a borrowed context from a real one.
+    ///
+    /// # [`Node::serve`] is the exception, and it wants the guard
+    ///
+    /// This paragraph named `serve` as one of the refusals, and it is the
+    /// opposite of what happens. `serve` does not call [`Runtime::run`] at all —
+    /// read its body — so the check never fires for it. What it does call is
+    /// `Server::spawn`, which reaches iroh's router, which spawns. **Without the
+    /// guard it panics**, inside iroh, with `there is no reactor running, must
+    /// be called from the context of a Tokio 1.x runtime`.
+    ///
+    /// So a synchronous program builds its actor AND serves it inside one
+    /// guarded scope, then drops the guard before it calls anything. That is
+    /// what `keylink/examples/toolroom.rs` does, and the panic above is what
+    /// writing it the way this paragraph used to describe produces.
     ///
     /// Hence the braces in the example. Hold the guard while constructing, drop
     /// it, then carry on.

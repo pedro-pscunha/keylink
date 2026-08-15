@@ -36,8 +36,20 @@ use crate::{EndpointAddr, Error, Node, Result};
 
 /// How a typed client is dialled, so [`Peer`] can re-dial one.
 ///
-/// Implemented by every client `service!` generates. A caller does not write
-/// this.
+/// Implemented by every client `service!` generates, which connects to the
+/// address it is handed. Most callers need nothing else.
+///
+/// # Writing one
+///
+/// This trait is public and unsealed, and a hand-written impl is the seam for
+/// **resolving an address at dial time** rather than at handle-construction
+/// time. [`Peer`] calls it on every dial — the first one, the one after
+/// [`Peer::disconnect`], and the automatic reconnect — so an impl that consults
+/// a directory picks up a peer whose routes changed, without the handle being
+/// rebuilt. `examples/waypoint.rs` measures that against a pinned control.
+///
+/// The returned future is [`Send`], so an impl may not hold a lock across its
+/// await. Resolve first, drop the guard, then dial.
 pub trait Dial: Sized {
     /// Dial `addr` from `node`.
     fn dial(

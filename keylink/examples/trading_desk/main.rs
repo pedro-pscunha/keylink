@@ -251,6 +251,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         "the served desk agrees with the handle"
     );
 
+    // ── 5. The third backpressure policy, which neither feed above uses.
+    //
+    //  Nothing here is on the wire, so it runs after the comparison rather than
+    //  inside it.
+    venue::patience().await?;
+
     let _ = system.stop(&alpha, Duration::from_secs(1)).await;
     let _ = system.stop(&bravo, Duration::from_secs(1)).await;
     served_desk.stop().await?;
