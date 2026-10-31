@@ -6,7 +6,7 @@
 //! # The stand-in for generated dispatch
 //!
 //! RFC-01 §3.2 puts the grant inside the code the `service!` macro writes for a
-//! `blob` method, so a handler that returns a [`BlobId`] has already granted it.
+//! `blob` method, so a handler that returns [`Content`] has already granted it.
 //! That macro kind is a later commit. Until it lands, [`Granting`] below is the
 //! same shape by hand: a real `ProtocolHandler`, a real accept, and a grant
 //! taken from the connection iroh proved — which is the only argument
@@ -29,7 +29,9 @@ use iroh_blobs::protocol::{
     PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
-use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Caller, Context, Error, Node, ProvenPeer};
+use keylink::{
+    Allowlist, BlobHandle, BlobId, Blobs, Caller, Content, Context, Error, Node, ProvenPeer,
+};
 use n0_future::StreamExt;
 
 mod common;
@@ -43,7 +45,7 @@ const GRANT_ALPN: &[u8] = b"/keylink-test/grant/1";
 
 /// The stand-in for generated `blob` dispatch.
 ///
-/// A peer asks for a list of addresses and the handler records a grant for each
+/// A peer asks for a list of content and the handler records a grant for each
 /// one against **this connection's** proven peer. A real handler would compute
 /// the list instead of being told it; nothing else about the shape differs, and
 /// the argument `Blobs::grant` takes is what forces that.
@@ -62,7 +64,7 @@ impl ProtocolHandler for Granting {
             .read_to_end(64 * 1024)
             .await
             .map_err(AcceptError::from_err)?;
-        let wanted: Vec<BlobId> = postcard::from_bytes(&asked).map_err(AcceptError::from_err)?;
+        let wanted: Vec<Content> = postcard::from_bytes(&asked).map_err(AcceptError::from_err)?;
 
         // The ladder, in the order a real service walks it: iroh proves the
         // peer, the service's own `Allowlist` admits it, and only the value
@@ -72,7 +74,7 @@ impl ProtocolHandler for Granting {
             return Ok(());
         };
         for id in wanted {
-            self.blobs.grant(&admitted, id);
+            self.blobs.grant(&admitted, id).expect("within budget");
         }
 
         // Answered only after every grant is recorded, so a test that has read
@@ -96,8 +98,12 @@ struct Cluster {
 }
 
 async fn cluster() -> Cluster {
+    cluster_over(Blobs::memory()).await
+}
+
+/// The same, over a store the test already holds.
+async fn cluster_over(blobs: Blobs) -> Cluster {
     let server = local_node().await;
-    let blobs = Blobs::memory();
     let router = Router::builder(server.endpoint().clone())
         .accept(iroh_blobs::ALPN, blobs.protocol())
         .accept(
@@ -119,15 +125,21 @@ async fn cluster() -> Cluster {
 }
 
 impl Cluster {
-    /// Ask the serving node to grant `ids` to `who`.
+    /// Ask the serving node to grant `ids` to `who`, each as one blob.
     async fn grant(&self, who: &Node, ids: &[BlobId]) {
+        let content: Vec<Content> = ids.iter().copied().map(Content::from).collect();
+        self.grant_content(who, &content).await;
+    }
+
+    /// Ask the serving node to grant `content` to `who`.
+    async fn grant_content(&self, who: &Node, content: &[Content]) {
         let conn = who
             .endpoint()
             .connect(self.server.endpoint().addr(), GRANT_ALPN)
             .await
             .expect("dials the granting protocol");
         let (mut send, mut recv) = conn.open_bi().await.expect("opens a stream");
-        let asked = postcard::to_stdvec(&ids.to_vec()).expect("encodes the request");
+        let asked = postcard::to_stdvec(&content.to_vec()).expect("encodes the request");
         send.write_all(&asked).await.expect("writes the request");
         send.finish().expect("finishes the request");
         let answer = recv.read_to_end(64).await.expect("reads the answer");
@@ -252,7 +264,7 @@ async fn a_peer_no_allowlist_admits_cannot_be_granted_anything() {
                 .await
                 .expect("dials the granting protocol");
             let (mut send, mut recv) = conn.open_bi().await.expect("opens a stream");
-            let asked = postcard::to_stdvec(&vec![id]).expect("encodes");
+            let asked = postcard::to_stdvec(&vec![Content::from(id)]).expect("encodes");
             send.write_all(&asked).await.expect("writes");
             send.finish().expect("finishes");
             recv.read_to_end(64).await
@@ -1672,8 +1684,8 @@ impl catalog::Handler for Warehouse {
         "pong".to_owned()
     }
 
-    async fn datasheet(&self, _cx: &Context, _sku: String) -> (Manual, BlobId) {
-        (Manual { pages: 42 }, self.published)
+    async fn datasheet(&self, _cx: &Context, _sku: String) -> (Manual, Content) {
+        (Manual { pages: 42 }, self.published.into())
     }
 }
 
@@ -1685,14 +1697,14 @@ impl catalog::Actor for Warehouse {
         "pong".to_owned()
     }
 
-    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (Manual, BlobId) {
-        (Manual { pages: 42 }, self.published)
+    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (Manual, Content) {
+        (Manual { pages: 42 }, self.published.into())
     }
 }
 
 impl depot::Handler for Warehouse {
-    async fn parcel(&self, _cx: &Context, _sku: String) -> (Manual, BlobId) {
-        (Manual { pages: 1 }, self.published)
+    async fn parcel(&self, _cx: &Context, _sku: String) -> (Manual, Content) {
+        (Manual { pages: 1 }, self.published.into())
     }
 }
 
@@ -2213,7 +2225,7 @@ async fn a_local_keyed_blob_method_returns_its_address() {
         .await
         .expect("the local keyed actor answers");
     assert_eq!(manual.pages, 42);
-    assert_eq!(returned, published);
+    assert_eq!(returned, Content::Blob(published));
 }
 
 /// The startup refusal that could not fire before, and now can.
@@ -2252,39 +2264,39 @@ async fn a_keyed_service_with_blob_methods_and_no_store_is_refused_at_startup() 
 //
 // - the idempotency record, bounded by `MAX_RECORDS`, `MAX_RECORDED_BYTES` and
 //   `RECORD_TTL`, held in the service's `Ledger`;
-// - the grant, bounded by `MAX_GRANTS` and evicted **oldest first across every
-//   peer**, held in the node's grant book.
+// - the grant, which lasts until the holder revokes it, held in the node's
+//   grant book.
 //
 // A `blob` reply is recordable — the generated dispatch answers with
 // `Body::empty()`, so `declared_len()` is `Some(0)`, so `Guard::record` is
 // handed `carries_body: false` and stores the frame rather than
 // `Slot::Unrecordable`. And `serve_one` returns at `Claimed::Replay` **before**
-// the grant site, so a replay re-sends the recorded `BlobId` and records no
+// the grant site, so a replay re-sends the recorded `Content` and records no
 // grant.
 //
 // The question that makes that either harmless or a hole is whether the address
 // carries any authority of its own. It does not: `admits_get` reads the grant
-// book on **every** request, so an address whose grant has been evicted is
+// book on **every** request, so an address whose grant has been revoked is
 // refused however the caller came by it. The test below drives exactly the
-// sequence — record kept, grant evicted, key retried — and pins the refusal.
+// sequence — record kept, grant revoked, key retried — and pins the refusal.
+// Before grants could be revoked the sequence needed 4096 filler grants to push
+// the first one off the end of a bounded queue; a revoke is the same event
+// stated directly.
 
 // The service for the sequence: one pinned address under an idempotency key,
-// and a filler method that hands out a distinct address per call so grants can
-// be counted off the end of the book.
+// and a second method whose grant keeps the caller known to the connection
+// guard.
 keylink::service! {
     service Vault;
 
     blob Receipt(order: String) -> Manual;
-    blob Filler(nth: u64) -> Manual;
+    blob Decoy() -> Manual;
 }
 
 #[derive(Debug, Clone)]
 struct Strongroom {
     receipt: BlobId,
-    /// One address per filler call. Distinct on purpose: a repeat grant takes no
-    /// second slot in the eviction queue, so a filler that returned one address
-    /// would evict nothing.
-    filler: std::sync::Arc<Vec<BlobId>>,
+    decoy: BlobId,
     /// How many times `receipt` was entered. A replayed reply and a re-run one
     /// are byte identical, so this is the only way to prove which path the retry
     /// took — and "the replay never reaches the grant site" is a claim about the
@@ -2293,64 +2305,48 @@ struct Strongroom {
 }
 
 impl vault::Handler for Strongroom {
-    async fn receipt(&self, _cx: &Context, _order: String) -> (Manual, BlobId) {
+    async fn receipt(&self, _cx: &Context, _order: String) -> (Manual, Content) {
         self.entered
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (Manual { pages: 7 }, self.receipt)
+        (Manual { pages: 7 }, self.receipt.into())
     }
 
-    async fn filler(&self, _cx: &Context, nth: u64) -> (Manual, BlobId) {
-        (
-            Manual { pages: 0 },
-            *self
-                .filler
-                .get(nth as usize)
-                .expect("the test asks for an address it added"),
-        )
+    async fn decoy(&self, _cx: &Context) -> (Manual, Content) {
+        (Manual { pages: 0 }, self.decoy.into())
     }
 }
 
-/// **The sequence, over three real endpoints: the record outlives the grant, the
+/// **The sequence, over two real endpoints: the record outlives the grant, the
 /// replay hands the address back, and the fetch is still refused.**
 ///
 /// Countable rather than timed. Nothing here waits for `RECORD_TTL`; the record
 /// is shown to be present by asking the ledger (`key_state` is `Done`), and the
-/// grant is shown to be absent by `MAX_GRANTS` evictions, which is arithmetic.
-///
-/// The `Filler` flood is driven by a **second** peer, which is the part worth
-/// having: `Book::order` is one queue across every peer, so `flood` evicts
-/// `caller`'s grant without `caller` making a single call. A peer therefore
-/// cannot keep its own capability alive by being quiet.
+/// grant is shown to be absent by revoking it.
 ///
 /// The caller then takes one live grant on a **different** blob, and that is
 /// load bearing rather than scenery — see step 3. It is what puts the refusal
 /// at `admits_get` rather than at `BlobsAdmission::accept`, and `admits_get` is
 /// the only guard the claim above is about.
 #[tokio::test]
-async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_fetch_is_refused() {
+async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_was_revoked_and_the_fetch_is_refused(
+) {
     let server = local_node().await;
     let caller = local_node().await;
-    let flood = local_node().await;
     let blobs = Blobs::memory();
 
     let receipt = blobs
         .add_bytes(b"the receipt, recorded under a key".to_vec())
         .await
         .expect("stores");
-    let mut filler = Vec::with_capacity(keylink::MAX_GRANTS);
-    for nth in 0..keylink::MAX_GRANTS {
-        filler.push(
-            blobs
-                .add_bytes(format!("filler {nth}").into_bytes())
-                .await
-                .expect("stores"),
-        );
-    }
+    let decoy = blobs
+        .add_bytes(b"a second blob, to keep the caller known".to_vec())
+        .await
+        .expect("stores");
 
     let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let strongroom = Strongroom {
         receipt,
-        filler: std::sync::Arc::new(filler),
+        decoy,
         entered: std::sync::Arc::clone(&entered),
     };
     let _running = keylink::Server::builder(&server)
@@ -2366,9 +2362,6 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
     let client = vault::Client::connect(&caller, server_addr.clone())
         .await
         .expect("the caller dials");
-    let flooder = vault::Client::connect(&flood, server_addr.clone())
-        .await
-        .expect("the flooding peer dials");
 
     // 1. The keyed call. The grant is recorded at the grant site, and the reply
     //    frame is recorded in the ledger because a `blob` reply carries no body.
@@ -2386,44 +2379,36 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
     handle.copy_to(&mut sink).await.expect("granted");
     assert_eq!(sink, b"the receipt, recorded under a key");
 
-    // 2. Further grants, all to the OTHER peer. The caller's grant is the
-    //    oldest entry in the book, so it is the first one evicted — and one
-    //    grant is already recorded, so `MAX_GRANTS` more takes the queue exactly
-    //    one over the limit. One fewer evicts nothing, which is what the red
-    //    test for this file changes.
-    let to_evict = keylink::MAX_GRANTS;
-    for nth in 0..to_evict {
-        flooder
-            .filler(nth as u64)
-            .await
-            .expect("the filler call runs");
-    }
+    // 2. The holder withdraws the grant. The record in the idempotency ledger is
+    //    a different structure and is untouched.
+    assert!(
+        blobs.revoke(caller.id(), receipt),
+        "the first call recorded a grant, so there is one to revoke"
+    );
 
-    // 3. ONE live grant for the caller, on a DIFFERENT blob, taken AFTER the
-    //    flood so the flood cannot evict it.
+    // 3. ONE live grant for the caller, on a DIFFERENT blob.
     //
     //    **This is the step that makes the refusal at the end mean anything,
-    //    and without it this test passed for the wrong reason.** Eviction pops
-    //    `(caller, receipt)`, `held.remove` empties the caller's set, and
-    //    `Grants::grant` then deletes the caller from `by_peer` outright. A
+    //    and without it this test passed for the wrong reason.** Revoking the
+    //    caller's only grant removes the caller from the ledger outright. A
     //    caller holding zero grants is turned away by `BlobsAdmission::accept`
     //    at `knows(&peer)` — the connection is closed before a single request
     //    is parsed, so `admits_get` is never called. Both refusals arrive as
     //    `Error::BlobRefused`, so `assert_refused` cannot tell them apart, and
-    //    deleting the `permits` check from `admits_get` — the exact check this
+    //    deleting the `scope` check from `admits_get` — the exact check this
     //    test exists to hold — left it green.
     //
     //    With this grant the connection is admitted, and the per-request check
     //    is the only thing left standing between a replayed address and the
     //    bytes. Same idea as `a_grant_to_one_peer_does_not_admit_another_peer`,
     //    which keeps a decoy grant for the same reason.
-    let (_, decoy) = client.filler(0).await.expect("the filler call runs");
+    let (_, kept) = client.decoy().await.expect("the decoy call runs");
     let mut sink = Vec::new();
-    decoy.copy_to(&mut sink).await.expect(
+    kept.copy_to(&mut sink).await.expect(
         "the caller must get past connection admission, or the refusal below \
          is the connection talking and not the grant book",
     );
-    assert_eq!(sink, b"filler 0");
+    assert_eq!(sink, b"a second blob, to keep the caller known");
 
     // 4. The record is still there. This is the half of "two lifetimes" that
     //    makes the sequence reachable at all, and it is asserted rather than
@@ -2444,6 +2429,7 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
         .await
         .expect("the retry is answered from the record");
     assert_eq!(replayed_manual.pages, 7);
+    assert_eq!(replayed.id(), receipt, "the same address came back");
     assert_eq!(
         entered.load(std::sync::atomic::Ordering::Relaxed),
         1,
@@ -2460,7 +2446,7 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
     let error = replayed
         .copy_to(&mut sink)
         .await
-        .expect_err("a replayed address whose grant was evicted must be refused");
+        .expect_err("a replayed address whose grant was revoked must be refused");
     assert_refused(&error, "a replayed address with no live grant");
     assert!(
         sink.is_empty(),
@@ -2474,6 +2460,436 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
     let error = BlobHandle::new(&caller, server_addr, receipt)
         .copy_to(&mut sink)
         .await
-        .expect_err("the evicted grant is gone for every route to the address");
+        .expect_err("the revoked grant is gone for every route to the address");
     assert_refused(&error, "the address spelled out by hand");
+}
+
+// ═══════════════════════════════════════ closures: one grant, a whole tree
+//
+// A `Content::Closure` grant covers a hash sequence and every blob it lists,
+// and it is ONE entry in the ledger however many members there are. These tests
+// run it over real endpoints: the grant comes from generated dispatch where the
+// property is about dispatch, and from the `Granting` fixture where the test
+// needs a raw blobs connection to ask for something keylink's client never
+// sends.
+
+keylink::service! {
+    service Shelf;
+
+    blob Snapshot() -> u32;
+    blob Single(nth: u64) -> u32;
+}
+
+/// 1024 bytes that depend on `nth`, so two members never share an address and a
+/// member read from the wrong place cannot coincidentally equal the right one.
+fn member(nth: u32) -> Vec<u8> {
+    nth.to_le_bytes().repeat(256)
+}
+
+/// Add `member(0..count)` and return their addresses, in order.
+async fn add_members(blobs: &Blobs, count: u32) -> Vec<BlobId> {
+    let mut ids = Vec::with_capacity(count as usize);
+    for nth in 0..count {
+        ids.push(blobs.add_bytes(member(nth)).await.expect("stores a member"));
+    }
+    ids
+}
+
+#[derive(Clone)]
+struct Stacks {
+    seq: keylink::SeqId,
+    ids: Arc<Vec<BlobId>>,
+}
+
+impl shelf::Handler for Stacks {
+    async fn snapshot(&self, _cx: &Context) -> (u32, Content) {
+        (self.ids.len() as u32, self.seq.into())
+    }
+
+    async fn single(&self, _cx: &Context, nth: u64) -> (u32, Content) {
+        (nth as u32, self.ids[nth as usize].into())
+    }
+}
+
+/// A serving node that lists `count` members, and a caller that has dialled it.
+struct Stack {
+    blobs: Blobs,
+    seq: keylink::SeqId,
+    ids: Vec<BlobId>,
+    caller: Node,
+    client: shelf::Client,
+    _server: keylink::Server,
+    _node: Node,
+}
+
+async fn stack(count: u32) -> Stack {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let blobs = Blobs::memory();
+    let ids = add_members(&blobs, count).await;
+    let seq = blobs
+        .add_seq(ids.clone())
+        .await
+        .expect("stores the sequence");
+    let server = keylink::Server::builder(&node)
+        .service(
+            shelf::service(
+                Stacks {
+                    seq,
+                    ids: Arc::new(ids.clone()),
+                },
+                Allowlist::anyone(),
+            )
+            .with_blobs(&blobs)
+            .build(),
+        )
+        .spawn()
+        .expect("one service with a store");
+    let client = shelf::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("the caller dials");
+    Stack {
+        blobs,
+        seq,
+        ids,
+        caller,
+        client,
+        _server: server,
+        _node: node,
+    }
+}
+
+/// Read `ids` back out of `store`, by serving it to a peer and fetching.
+///
+/// `Blobs` has no read of its own, and a test that only asked the store whether
+/// it `missing`-lists nothing would be trusting the answer it is checking.
+async fn read_back(store: &Blobs, ids: &[BlobId]) -> Vec<Vec<u8>> {
+    let held = cluster_over(store.clone()).await;
+    held.grant(&held.peer, ids).await;
+    let mut read = Vec::new();
+    for id in ids {
+        read.push(
+            held.fetch(&held.peer, *id)
+                .await
+                .expect("the store holds it"),
+        );
+    }
+    read
+}
+
+/// **The limit, gone: one grant for a closure of 5000 members.**
+///
+/// The caller makes one call and holds one grant. It then fetches 5000 blobs it
+/// was never granted one by one, which the old ledger could not express: it
+/// would have needed 5000 grants, and it kept 4096.
+#[tokio::test]
+async fn a_closure_of_5000_members_is_fetched_with_one_grant() {
+    let stack = stack(5000).await;
+    let (count, handle) = stack.client.snapshot().await.expect("the one call");
+    assert_eq!(count, 5000);
+    assert_eq!(handle.content(), Content::Closure(stack.seq));
+
+    let local = Blobs::memory();
+    let moved = handle
+        .fetch_into(&local)
+        .await
+        .expect("fetches the closure");
+    assert_eq!(
+        moved,
+        5000 * 1024 + 5000 * 32,
+        "every member's payload and the member list, once"
+    );
+    assert_eq!(
+        local.missing(handle.content()).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+
+    let probes = [0usize, 2499, 4999];
+    let ids: Vec<BlobId> = probes.iter().map(|nth| stack.ids[*nth]).collect();
+    let read = read_back(&local, &ids).await;
+    for (nth, bytes) in probes.iter().zip(read) {
+        assert_eq!(bytes, member(*nth as u32), "member {nth} reads back intact");
+    }
+}
+
+/// A peer holding a closure on `S` asks for a hash `S` does not list. It reads
+/// the same refusal as for a hash the holder never had.
+#[tokio::test]
+async fn a_hash_outside_the_closure_is_refused_like_a_missing_one() {
+    let cluster = cluster().await;
+    let ids = add_members(&cluster.blobs, 4).await;
+    let seq = cluster.blobs.add_seq(ids).await.expect("stores");
+    let secret = cluster.add("in the store, listed by nobody").await;
+    let absent = {
+        let elsewhere = MemStore::new();
+        let tag = elsewhere
+            .add_bytes(b"this node has never seen these bytes".to_vec())
+            .await
+            .expect("adds to a throwaway store");
+        address_of(tag.hash)
+    };
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .await;
+
+    let store = MemStore::new();
+    let ask = |hash| {
+        let store = store.clone();
+        let cluster = &cluster;
+        async move {
+            let conn = cluster.dial_blobs(&cluster.peer).await;
+            store
+                .remote()
+                .execute_get(conn, GetRequest::blob(hash))
+                .await
+        }
+    };
+    let outside = ask(hash_of(secret)).await.expect_err("not in the closure");
+    let missing = ask(hash_of(absent)).await.expect_err("not held at all");
+
+    assert_eq!(
+        outside.iroh_error_code(),
+        Some(iroh_blobs::protocol::ERR_PERMISSION)
+    );
+    assert_eq!(missing.iroh_error_code(), outside.iroh_error_code());
+    assert_eq!(outside.to_string(), missing.to_string());
+    assert!(
+        store.get_bytes(hash_of(secret)).await.is_err(),
+        "the secret was not served"
+    );
+}
+
+/// A member is reached through its root, by position, and never by its own
+/// hash.
+#[tokio::test]
+async fn a_member_is_reached_through_its_root_and_not_by_its_own_hash() {
+    let cluster = cluster().await;
+    let ids = add_members(&cluster.blobs, 10).await;
+    let seq = cluster.blobs.add_seq(ids.clone()).await.expect("stores");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .await;
+
+    let store = MemStore::new();
+    let connect = || cluster.dial_blobs(&cluster.peer);
+    // The root first, so the child index has a list to resolve against.
+    store
+        .remote()
+        .fetch(
+            connect().await,
+            iroh_blobs::HashAndFormat::raw(hash_of(seq.id())),
+        )
+        .await
+        .expect("a closure grant admits its root alone");
+    store
+        .remote()
+        .execute_get(
+            connect().await,
+            GetRequest::builder()
+                .child(7, ChunkRanges::all())
+                .build(hash_of(seq.id())),
+        )
+        .await
+        .expect("member 7, through its root");
+    assert_eq!(
+        store
+            .get_bytes(hash_of(ids[7]))
+            .await
+            .expect("member 7 landed")
+            .as_ref(),
+        member(7).as_slice()
+    );
+
+    let by_hash = store
+        .remote()
+        .execute_get(connect().await, GetRequest::blob(hash_of(ids[8])))
+        .await;
+    assert!(by_hash.is_err(), "member 8 by its own hash is refused");
+    assert!(
+        store.get_bytes(hash_of(ids[8])).await.is_err(),
+        "and was not served"
+    );
+}
+
+/// The have/want half: a store that holds most of a closure is told what it
+/// lacks, and fetches exactly that.
+#[tokio::test]
+async fn missing_names_exactly_the_members_the_store_lacks() {
+    let stack = stack(5000).await;
+    let (_, handle) = stack.client.snapshot().await.expect("the one call");
+
+    let local = Blobs::memory();
+    add_members(&local, 4000).await;
+    assert_eq!(
+        local.missing(handle.content()).await.expect("answers"),
+        keylink::Missing::All,
+        "without the root the members are not known yet"
+    );
+    assert_eq!(
+        handle
+            .missing(&local)
+            .await
+            .expect("fetches the root, answers"),
+        keylink::Missing::Members(stack.ids[4000..5000].to_vec()),
+        "in sequence order, and only what the store lacks"
+    );
+
+    let moved = handle.fetch_into(&local).await.expect("fetches the rest");
+    assert_eq!(
+        moved,
+        1000 * 1024,
+        "the root was already held, and so was the rest"
+    );
+    assert_eq!(
+        handle.missing(&local).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+}
+
+/// Revoking a closure takes effect at the next request.
+#[tokio::test]
+async fn a_revoked_closure_is_refused_on_the_next_request() {
+    let stack = stack(20).await;
+    let (_, handle) = stack.client.snapshot().await.expect("the one call");
+    // A grant on something else, so the caller stays known to the connection
+    // guard and the refusal below comes from `admits_get`.
+    let (_, kept) = stack.client.single(0).await.expect("the decoy call");
+
+    let local = Blobs::memory();
+    handle
+        .fetch_into(&local)
+        .await
+        .expect("granted, so it fetches");
+    handle.open().await.expect("and the root opens");
+
+    assert!(
+        stack.blobs.revoke(stack.caller.id(), stack.seq.id()),
+        "a live grant was withdrawn"
+    );
+    let error = handle.open().await.expect_err("the grant is gone");
+    assert_refused(&error, "a revoked closure");
+    kept.open()
+        .await
+        .expect("control: the other grant is untouched");
+}
+
+/// `revoke_peer` is the immediate cut: the transfer already running stops.
+#[tokio::test]
+async fn revoking_a_peer_cuts_its_transfer_in_flight() {
+    let cluster = cluster().await;
+    let content = vec![7u8; 64 * 1024 * 1024];
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    let handle = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), id);
+    let mut reader = handle.open().await.expect("opens");
+    reader
+        .next_chunk()
+        .await
+        .expect("reads")
+        .expect("the first chunk");
+
+    assert_eq!(cluster.blobs.revoke_peer(cluster.peer.id()), 1);
+
+    let mut read = 0usize;
+    let end = loop {
+        match reader.next_chunk().await {
+            Ok(Some(chunk)) => read += chunk.len(),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    let error = end.expect("the transfer did not run to its end");
+    assert_refused(&error, "a transfer cut by revoke_peer");
+    assert!(read < content.len(), "and it stopped short: {read} bytes");
+}
+
+/// One level deep: a sequence listed by a closure is served as bytes, and its
+/// own members are not covered.
+#[tokio::test]
+async fn a_nested_sequence_is_not_covered_by_its_parents_closure() {
+    let cluster = cluster().await;
+    let secret = cluster.add("listed only by the inner sequence").await;
+    let inner = cluster.blobs.add_seq([secret]).await.expect("stores");
+    let outer = cluster.blobs.add_seq([inner.id()]).await.expect("stores");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(outer)])
+        .await;
+
+    let store = MemStore::new();
+    let connect = || cluster.dial_blobs(&cluster.peer);
+    store
+        .remote()
+        .fetch(
+            connect().await,
+            iroh_blobs::HashAndFormat::raw(hash_of(outer.id())),
+        )
+        .await
+        .expect("the outer root");
+
+    // The control: the inner sequence's own bytes are the outer's member 0.
+    store
+        .remote()
+        .execute_get(
+            connect().await,
+            GetRequest::builder()
+                .child(0, ChunkRanges::all())
+                .build(hash_of(outer.id())),
+        )
+        .await
+        .expect("a member of the outer sequence");
+    assert_eq!(
+        store
+            .get_bytes(hash_of(inner.id()))
+            .await
+            .expect("the inner sequence landed as bytes")
+            .as_ref(),
+        secret.as_bytes()
+    );
+
+    let reach = store
+        .remote()
+        .execute_get(connect().await, GetRequest::all(hash_of(inner.id())))
+        .await;
+    assert!(reach.is_err(), "the inner sequence's members are refused");
+    assert!(
+        store.get_bytes(hash_of(secret)).await.is_err(),
+        "the secret was not served"
+    );
+}
+
+/// The budget refuses loudly and evicts nothing.
+#[tokio::test]
+async fn a_grant_past_the_budget_answers_grants_exhausted_and_evicts_nothing() {
+    let stack = stack(4).await;
+    let budget = keylink::PEER_COST + 2 * keylink::GRANT_COST;
+    stack
+        .blobs
+        .set_grant_budget(std::num::NonZeroUsize::new(budget).expect("non-zero"));
+
+    let (_, first) = stack.client.single(0).await.expect("fits");
+    let (_, second) = stack.client.single(1).await.expect("fits");
+    let error = stack
+        .client
+        .single(2)
+        .await
+        .expect_err("the third grant does not fit");
+    assert!(
+        matches!(
+            error,
+            Error::Remote(keylink::RemoteError::GrantsExhausted { budget: met }) if met == budget as u64
+        ),
+        "expected GrantsExhausted, got {error:?}"
+    );
+
+    let local = Blobs::memory();
+    first
+        .fetch_into(&local)
+        .await
+        .expect("the first still fetches");
+    second
+        .fetch_into(&local)
+        .await
+        .expect("the second still fetches");
 }

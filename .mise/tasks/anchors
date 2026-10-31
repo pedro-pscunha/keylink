@@ -2182,6 +2182,8 @@ ANCHORS = [
      "        if self.emitted == self.len {"),
     ("HK6", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "    if !msg.request.ranges.is_blob() {"),
+    ("HK50", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if scope != Scope::Closure {"),
     ("HK7", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
      "        while let Some(chunk) = self.next_chunk().await? {"),
     ("HK8", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",

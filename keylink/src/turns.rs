@@ -116,7 +116,7 @@
 //!
 //! The method names and success types match the remote client for `rpc` and
 //! `tell`. They do not for the other three: `blob` hands back a
-//! [`BlobId`](crate::BlobId) where the client hands back a
+//! [`Content`](crate::Content) where the client hands back a
 //! [`BlobHandle`](crate::BlobHandle), and `send` and `recv` have no local method
 //! at all. Moving an actor across that boundary is a mechanical edit for two
 //! kinds out of five, and a compile error that needs a decision for the rest —

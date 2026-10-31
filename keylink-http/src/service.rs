@@ -263,8 +263,8 @@ mod tests {
             (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
         }
 
-        async fn asset(&self, _cx: &Context) -> (u64, keylink::BlobId) {
-            (7, self.id)
+        async fn asset(&self, _cx: &Context) -> (u64, keylink::Content) {
+            (7, self.id.into())
         }
 
         async fn ignored_transport(&self, _cx: &Context, _value: u64) {}
@@ -378,8 +378,8 @@ mod tests {
             (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
         }
 
-        async fn asset(&mut self, _cx: keylink::Caller<'_>) -> (u64, keylink::BlobId) {
-            (7, self.id)
+        async fn asset(&mut self, _cx: keylink::Caller<'_>) -> (u64, keylink::Content) {
+            (7, self.id.into())
         }
     }
 

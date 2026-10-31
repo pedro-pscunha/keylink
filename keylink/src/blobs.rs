@@ -29,11 +29,38 @@
 //! per service while blobs is per node, so several services give one node
 //! several answers to "who may connect".
 //!
-//! Instead: returning a [`BlobId`] to a peer records a grant for that exact
-//! `(peer, hash)` pair, and a blobs request is admitted only against a grant.
+//! Instead: returning [`Content`] to a peer records a grant for that exact
+//! `(peer, root)` pair, and a blobs request is admitted only against a grant.
 //! Every entry was therefore created by an RPC that already passed that
 //! service's allowlist and its layers, so the ledger composes across services
 //! whose policies disagree.
+//!
+//! # One grant can cover a whole tree
+//!
+//! A [`Content::Blob`] grant covers one blob and nothing its bytes name. A
+//! [`Content::Closure`] grant covers a hash sequence built by
+//! [`Blobs::add_seq`], its root and every blob the root lists, however many
+//! there are, and it is still **one** entry in the ledger. The peer reaches a
+//! member through the root, by position, because iroh-blobs serves the members
+//! the holder's own copy of the root lists and a request names offsets, never
+//! hashes. A member asked for by its own hash is refused unless it was granted
+//! on its own.
+//!
+//! A closure is one level deep. A listed sequence that is itself a sequence is
+//! served as bytes, and its members are not covered: build one flat sequence
+//! that lists every blob of the tree.
+//!
+//! **A closure grant authorizes every hash its sequence lists.** List only
+//! blobs the recipient may read.
+//!
+//! # A grant lasts until it is revoked, and the ledger has a byte budget
+//!
+//! Nothing expires a grant. [`Blobs::revoke`], [`Blobs::revoke_peer`] and
+//! [`Blobs::revoke_everywhere`] withdraw them, and the ledger charges every
+//! grant against a byte budget ([`GRANT_BUDGET`]). A grant that would exceed it
+//! is refused, loudly, with [`RemoteError::GrantsExhausted`]; nothing is
+//! evicted to make room, because an evicted capability is one the application
+//! believes it handed out. Grants die with the process.
 //!
 //! # One node has one content store
 //!
@@ -49,7 +76,8 @@
 //!
 //! [iroh-blobs]: https://docs.rs/iroh-blobs
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -57,7 +85,8 @@ use bao_tree::io::BaoContentItem;
 use bytes::Bytes;
 use iroh::endpoint::{ConnectError, Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh_blobs::api::blobs::AddBytesOptions;
 use iroh_blobs::api::Store;
 use iroh_blobs::get::request::get_verified_size;
 use iroh_blobs::get::{fsm, GetError};
@@ -69,25 +98,38 @@ use iroh_blobs::provider::events::{
     ProviderMessage, RequestMode, RequestReceived, ThrottleMode,
 };
 use iroh_blobs::store::mem::MemStore;
-use iroh_blobs::{BlobsProtocol, Hash};
+use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, Result};
+use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, RemoteError, Result};
 
-/// Grants one node holds before it starts evicting the oldest.
+/// Default byte budget of one node's grant ledger: 64 MiB.
 ///
-/// RFC-01 §9 Risk 3: grants are never revoked, so a long-lived server that
-/// hands out content to many peers accumulates `(peer, hash)` pairs forever.
-/// Judgement, not measurement, exactly like
-/// [`MAX_RECORDS`](crate::MAX_RECORDS): large enough that an ordinary catalog
-/// fits, small enough that the ledger is a rounding error beside one blob.
+/// The ledger charges [`GRANT_COST`] for each grant and [`PEER_COST`] for each
+/// peer that holds at least one, and refuses a grant that would take the total
+/// past the budget. One closure is one grant, however many blobs it lists.
+/// Change it per store with [`Blobs::set_grant_budget`].
+pub const GRANT_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Bytes the ledger charges for one grant.
 ///
-/// **An evicted grant takes its capability with it.** A peer whose grant fell
-/// off the end is refused until the handler hands it the [`BlobId`] again. That
-/// is the same trade the idempotency ledger makes, and the same reason: a bound
-/// somebody can exhaust is better than a leak nobody can see.
-pub const MAX_GRANTS: usize = 4096;
+/// An upper bound on one `(BlobId, Entry)` slot of a hash table, computed from
+/// `size_of` at compile time rather than written down: one control byte per
+/// slot, times 16/7, which is the emptiest a hashbrown table is just after it
+/// grows. **Derived from the type layout, not measured.** A counting-allocator
+/// test could pin it; none does yet.
+pub const GRANT_COST: usize = ((size_of::<(BlobId, Entry)>() + 1) * 16).div_ceil(7);
+
+/// Bytes the ledger charges for each peer that holds at least one grant.
+///
+/// The peer's slot in the outer table at the same worst load as [`GRANT_COST`],
+/// plus the smallest inner table (4 buckets, their control bytes and one group
+/// of padding). **Derived from the type layout, not measured.**
+pub const PEER_COST: usize = ((size_of::<(EndpointId, HashMap<BlobId, Entry>)>() + 1) * 16)
+    .div_ceil(7)
+    + 4 * (size_of::<(BlobId, Entry)>() + 1)
+    + 16;
 
 // ────────────────────────────────────────────────────────────── the address
 
@@ -156,6 +198,94 @@ impl std::fmt::Debug for BlobId {
     }
 }
 
+/// The address of a hash sequence this store built, or one a peer handed over.
+///
+/// A hash sequence is its members' addresses laid end to end and stored as one
+/// blob, the way iroh-blobs stores a collection. Granting one as
+/// [`Content::Closure`] grants every blob it lists.
+///
+/// **Level 2, honestly labelled**, exactly like [`BlobId`]: the field is private
+/// and the only constructors are [`Blobs::add_seq`] and `Deserialize`. That is
+/// provenance, not an invariant. It stops `Content::Closure(uploaded_blob)` from
+/// compiling, which is the accidental way to grant a closure over bytes a peer
+/// chose, and it does not stop a handler that builds a sequence from hashes a
+/// peer supplied. See [`Blobs::add_seq`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema)]
+pub struct SeqId(BlobId);
+
+impl SeqId {
+    /// The root blob's address, for a log line, a revoke, or a raw read of the
+    /// member list.
+    #[must_use]
+    pub fn id(&self) -> BlobId {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SeqId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Debug for SeqId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SeqId({})", self.0)
+    }
+}
+
+/// What a `blob` method hands out, and so what the caller may fetch.
+///
+/// # Exhaustive, on purpose
+///
+/// Callers construct and match it, and neither variant is feature-gated.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema,
+)]
+pub enum Content {
+    /// One blob: its bytes, and nothing they name.
+    Blob(BlobId),
+    /// A hash sequence and every blob it lists, one level deep. Nested
+    /// sequences are not followed.
+    Closure(SeqId),
+}
+
+impl Content {
+    /// The address the grant is recorded under: the blob, or the sequence's
+    /// root.
+    #[must_use]
+    pub fn root(&self) -> BlobId {
+        match self {
+            Self::Blob(id) => *id,
+            Self::Closure(seq) => seq.id(),
+        }
+    }
+}
+
+impl From<BlobId> for Content {
+    fn from(id: BlobId) -> Self {
+        Self::Blob(id)
+    }
+}
+
+impl From<SeqId> for Content {
+    fn from(seq: SeqId) -> Self {
+        Self::Closure(seq)
+    }
+}
+
+/// What a store lacks of some content, answered from that store alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// The store holds every blob the content names, in full.
+    Nothing,
+    /// The root is not held in full, so the members are not known yet.
+    All,
+    /// The root is held, and these members are not held in full, in sequence
+    /// order (a member listed twice repeats).
+    Members(Vec<BlobId>),
+}
+
 // ──────────────────────────────────────── what the ledger is keyed on, and why
 
 // `ProvenPeer` and `AdmittedPeer` live in `authz.rs`, because admission is an
@@ -186,35 +316,101 @@ impl std::fmt::Debug for BlobId {
 
 // ────────────────────────────────────────────────────────────── the ledger
 
+/// How far a grant reaches.
+///
+/// Ordered, because a closure includes its root: `Closure > Blob`, and a repeat
+/// grant widens an entry and never narrows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    /// The root blob, and nothing its bytes name.
+    Blob,
+    /// The root and every blob it lists, reached through the root.
+    Closure,
+}
+
+impl From<Content> for Scope {
+    fn from(content: Content) -> Self {
+        match content {
+            Content::Blob(_) => Self::Blob,
+            Content::Closure(_) => Self::Closure,
+        }
+    }
+}
+
+/// One `(peer, root)` grant.
+#[derive(Debug)]
+struct Entry {
+    scope: Scope,
+    /// Whether a reply that carried this grant has been written. A reserved
+    /// entry that is not live admits nothing.
+    live: bool,
+    /// Reservations that have not committed or been dropped yet.
+    pending: u32,
+    /// Which incarnation of this `(peer, root)` pair this is. A revoke removes
+    /// the entry, and a permit from before it must not be able to flip an entry
+    /// somebody reserved after it.
+    generation: u64,
+}
+
 /// Which peer may fetch which content.
 ///
-/// Written when a handler returns a [`BlobId`], read by blobs admission. Keyed
-/// by [`ProvenPeer`] rather than by `EndpointId`, which is what stops an
-/// unidentified or merely claimed peer from reaching a decision.
+/// Written when a handler returns [`Content`], read by blobs admission. The
+/// ladder is in the signatures: [`reserve`](Self::reserve) takes an
+/// [`AdmittedPeer`] and is the only write, [`scope`](Self::scope) takes a
+/// [`ProvenPeer`] and is the only read, and the revoke calls take a bare
+/// `EndpointId` because removing a capability cannot widen access.
 #[derive(Debug)]
 struct Grants {
     inner: Mutex<Book>,
-    max: usize,
 }
 
-/// The grants, plus the order to drop them in.
-#[derive(Debug, Default)]
+/// The grants, and what they are charged.
+#[derive(Debug)]
 struct Book {
-    by_peer: HashMap<ProvenPeer, HashSet<BlobId>>,
-    /// Oldest first. Every entry here has a matching entry in `by_peer`, which
-    /// is what makes the eviction bookkeeping a single pass.
-    order: VecDeque<(ProvenPeer, BlobId)>,
+    /// Keyed by `EndpointId` so a revoke is one lookup.
+    by_peer: HashMap<EndpointId, HashMap<BlobId, Entry>>,
+    /// Bytes charged: [`GRANT_COST`] per entry plus [`PEER_COST`] per key of
+    /// `by_peer`.
+    used: usize,
+    budget: usize,
+    next_generation: u64,
+}
+
+/// A grant that would not fit the budget.
+#[derive(Debug)]
+pub(crate) struct Exhausted {
+    pub(crate) budget: usize,
+}
+
+/// A reservation in the ledger, committed once the reply that carries the
+/// grant is on its way.
+///
+/// Dropping one releases the reservation, which is what lets an early return
+/// in `serve_one` stay truthful: a reply that was never written grants nothing.
+#[derive(Debug)]
+#[must_use = "dropping a permit releases its reservation"]
+pub(crate) struct Permit {
+    grants: Arc<Grants>,
+    peer: EndpointId,
+    root: BlobId,
+    scope: Scope,
+    generation: u64,
+    done: bool,
 }
 
 impl Grants {
     fn new() -> Arc<Self> {
-        Self::with_limit(MAX_GRANTS)
+        Self::with_budget(GRANT_BUDGET)
     }
 
-    fn with_limit(max: usize) -> Arc<Self> {
+    fn with_budget(budget: usize) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Book::default()),
-            max,
+            inner: Mutex::new(Book {
+                by_peer: HashMap::new(),
+                used: 0,
+                budget,
+                next_generation: 0,
+            }),
         })
     }
 
@@ -227,45 +423,187 @@ impl Grants {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes an [`AdmittedPeer`], not a [`ProvenPeer`]: a grant is an
-    /// authorization record, so writing one must be downstream of an
-    /// allowlist saying yes. The map keys on the identity underneath,
-    /// because that is all a later blobs connection can prove.
-    fn grant(&self, peer: AdmittedPeer, id: BlobId) {
-        let peer = peer.proven();
-        let mut book = self.lock();
-        // A repeat grant must not take a second slot in the eviction queue, or
-        // a handler that answers one peer in a loop evicts every other peer.
-        if !book.by_peer.entry(peer).or_default().insert(id) {
-            return;
-        }
-        book.order.push_back((peer, id));
-        while book.order.len() > self.max {
-            let Some((stale_peer, stale_id)) = book.order.pop_front() else {
-                break;
-            };
-            let Some(held) = book.by_peer.get_mut(&stale_peer) else {
-                continue;
-            };
-            held.remove(&stale_id);
-            if held.is_empty() {
-                // Not tidiness: `knows` reads this map, so a peer left behind
-                // with an empty set would keep passing connection admission
-                // while holding no grant at all.
-                book.by_peer.remove(&stale_peer);
-            }
-        }
+    fn set_budget(&self, budget: usize) {
+        self.lock().budget = budget;
     }
 
-    fn permits(&self, peer: &ProvenPeer, id: &BlobId) -> bool {
+    /// Reserve a grant. Takes an [`AdmittedPeer`], not a [`ProvenPeer`]: a
+    /// grant is an authorization record, so writing one must be downstream of
+    /// an allowlist saying yes.
+    ///
+    /// A repeat or widening grant for a pair that already has an entry costs
+    /// nothing. A new pair costs [`GRANT_COST`], plus [`PEER_COST`] when it is
+    /// the peer's first, and is refused when that would pass the budget.
+    fn reserve(
+        self: &Arc<Self>,
+        peer: &AdmittedPeer,
+        content: Content,
+    ) -> std::result::Result<Permit, Exhausted> {
+        let peer = peer.id();
+        let root = content.root();
+        let mut book = self.lock();
+        let book = &mut *book;
+        let existing = book
+            .by_peer
+            .get_mut(&peer)
+            .and_then(|held| held.get_mut(&root));
+        let generation = if let Some(entry) = existing {
+            entry.pending += 1;
+            entry.generation
+        } else {
+            let cost = GRANT_COST
+                + if book.by_peer.contains_key(&peer) {
+                    0
+                } else {
+                    PEER_COST
+                };
+            if book.used.saturating_add(cost) > book.budget {
+                return Err(Exhausted {
+                    budget: book.budget,
+                });
+            }
+            let generation = book.next_generation;
+            book.next_generation += 1;
+            book.used += cost;
+            book.by_peer.entry(peer).or_default().insert(
+                root,
+                Entry {
+                    scope: content.into(),
+                    live: false,
+                    pending: 1,
+                    generation,
+                },
+            );
+            generation
+        };
+        Ok(Permit {
+            grants: Arc::clone(self),
+            peer,
+            root,
+            scope: content.into(),
+            generation,
+            done: false,
+        })
+    }
+
+    /// How far `peer`'s grant on `root` reaches, if it holds a live one.
+    fn scope(&self, peer: &ProvenPeer, root: &BlobId) -> Option<Scope> {
         self.lock()
             .by_peer
-            .get(peer)
-            .is_some_and(|held| held.contains(id))
+            .get(&peer.id())?
+            .get(root)
+            .filter(|entry| entry.live)
+            .map(|entry| entry.scope)
     }
 
+    /// Whether `peer` holds, or is about to hold, any grant. A reserved entry
+    /// counts, so a peer whose first grant is still being written passes the
+    /// connection guard; every request it sends is then refused by
+    /// [`scope`](Self::scope), which is the real check.
     fn knows(&self, peer: &ProvenPeer) -> bool {
-        self.lock().by_peer.contains_key(peer)
+        self.lock().by_peer.contains_key(&peer.id())
+    }
+
+    fn revoke(&self, peer: EndpointId, root: BlobId) -> bool {
+        let mut book = self.lock();
+        Self::remove(&mut book, peer, &root).is_some_and(|entry| entry.live)
+    }
+
+    fn revoke_peer(&self, peer: EndpointId) -> usize {
+        let mut book = self.lock();
+        let Some(held) = book.by_peer.remove(&peer) else {
+            return 0;
+        };
+        book.used -= PEER_COST + GRANT_COST * held.len();
+        held.values().filter(|entry| entry.live).count()
+    }
+
+    fn revoke_everywhere(&self, root: BlobId) -> usize {
+        let mut book = self.lock();
+        let peers: Vec<EndpointId> = book
+            .by_peer
+            .iter()
+            .filter(|(_, held)| held.contains_key(&root))
+            .map(|(peer, _)| *peer)
+            .collect();
+        peers
+            .into_iter()
+            .filter_map(|peer| Self::remove(&mut book, peer, &root))
+            .filter(|entry| entry.live)
+            .count()
+    }
+
+    /// Take one entry out and uncharge it, and its peer when it was the last.
+    fn remove(book: &mut Book, peer: EndpointId, root: &BlobId) -> Option<Entry> {
+        let held = book.by_peer.get_mut(&peer)?;
+        let entry = held.remove(root)?;
+        book.used -= GRANT_COST;
+        if held.is_empty() {
+            // Not tidiness: `knows` reads this map, so a peer left behind with
+            // an empty table would keep passing connection admission while
+            // holding no grant at all.
+            book.by_peer.remove(&peer);
+            book.used -= PEER_COST;
+        }
+        Some(entry)
+    }
+}
+
+impl Permit {
+    /// The reply is on its way: make the grant live.
+    ///
+    /// A no-op when the entry was revoked meanwhile, or revoked and reserved
+    /// again by somebody else, which the generation tells apart.
+    pub(crate) fn commit(mut self) {
+        self.done = true;
+        let mut book = self.grants.lock();
+        if let Some(entry) = book
+            .by_peer
+            .get_mut(&self.peer)
+            .and_then(|held| held.get_mut(&self.root))
+            .filter(|entry| entry.generation == self.generation)
+        {
+            entry.pending -= 1;
+            entry.live = true;
+            entry.scope = entry.scope.max(self.scope);
+        }
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut book = self.grants.lock();
+        let Some(entry) = book
+            .by_peer
+            .get_mut(&self.peer)
+            .and_then(|held| held.get_mut(&self.root))
+            .filter(|entry| entry.generation == self.generation)
+        else {
+            return;
+        };
+        entry.pending -= 1;
+        if !entry.live && entry.pending == 0 {
+            Grants::remove(&mut book, self.peer, &self.root);
+        }
+    }
+}
+
+/// Closes a live connection when its peer's grants are withdrawn.
+///
+/// A trait, and not a [`Connection`] in the table, so the unit tests can admit
+/// a connection quinn never saw and watch it being closed.
+trait Hangup: std::fmt::Debug + Send + Sync {
+    fn hang_up(&self);
+}
+
+impl Hangup for Connection {
+    /// The same code and reason iroh-blobs and [`BlobsAdmission`] refuse with,
+    /// so the peer reads [`Error::BlobRefused`].
+    fn hang_up(&self) {
+        self.close(ERR_PERMISSION, b"permission");
     }
 }
 
@@ -275,17 +613,25 @@ impl Grants {
 /// (`provider/events.rs:602`), so the identity has to be remembered from the
 /// accept. Populated **only** by [`BlobsAdmission::accept`], which is the second
 /// guard: a request arriving on a connection keylink never admitted finds
-/// nothing here and is refused.
+/// nothing here and is refused. It also keeps each connection's handle, so
+/// [`Blobs::revoke_peer`] can close the ones a peer has open.
 #[derive(Debug, Default)]
-struct Connections(Mutex<HashMap<u64, ProvenPeer>>);
+struct Connections(Mutex<HashMap<u64, Live>>);
+
+/// One admitted connection.
+#[derive(Debug)]
+struct Live {
+    peer: ProvenPeer,
+    handle: Arc<dyn Hangup>,
+}
 
 impl Connections {
-    fn lock(&self) -> MutexGuard<'_, HashMap<u64, ProvenPeer>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Live>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn admit(&self, connection_id: u64, peer: ProvenPeer) {
-        self.lock().insert(connection_id, peer);
+    fn admit(&self, connection_id: u64, peer: ProvenPeer, handle: Arc<dyn Hangup>) {
+        self.lock().insert(connection_id, Live { peer, handle });
     }
 
     /// Drop an entry only while it still names the peer that took it.
@@ -297,13 +643,31 @@ impl Connections {
     /// comparison costs one lookup and removes that window.
     fn forget(&self, connection_id: u64, peer: ProvenPeer) {
         let mut live = self.lock();
-        if live.get(&connection_id) == Some(&peer) {
+        if live
+            .get(&connection_id)
+            .is_some_and(|held| held.peer == peer)
+        {
             live.remove(&connection_id);
         }
     }
 
     fn peer(&self, connection_id: u64) -> Option<ProvenPeer> {
-        self.lock().get(&connection_id).copied()
+        self.lock().get(&connection_id).map(|held| held.peer)
+    }
+
+    /// Close every connection `peer` has open. Returns how many.
+    fn close_peer(&self, peer: EndpointId) -> usize {
+        // Collected first so the handles are called with the lock released.
+        let handles: Vec<Arc<dyn Hangup>> = self
+            .lock()
+            .values()
+            .filter(|held| held.peer.id() == peer)
+            .map(|held| Arc::clone(&held.handle))
+            .collect();
+        for handle in &handles {
+            handle.hang_up();
+        }
+        handles.len()
     }
 }
 
@@ -311,8 +675,8 @@ impl Connections {
 ///
 /// A plain call after the `await` is not enough: the router drops handler
 /// futures on shutdown, and a dropped future never reaches its next line. Each
-/// cancelled accept would leave one entry behind forever, which is the leak
-/// [`MAX_GRANTS`] exists to prevent one map over.
+/// cancelled accept would leave one entry behind forever, which is a leak one
+/// map over from the one the ledger's byte budget bounds.
 struct Admitted<'a> {
     live: &'a Connections,
     connection_id: u64,
@@ -464,12 +828,107 @@ impl Blobs {
     ///
     /// [`Error::Io`] when the store refuses the write.
     pub async fn add_bytes(&self, data: impl Into<Bytes>) -> Result<BlobId> {
+        let tag = self.store().add_bytes(data).await.map_err(store_error)?;
+        Ok(BlobId::from_hash(tag.hash))
+    }
+
+    /// Store a hash sequence listing `members`, in order, and return its
+    /// address.
+    ///
+    /// Adding grants nothing. A member this store does not hold makes the
+    /// fetcher's closure fetch fail for that member. **A
+    /// [`Content::Closure`] grant authorizes every hash the sequence lists**, so
+    /// build one only from members the recipient may read. In particular, do not
+    /// build one from hashes a peer supplied: that peer could list any hash this
+    /// store holds and read it, and so probe what is stored.
+    ///
+    /// A closure is one level deep: a member that is itself a sequence is served
+    /// as bytes and its own members are not covered, so list every blob of a
+    /// tree in the one sequence.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the store refuses the write.
+    pub async fn add_seq(&self, members: impl IntoIterator<Item = BlobId>) -> Result<SeqId> {
+        let data: Vec<u8> = members.into_iter().flat_map(|member| member.0).collect();
         let tag = self
             .store()
-            .add_bytes(data)
+            .add_bytes_with_opts(AddBytesOptions {
+                data: Bytes::from(data),
+                format: BlobFormat::HashSeq,
+            })
             .await
-            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
-        Ok(BlobId::from_hash(tag.hash))
+            .map_err(store_error)?;
+        Ok(SeqId(BlobId::from_hash(tag.hash)))
+    }
+
+    /// What this store lacks of `content`, without asking any peer.
+    ///
+    /// For a [`Content::Blob`] that is the blob or nothing. For a
+    /// [`Content::Closure`] whose root is held, the root is read in 32 KiB
+    /// windows and each listed member is asked of the store, so the memory is
+    /// one window plus the list of what is missing.
+    ///
+    /// An rpc that relays this answer to a peer makes it an existence oracle on
+    /// this store, unless the handler limits it to hashes that peer may know
+    /// about.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the store fails, and [`Error::BlobUnverified`] with
+    /// [`BlobFault::NotASequence`] when a closure's root is not a whole number of
+    /// 32-byte addresses.
+    pub async fn missing(&self, content: Content) -> Result<Missing> {
+        let root = content.root();
+        if !self.has(root).await? {
+            return Ok(Missing::All);
+        }
+        let Content::Closure(_) = content else {
+            return Ok(Missing::Nothing);
+        };
+        let mut lacking = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let window = self
+                .store()
+                .export_ranges(root.hash(), offset..offset + ROOT_WINDOW)
+                .concatenate()
+                .await
+                .map_err(store_error)?;
+            let (members, rest) = window.as_chunks::<32>();
+            if !rest.is_empty() {
+                return Err(Error::BlobUnverified {
+                    id: root,
+                    fault: BlobFault::NotASequence {
+                        len: offset + window.len() as u64,
+                    },
+                });
+            }
+            for member in members {
+                let member = BlobId(*member);
+                if !self.has(member).await? {
+                    lacking.push(member);
+                }
+            }
+            if (window.len() as u64) < ROOT_WINDOW {
+                break;
+            }
+            offset += ROOT_WINDOW;
+        }
+        Ok(if lacking.is_empty() {
+            Missing::Nothing
+        } else {
+            Missing::Members(lacking)
+        })
+    }
+
+    /// Whether this store holds `id` in full.
+    async fn has(&self, id: BlobId) -> Result<bool> {
+        self.store()
+            .blobs()
+            .has(id.hash())
+            .await
+            .map_err(store_error)
     }
 
     /// Commit everything this store holds, so that it survives the process.
@@ -514,13 +973,53 @@ impl Blobs {
     /// [`Error::Io`] when the commit fails. What was already committed is
     /// intact.
     pub async fn flush(&self) -> Result<()> {
-        self.store()
-            .sync_db()
-            .await
-            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
+        self.store().sync_db().await.map_err(store_error)
     }
 
-    /// Record that an admitted peer may fetch `id`.
+    /// Withdraw `peer`'s grant on `root`; its next request for it is refused.
+    /// Returns whether one was held.
+    ///
+    /// A request that was already admitted runs to completion, bounded by what
+    /// that one request asked for. Use [`revoke_peer`](Self::revoke_peer) for an
+    /// immediate cut. Bytes already delivered are verified content in the
+    /// fetcher's store, and nothing recalls them.
+    pub fn revoke(&self, peer: EndpointId, root: BlobId) -> bool {
+        self.inner.grants.revoke(peer, root)
+    }
+
+    /// Withdraw every grant `peer` holds and close its live blobs connections.
+    /// Returns how many grants.
+    ///
+    /// Its in-flight transfers stop at once and the fetcher reads
+    /// [`Error::BlobRefused`], and a new connection is refused at accept.
+    /// Removing a peer from an [`Allowlist`](crate::Allowlist) or a
+    /// [`DynamicAdmission`](crate::DynamicAdmission) does not touch its blob
+    /// grants, because the ledger is per node and does not record which service
+    /// granted what: drop the peer from admission first, then call this.
+    pub fn revoke_peer(&self, peer: EndpointId) -> usize {
+        let grants = self.inner.grants.revoke_peer(peer);
+        self.inner.live.close_peer(peer);
+        grants
+    }
+
+    /// Withdraw every peer's grant on `root`. Returns how many grants.
+    ///
+    /// The same in-flight rule as [`revoke`](Self::revoke).
+    pub fn revoke_everywhere(&self, root: BlobId) -> usize {
+        self.inner.grants.revoke_everywhere(root)
+    }
+
+    /// Set the byte budget of the grant ledger every clone of this store
+    /// shares. The default is [`GRANT_BUDGET`].
+    ///
+    /// Takes effect at the next new grant. Grants already held are kept even
+    /// when they exceed it.
+    pub fn set_grant_budget(&self, bytes: NonZeroUsize) {
+        self.inner.grants.set_budget(bytes.get());
+    }
+
+    /// Record a grant outside generated dispatch. Test fixtures only; dispatch
+    /// reserves, and commits once the reply is on its way.
     ///
     /// Takes an [`AdmittedPeer`] rather than a connection or an id. A
     /// connection would prove only identity, and an id proves nothing at all —
@@ -529,11 +1028,26 @@ impl Blobs {
     /// of an `AdmittedPeer` is `Allowlist::admit`, so the policy has already
     /// run by the time this can be called.
     ///
-    /// Generated `blob` dispatch calls it, so a handler that returns a
-    /// [`BlobId`] has already granted it and there is no call to forget.
+    /// # Errors
+    ///
+    /// [`Error::Remote`] carrying [`RemoteError::GrantsExhausted`] when the
+    /// budget refuses it.
     #[doc(hidden)]
-    pub fn grant(&self, peer: &AdmittedPeer, id: BlobId) {
-        self.inner.grants.grant(*peer, id);
+    pub fn grant(&self, peer: &AdmittedPeer, content: Content) -> Result<()> {
+        self.reserve(peer, content)
+            .map_err(|full| Error::Remote(exhausted(&full)))?
+            .commit();
+        Ok(())
+    }
+
+    /// Reserve a grant, to be committed once the reply that carries it is
+    /// written.
+    pub(crate) fn reserve(
+        &self,
+        peer: &AdmittedPeer,
+        content: Content,
+    ) -> std::result::Result<Permit, Exhausted> {
+        self.inner.grants.reserve(peer, content)
     }
 
     /// The mount, with the ledger attached.
@@ -566,7 +1080,7 @@ impl Blobs {
     }
 }
 
-/// Whether a reply hands out a content address.
+/// Whether a reply hands out content.
 ///
 /// Implemented by every generated `Response`, so the RPC layer can record a
 /// grant without knowing anything about the service's types. `serve_one` is the
@@ -589,8 +1103,23 @@ impl Blobs {
 /// A keyed actor answers with the service's own `Response` now, so the generated
 /// impl below is the only one, it is honest, and `blob` works on a keyed actor.
 pub trait Granting {
-    /// The content this reply names, if it names any.
-    fn granted(&self) -> Option<BlobId>;
+    /// The content this reply hands out, if it hands out any.
+    fn granted(&self) -> Option<Content>;
+}
+
+/// How much of a closure's root is read per store call: 1024 members.
+const ROOT_WINDOW: u64 = 32 * 1024;
+
+/// A store failure, as keylink reports every one.
+fn store_error(error: impl std::fmt::Display) -> Error {
+    Error::Io(std::io::Error::other(error.to_string()))
+}
+
+/// The refusal a caller reads when the ledger will not take its grant.
+pub(crate) fn exhausted(full: &Exhausted) -> RemoteError {
+    RemoteError::GrantsExhausted {
+        budget: full.budget as u64,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────── the mount
@@ -632,7 +1161,8 @@ impl ProtocolHandler for BlobsAdmission {
         // a granted fetch SUCCEEDS, so a broken derivation turns a test red
         // instead of turning the feature off.
         let connection_id = connection.stable_id() as u64;
-        self.live.admit(connection_id, peer);
+        self.live
+            .admit(connection_id, peer, Arc::new(connection.clone()));
         let _admitted = Admitted {
             live: &self.live,
             connection_id,
@@ -690,8 +1220,9 @@ fn policy(grants: Arc<Grants>, live: Arc<Connections>) -> EventSender {
                     let verdict = admits_get(&grants, &live, &msg.inner);
                     msg.tx.send(verdict).await.ok();
                 }
-                // keylink hands out one raw blob per grant. Nothing else is
-                // reachable through a `blob` method, so nothing else is served.
+                // No keylink caller sends one: a closure's members travel by
+                // offset under their root, so a request that names hashes of
+                // its own has no use here and is not served.
                 ProviderMessage::GetManyRequestReceived(msg) => {
                     msg.tx.send(Err(AbortReason::Permission)).await.ok();
                 }
@@ -757,8 +1288,16 @@ fn admits_connection(
 /// So under a hash-only check, a grant on any 32-aligned blob is a capability
 /// for every blob its bytes happen to address. The trigger is **alignment, not
 /// intent**: a 64-byte key file qualifies, and so does anything else whose
-/// length is a multiple of 32. Requiring `ranges.is_blob()` — a single range
-/// set, starting at offset 0 — refuses the child request outright.
+/// length is a multiple of 32. A [`Scope::Blob`] grant is therefore admitted
+/// only for a request that stays on the root (`ranges.is_blob()`: one range set
+/// at offset 0).
+///
+/// A [`Scope::Closure`] grant is admitted for any ranges under its root,
+/// because its root was built by [`Blobs::add_seq`] and intent is stated: the
+/// holder lists exactly the members it means to hand out. iroh-blobs serves
+/// only the members its own copy of the root lists, by offset, and the request
+/// names no hash. Admission reads nothing from the store and costs the same for
+/// a five-member sequence and a fifty-thousand-member one.
 ///
 /// This stays a runtime check on purpose. It is peer-supplied data arriving at
 /// the edge, which is the one place a guard belongs (peak-rust rule 2): no type
@@ -768,22 +1307,24 @@ fn admits_get(
     live: &Connections,
     msg: &RequestReceived<GetRequest>,
 ) -> std::result::Result<(), AbortReason> {
-    if !msg.request.ranges.is_blob() {
-        return Err(AbortReason::Permission);
-    }
     let Some(peer) = live.peer(msg.connection_id) else {
         return Err(AbortReason::Permission);
     };
-    if grants.permits(&peer, &BlobId::from_hash(msg.request.hash)) {
-        Ok(())
-    } else {
-        Err(AbortReason::Permission)
+    let Some(scope) = grants.scope(&peer, &BlobId::from_hash(msg.request.hash)) else {
+        return Err(AbortReason::Permission);
+    };
+    if !msg.request.ranges.is_blob() {
+        // Reaches past the root. Only a closure grant covers that.
+        if scope != Scope::Closure {
+            return Err(AbortReason::Permission);
+        }
     }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────── the client
 
-/// A content address plus the node that holds it.
+/// Content plus the node that holds it.
 ///
 /// Opens the blobs connection internally, so a call site names no ALPN and no
 /// second dial.
@@ -799,7 +1340,7 @@ fn admits_get(
 pub struct BlobHandle {
     endpoint: Endpoint,
     holder: EndpointAddr,
-    id: BlobId,
+    content: Content,
 }
 
 impl BlobHandle {
@@ -807,34 +1348,70 @@ impl BlobHandle {
     ///
     /// A `blob` method hands back a [`BlobHandle`] already built, and that is
     /// the ordinary route. This constructor is for the other one: a [`BlobId`]
-    /// is `Serialize`, so a peer can pass an address on to somebody else, and
-    /// that recipient needs a way to spend it.
+    /// or a [`SeqId`] is `Serialize`, so a peer can pass an address on to
+    /// somebody else, and that recipient needs a way to spend it.
     ///
     /// **An address is not a capability.** The grant is recorded for the exact
-    /// `(peer, hash)` pair the *handler* answered, so a handle built here
+    /// `(peer, root)` pair the *handler* answered, so a handle built here
     /// reaches the content only if the holder has already granted it to this
-    /// node. Building one for an address nobody granted you is refused at the
-    /// fetch, not here.
+    /// node, at least as widely as the handle claims. Building one for an
+    /// address nobody granted you is refused at the fetch, not here.
     #[must_use]
-    pub fn new(node: &Node, holder: impl Into<EndpointAddr>, id: BlobId) -> Self {
-        Self::on(node.endpoint().clone(), holder, id)
+    pub fn new(node: &Node, holder: impl Into<EndpointAddr>, content: impl Into<Content>) -> Self {
+        Self::on(node.endpoint().clone(), holder, content.into())
     }
 
     /// The same handle, built from the endpoint a live client is already
     /// dialling on. Generated `blob` client code takes this route, because an
     /// `RpcClient` holds an endpoint and a peer rather than a `Node`.
-    pub(crate) fn on(endpoint: Endpoint, holder: impl Into<EndpointAddr>, id: BlobId) -> Self {
+    pub(crate) fn on(
+        endpoint: Endpoint,
+        holder: impl Into<EndpointAddr>,
+        content: Content,
+    ) -> Self {
         Self {
             endpoint,
             holder: holder.into(),
-            id,
+            content,
         }
     }
 
-    /// The content address, for logging or for a later fetch.
+    /// The root address: the blob, or the sequence's root.
+    ///
+    /// [`open`](Self::open), [`open_range`](Self::open_range),
+    /// [`verified_len`](Self::verified_len) and [`copy_to`](Self::copy_to) read
+    /// this blob, which for a closure is its member list.
     #[must_use]
     pub fn id(&self) -> BlobId {
-        self.id
+        self.content.root()
+    }
+
+    /// What the holder granted: one blob, or a closure.
+    #[must_use]
+    pub fn content(&self) -> Content {
+        self.content
+    }
+
+    /// What `store` lacks of this content.
+    ///
+    /// For a closure whose root `store` does not hold, this first fetches the
+    /// root into `store`, on one dial, because the members cannot be named
+    /// before it. That fetch is the one request the holder's closure grant
+    /// admits for it, and it moves only the member list.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`fetch_into`](Self::fetch_into), and
+    /// [`Error::BlobUnverified`] with [`BlobFault::NotASequence`] when the root
+    /// is not a whole number of addresses.
+    pub async fn missing(&self, store: &Blobs) -> Result<Missing> {
+        if let Content::Closure(_) = self.content {
+            if !store.has(self.id()).await? {
+                let connection = self.dial().await?;
+                self.fetch_root(&connection, store).await?;
+            }
+        }
+        store.missing(self.content).await
     }
 
     /// The verified size of the content, without transferring it.
@@ -855,7 +1432,7 @@ impl BlobHandle {
     }
 
     async fn verified_len_on(&self, connection: &Connection) -> Result<u64> {
-        get_verified_size(connection, &self.id.hash())
+        get_verified_size(connection, &self.id().hash())
             .await
             .map(|(size, _)| size)
             .map_err(|error| self.classify(error, connection))
@@ -918,7 +1495,7 @@ impl BlobHandle {
 
     fn no_such_range(&self, len: u64, range: &Range<u64>) -> Error {
         Error::BlobRange {
-            id: self.id,
+            id: self.id(),
             len,
             start: range.start,
             end: range.end,
@@ -950,7 +1527,7 @@ impl BlobHandle {
         let (content, announced) = self.request(&connection, ranges).await?;
         if announced != total {
             return Err(Error::BlobUnverified {
-                id: self.id,
+                id: self.id(),
                 fault: BlobFault::Size {
                     announced,
                     verified: total,
@@ -960,7 +1537,7 @@ impl BlobHandle {
         Ok(BlobReader {
             connection,
             total,
-            take: Selection::new(self.id, start, len),
+            take: Selection::new(self.id(), start, len),
             state: State::Reading(content),
         })
     }
@@ -983,7 +1560,7 @@ impl BlobHandle {
         connection: &Connection,
         ranges: ChunkRanges,
     ) -> Result<(fsm::AtBlobContent, u64)> {
-        let request = GetRequest::new(self.id.hash(), ChunkRangesSeq::from_ranges([ranges]));
+        let request = GetRequest::new(self.id().hash(), ChunkRangesSeq::from_ranges([ranges]));
         let at = fsm::start(connection.clone(), request, fsm::RequestCounters::default());
         let connected = at
             .next()
@@ -1000,7 +1577,7 @@ impl BlobHandle {
             // reader of the second to look in the wrong place.
             return Err(Error::Io(std::io::Error::other(format!(
                 "blob {} root-only request did not start at the root",
-                self.id
+                self.id()
             ))));
         };
         root.next()
@@ -1025,15 +1602,25 @@ impl BlobHandle {
         self.open().await?.copy_to(sink).await
     }
 
-    /// Fetch into a local store.
+    /// Fetch into a local store everything this handle grants that `store`
+    /// lacks. Returns the payload bytes that crossed the wire.
     ///
     /// Deduplication and resume come from the store: an interrupted transfer
-    /// continues where it stopped, and content already present costs nothing.
-    /// Returns the payload bytes that crossed the wire, which is zero for a
-    /// blob the store already held. Measured by
+    /// continues where it stopped, and content already present costs nothing,
+    /// which is zero for a blob the store already held. Measured by
     /// `interrupted_fetch_into_resumes_from_store_progress`: after an answer
     /// cut in half, the second fetch read 37232 of 70000 bytes, so the two
     /// whole 16 KiB blocks the store had already validated were kept.
+    ///
+    /// # A closure is fetched in two phases, on one dial
+    ///
+    /// First the root alone, which costs no request when the store already holds
+    /// it. Then the members, and only the members the store lacks: iroh-blobs
+    /// computes what is missing from the local copy of the root and asks for
+    /// exactly that. Fetching the sequence in one request would send the whole
+    /// closure when the root is absent, because the fetcher cannot know which
+    /// members it holds until it holds the list. The holder's grant is its
+    /// claim that it has the closure.
     ///
     /// # It does not inherit the reader's size guarantee, on purpose
     ///
@@ -1051,13 +1638,37 @@ impl BlobHandle {
     /// The same set as [`copy_to`](Self::copy_to).
     pub async fn fetch_into(&self, store: &Blobs) -> Result<u64> {
         let connection = self.dial().await?;
-        let watched = connection.clone();
+        let mut bytes = self.fetch_root(&connection, store).await?;
+        if let Content::Closure(_) = self.content {
+            bytes += self
+                .fetch_with(
+                    &connection,
+                    store,
+                    HashAndFormat::hash_seq(self.id().hash()),
+                )
+                .await?;
+        }
+        Ok(bytes)
+    }
+
+    /// The root alone, as a raw blob.
+    async fn fetch_root(&self, connection: &Connection, store: &Blobs) -> Result<u64> {
+        self.fetch_with(connection, store, HashAndFormat::raw(self.id().hash()))
+            .await
+    }
+
+    async fn fetch_with(
+        &self,
+        connection: &Connection,
+        store: &Blobs,
+        what: HashAndFormat,
+    ) -> Result<u64> {
         let stats = store
             .store()
             .remote()
-            .fetch(connection, self.id.hash())
+            .fetch(connection.clone(), what)
             .await
-            .map_err(|error| self.classify(error, &watched))?;
+            .map_err(|error| self.classify(error, connection))?;
         Ok(stats.payload_bytes_read)
     }
 
@@ -1087,7 +1698,7 @@ impl BlobHandle {
     /// connection rather than on the error, which is why the connection is
     /// still in hand here.
     fn classify(&self, error: GetError, connection: &Connection) -> Error {
-        classify(self.id, error, connection)
+        classify(self.id(), error, connection)
     }
 
     /// The same question, asked one layer earlier.
@@ -1104,7 +1715,7 @@ impl BlobHandle {
         } = &error
         {
             if is_permission(closed) {
-                return Error::BlobRefused { id: self.id };
+                return Error::BlobRefused { id: self.id() };
             }
         }
         Error::Transport(error.into())
@@ -1429,60 +2040,246 @@ mod tests {
         BlobId([seed; 32])
     }
 
+    /// A grant as dispatch records it: reserved, then committed.
+    fn grant(grants: &Arc<Grants>, seed: u8, content: impl Into<Content>) {
+        grants
+            .reserve(&admitted(seed), content.into())
+            .expect("within budget")
+            .commit();
+    }
+
+    fn scope(grants: &Grants, seed: u8, root: BlobId) -> Option<Scope> {
+        grants.scope(&peer(seed), &root)
+    }
+
+    fn seq(seed: u8) -> SeqId {
+        SeqId(blob(seed))
+    }
+
+    /// Records the hang-ups it is asked for, in place of a quinn connection.
+    #[derive(Debug, Default)]
+    struct Hung(std::sync::atomic::AtomicUsize);
+
+    impl Hangup for Hung {
+        fn hang_up(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn hung(live: &Connections, id: u64, seed: u8) -> Arc<Hung> {
+        let handle = Arc::new(Hung::default());
+        live.admit(id, peer(seed), handle.clone());
+        handle
+    }
+
+    fn hangups(handle: &Hung) -> usize {
+        handle.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[test]
     fn a_grant_admits_exactly_the_content_it_names() {
         let grants = Grants::new();
-        grants.grant(admitted(1), blob(7));
+        grant(&grants, 1, blob(7));
 
         assert!(grants.knows(&peer(1)));
-        assert!(grants.permits(&peer(1), &blob(7)));
-        assert!(!grants.permits(&peer(1), &blob(8)));
-        assert!(!grants.permits(&peer(2), &blob(7)));
+        assert_eq!(scope(&grants, 1, blob(7)), Some(Scope::Blob));
+        assert_eq!(scope(&grants, 1, blob(8)), None);
+        assert_eq!(scope(&grants, 2, blob(7)), None);
         assert!(!grants.knows(&peer(2)));
     }
 
+    /// The old ledger kept 4096 grants and evicted the oldest beyond that, so a
+    /// peer's capability could vanish without anybody revoking it. 5000 is past
+    /// that deleted `MAX_GRANTS`, and every one of them is still held.
     #[test]
-    fn the_ledger_evicts_the_oldest_grant_rather_than_growing() {
-        let grants = Grants::with_limit(2);
-        grants.grant(admitted(1), blob(1));
-        grants.grant(admitted(1), blob(2));
-        grants.grant(admitted(1), blob(3));
-
-        assert!(!grants.permits(&peer(1), &blob(1)), "oldest is evicted");
-        assert!(grants.permits(&peer(1), &blob(2)));
-        assert!(grants.permits(&peer(1), &blob(3)));
-        assert_eq!(grants.lock().order.len(), 2);
+    fn grants_past_the_old_cap_of_4096_are_all_kept() {
+        let grants = Grants::new();
+        for nth in 0..5000u32 {
+            let mut root = [0u8; 32];
+            root[..4].copy_from_slice(&nth.to_le_bytes());
+            grant(&grants, 1, BlobId(root));
+        }
+        for nth in 0..5000u32 {
+            let mut root = [0u8; 32];
+            root[..4].copy_from_slice(&nth.to_le_bytes());
+            assert_eq!(
+                scope(&grants, 1, BlobId(root)),
+                Some(Scope::Blob),
+                "grant {nth} was evicted"
+            );
+        }
     }
 
     #[test]
-    fn a_repeated_grant_does_not_consume_a_second_slot() {
-        let grants = Grants::with_limit(2);
-        grants.grant(admitted(1), blob(1));
-        grants.grant(admitted(1), blob(1));
-        grants.grant(admitted(1), blob(2));
+    fn a_closure_costs_one_grant_whatever_it_lists() {
+        let grants = Grants::new();
+        grant(&grants, 1, seq(5));
 
-        // Without the duplicate check, three pushes against a cap of two would
-        // have evicted blob(1) — the grant the peer still holds.
-        assert!(grants.permits(&peer(1), &blob(1)));
-        assert!(grants.permits(&peer(1), &blob(2)));
+        let book = grants.lock();
+        assert_eq!(book.used, PEER_COST + GRANT_COST);
+        assert_eq!(book.by_peer.len(), 1);
+        assert_eq!(book.by_peer.values().next().map(HashMap::len), Some(1));
     }
 
     #[test]
-    fn a_peer_whose_last_grant_is_evicted_is_no_longer_known() {
-        let grants = Grants::with_limit(1);
-        grants.grant(admitted(1), blob(1));
-        grants.grant(admitted(2), blob(2));
+    fn a_grant_past_the_budget_is_refused_and_nothing_is_evicted() {
+        let budget = PEER_COST + 2 * GRANT_COST;
+        let grants = Grants::with_budget(budget);
+        grant(&grants, 1, blob(1));
+        grant(&grants, 1, blob(2));
+
+        let refused = grants
+            .reserve(&admitted(1), blob(3).into())
+            .expect_err("the third grant does not fit");
+        assert_eq!(refused.budget, budget);
+        assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Blob));
+        assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
+        assert_eq!(scope(&grants, 1, blob(3)), None);
+        assert!(
+            !grants.lock().by_peer[&admitted(1).id()].contains_key(&blob(3)),
+            "a refused reservation leaves no entry behind"
+        );
+    }
+
+    #[test]
+    fn a_repeat_or_widening_grant_costs_nothing() {
+        let grants = Grants::new();
+        grant(&grants, 1, blob(4));
+        let used = grants.lock().used;
+
+        grant(&grants, 1, blob(4));
+        assert_eq!(grants.lock().used, used, "a repeat is free");
+        assert_eq!(scope(&grants, 1, blob(4)), Some(Scope::Blob));
+
+        grant(&grants, 1, seq(4));
+        assert_eq!(grants.lock().used, used, "a widening is free");
+        assert_eq!(scope(&grants, 1, blob(4)), Some(Scope::Closure));
+
+        grant(&grants, 1, blob(4));
+        assert_eq!(
+            scope(&grants, 1, blob(4)),
+            Some(Scope::Closure),
+            "a narrower repeat does not narrow it"
+        );
+    }
+
+    #[test]
+    fn a_revoke_while_a_grant_is_pending_wins() {
+        let grants = Grants::new();
+        let pending = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        assert!(
+            !grants.revoke(admitted(1).id(), blob(1)),
+            "a reserved grant is not a held one"
+        );
+        pending.commit();
+        assert_eq!(scope(&grants, 1, blob(1)), None, "the revoke won");
+
+        // The generation: revoke, then another reservation takes the pair, then
+        // the STALE permit commits. It must not make the new entry live.
+        let stale = grants.reserve(&admitted(1), blob(2).into()).expect("fits");
+        grants.revoke(admitted(1).id(), blob(2));
+        let fresh = grants.reserve(&admitted(1), blob(2).into()).expect("fits");
+        stale.commit();
+        assert_eq!(
+            scope(&grants, 1, blob(2)),
+            None,
+            "a stale permit does not flip somebody else's entry"
+        );
+        fresh.commit();
+        assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
+    }
+
+    #[test]
+    fn an_uncommitted_permit_releases_its_charge() {
+        let grants = Grants::new();
+        let permit = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        assert!(grants.knows(&peer(1)), "a pending peer passes the guard");
+        drop(permit);
+
+        assert_eq!(grants.lock().used, 0);
+        assert!(!grants.knows(&peer(1)));
+    }
+
+    #[test]
+    fn a_peer_whose_last_grant_is_revoked_is_no_longer_known() {
+        let grants = Grants::new();
+        grant(&grants, 1, blob(1));
+        grant(&grants, 1, blob(2));
+        grant(&grants, 2, blob(1));
+
+        assert!(grants.revoke(admitted(1).id(), blob(1)));
+        assert!(grants.knows(&peer(1)), "it still holds blob 2");
+        assert!(grants.revoke(admitted(1).id(), blob(2)));
 
         // `knows` gates connection admission. A peer left behind with an empty
-        // set would keep connecting while holding nothing.
+        // table would keep connecting while holding nothing.
         assert!(!grants.knows(&peer(1)));
         assert!(grants.knows(&peer(2)));
+        assert_eq!(grants.lock().used, PEER_COST + GRANT_COST);
+        assert!(!grants.revoke(admitted(1).id(), blob(2)), "already gone");
+    }
+
+    #[test]
+    fn revoke_everywhere_removes_that_root_from_every_peer_and_nothing_else() {
+        let grants = Grants::new();
+        grant(&grants, 1, blob(1));
+        grant(&grants, 1, blob(2));
+        grant(&grants, 2, blob(1));
+        grant(&grants, 3, blob(3));
+
+        assert_eq!(grants.revoke_everywhere(blob(1)), 2);
+
+        assert_eq!(scope(&grants, 1, blob(1)), None);
+        assert_eq!(scope(&grants, 2, blob(1)), None);
+        assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
+        assert_eq!(scope(&grants, 3, blob(3)), Some(Scope::Blob));
+        assert!(!grants.knows(&peer(2)), "its only grant went");
+        assert_eq!(grants.lock().used, 2 * PEER_COST + 2 * GRANT_COST);
+    }
+
+    #[test]
+    fn revoking_a_peer_withdraws_its_grants_and_hangs_up_its_connections() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grant(&grants, 1, blob(1));
+        grant(&grants, 1, seq(2));
+        grant(&grants, 2, blob(1));
+        let first = hung(&live, 1, 1);
+        let second = hung(&live, 2, 1);
+        let other = hung(&live, 3, 2);
+
+        assert_eq!(grants.revoke_peer(admitted(1).id()), 2);
+        assert_eq!(live.close_peer(admitted(1).id()), 2);
+
+        assert!(!grants.knows(&peer(1)));
+        assert_eq!(hangups(&first), 1);
+        assert_eq!(hangups(&second), 1);
+        assert_eq!(
+            hangups(&other),
+            0,
+            "another peer's connection is left alone"
+        );
+        assert_eq!(scope(&grants, 2, blob(1)), Some(Scope::Blob));
+        assert_eq!(grants.lock().used, PEER_COST + GRANT_COST);
+    }
+
+    /// `GRANT_COST` and `PEER_COST` are computed from `size_of`, and this pins
+    /// the arithmetic that has to hold for them to be upper bounds: a slot plus
+    /// its control byte at hashbrown's emptiest load after a grow, 16/7.
+    #[test]
+    fn the_cost_constants_cover_the_layout_they_were_derived_from() {
+        assert!(GRANT_COST >= (size_of::<(BlobId, Entry)>() + 1) * 16 / 7);
+        assert!(
+            PEER_COST
+                >= (size_of::<(EndpointId, HashMap<BlobId, Entry>)>() + 1) * 16 / 7
+                    + 4 * size_of::<(BlobId, Entry)>()
+        );
     }
 
     #[test]
     fn a_connection_is_forgotten_when_it_ends() {
         let live = Connections::default();
-        live.admit(4, peer(1));
+        hung(&live, 4, 1);
         assert_eq!(live.peer(4), Some(peer(1)));
 
         live.forget(4, peer(1));
@@ -1491,7 +2288,7 @@ mod tests {
         // The id is a slab index and quinn reuses one. A late forget from the
         // connection that USED to hold it must not evict the one that holds it
         // now.
-        live.admit(4, peer(2));
+        hung(&live, 4, 2);
         live.forget(4, peer(1));
         assert_eq!(live.peer(4), Some(peer(2)), "a stale forget is ignored");
     }
@@ -1502,7 +2299,7 @@ mod tests {
     #[test]
     fn an_admitted_connection_is_forgotten_however_its_accept_ends() {
         let live = Connections::default();
-        live.admit(7, peer(1));
+        hung(&live, 7, 1);
         {
             let _admitted = Admitted {
                 live: &live,
@@ -1530,7 +2327,7 @@ mod tests {
     #[test]
     fn connection_admission_ignores_the_reported_endpoint_id() {
         let live = Connections::default();
-        live.admit(1, peer(1));
+        hung(&live, 1, 1);
 
         let admitted = ClientConnected {
             connection_id: 1,
@@ -1564,12 +2361,12 @@ mod tests {
     fn a_request_on_a_connection_that_was_never_admitted_is_refused() {
         let grants = Grants::new();
         let live = Connections::default();
-        grants.grant(admitted(1), blob(1));
+        grant(&grants, 1, blob(1));
         // Deliberately NOT admitted: `live` is empty. The grant exists, so the
         // refusal can only come from the connection lookup.
         assert!(admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_err());
 
-        live.admit(1, peer(1));
+        hung(&live, 1, 1);
         assert!(
             admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_ok(),
             "control: the same request is admitted once the connection is known"
@@ -1591,8 +2388,8 @@ mod tests {
     fn blob_admission_accepts_only_finite_root_ranges() {
         let grants = Grants::new();
         let live = Connections::default();
-        grants.grant(admitted(1), blob(1));
-        live.admit(1, peer(1));
+        grant(&grants, 1, blob(1));
+        hung(&live, 1, 1);
         let admits = |ranges| admits_get(&grants, &live, &get(1, blob(1), ranges)).is_ok();
 
         assert!(admits(whole_blob()), "the whole blob");
@@ -1732,8 +2529,8 @@ mod tests {
     fn a_request_reaching_past_the_granted_blob_is_refused() {
         let grants = Grants::new();
         let live = Connections::default();
-        grants.grant(admitted(1), blob(1));
-        live.admit(1, peer(1));
+        grant(&grants, 1, blob(1));
+        hung(&live, 1, 1);
 
         assert!(
             admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_ok(),
@@ -1742,6 +2539,60 @@ mod tests {
         assert!(
             admits_get(&grants, &live, &get(1, blob(1), ChunkRangesSeq::all())).is_err(),
             "the same grant must not reach the children a hash sequence names"
+        );
+    }
+
+    /// A closure grant reaches past the root, whatever shape the reach takes,
+    /// and does it without reading a store: `admits_get` has none.
+    ///
+    /// The other half of the same guard is what keeps a `Blob` grant on the
+    /// root. Watched red with `scripts/break-once.sh` (row `HK50`) by replacing
+    /// `if scope != Scope::Closure {`
+    /// with `if false {`: a `Blob` grant then reaches the children a hash
+    /// sequence names, and `a_granted_peer_cannot_fetch_a_child_of_a_granted_hash_seq`
+    /// fails with `a request that reaches past the granted blob must be refused,
+    /// got Ok(Stats { .. payload_bytes_read: 57 ..})`. The unit tests in this
+    /// module that hold the same half are `a_request_reaching_past_the_granted_blob_is_refused`
+    /// and `blob_admission_accepts_only_finite_root_ranges`.
+    #[test]
+    fn a_closure_grant_admits_every_range_shape_under_its_root() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grant(&grants, 1, seq(1));
+        hung(&live, 1, 1);
+        let admits = |ranges| admits_get(&grants, &live, &get(1, blob(1), ranges)).is_ok();
+
+        assert!(admits(whole_blob()), "the root alone");
+        assert!(admits(ChunkRangesSeq::all()), "the root and every member");
+        assert!(
+            admits(ChunkRangesSeq::from_ranges_infinite([ChunkRanges::all()])),
+            "an infinite sequence"
+        );
+        assert!(
+            admits(ChunkRangesSeq::from_ranges([
+                ChunkRanges::empty(),
+                ChunkRanges::all()
+            ])),
+            "members only"
+        );
+    }
+
+    /// A request carries the root's hash and offsets, so a member named by its
+    /// own hash is just another hash, and only a grant on it admits it.
+    #[test]
+    fn a_member_named_by_its_own_hash_is_refused() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grant(&grants, 1, seq(1));
+        hung(&live, 1, 1);
+
+        assert!(
+            admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_ok(),
+            "control: the root is admitted"
+        );
+        assert!(
+            admits_get(&grants, &live, &get(1, blob(2), whole_blob())).is_err(),
+            "a member the closure lists, asked for by its own hash"
         );
     }
 }

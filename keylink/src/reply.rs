@@ -271,6 +271,22 @@ pub enum RemoteError {
     /// is local — so a peer that meets this has lost the call and rebuilds it.
     #[error("the actor's mailbox is full: back off rather than retry")]
     MailboxFull,
+
+    /// The handler ran, but the holder's grant ledger is at its byte budget, so
+    /// the content it returned was not granted.
+    ///
+    /// Nothing was evicted to make room. The caller has no address it can
+    /// spend; the holder frees room with the revoke calls on
+    /// [`Blobs`](crate::Blobs) or raises it with
+    /// [`set_grant_budget`](crate::Blobs::set_grant_budget). A key that was
+    /// sent with the call replays this refusal.
+    #[error("the holder's grant ledger is at its budget of {budget} bytes")]
+    GrantsExhausted {
+        /// The budget that was met.
+        ///
+        /// `u64` and not `usize` for [`AtCapacity`](Self::AtCapacity)'s reason.
+        budget: u64,
+    },
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.
