@@ -8,7 +8,7 @@
 //! anything. An answered call is a stored call.
 //!
 //! **A `#[defer]` method is one of those, and it was the exception until
-//! `parking.rs`.** [`Deferred::send`](crate::Deferred::send) used to hand the value
+//! `parking.rs`.** [`Deferred::send`] used to hand the value
 //! straight to the caller from inside the running handler — *"this turn's
 //! observers neither see it nor gate it"* — so a caller held its answer for the
 //! whole of the ~7.6 ms below and a crash in that window lost state somebody was
@@ -21,7 +21,7 @@
 //!
 //! # The one thing left of the exception
 //!
-//! A [`Deferred`](crate::Deferred) is `Send` and `'static`, so it can be sent
+//! A [`Deferred`] is `Send` and `'static`, so it can be sent
 //! from a spawned task, or reached from a
 //! [`with_state`](crate::LocalActor::read) closure through interior mutability.
 //! Those sends cross **immediately**, and they are outside the claim rather than
