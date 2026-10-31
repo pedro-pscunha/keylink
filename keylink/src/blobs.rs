@@ -656,10 +656,11 @@ impl ProtocolHandler for BlobsAdmission {
 /// `throttle: ThrottleMode::Intercept`, which costs an event round trip per
 /// 16 KiB — 4096 of them on a 64 MiB blob, for a result keylink discards.
 ///
-/// Naming all six also pins the dead-field bug. In 0.103.0 `EventSender::request`
-/// reads `mask.get` for get, get-many, push and observe alike, so `mask.push`,
-/// `mask.get_many` and `mask.observe` are never read anywhere in the crate.
-/// Setting them anyway means an upstream fix changes nothing here.
+/// Naming all six is what made the upstream fix a no-op here. In 0.103.0
+/// `EventSender::request` read `mask.get` for get, get-many, push and observe
+/// alike, so the other three fields were dead. 0.103.1 (#270) made each request
+/// kind read its own field, and 0.104.0 keeps that: `push: Disabled` is now the
+/// mode a push meets, where before it met `get`'s.
 fn policy(grants: Arc<Grants>, live: Arc<Connections>) -> EventSender {
     let mask = EventMask {
         connected: ConnectMode::Intercept,

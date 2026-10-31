@@ -37,17 +37,19 @@
 # The `framing` task is a grep, and a grep whose tool is "whatever is on PATH"
 # is a gate that passes on a machine without it. Pinned so it fails the same way
 # everywhere, including on a CI image that does not ship ripgrep.
-"aqua:BurntSushi/ripgrep" = "14.1.1"
+"aqua:BurntSushi/ripgrep" = "15.2.0"
 
 # The shared compilation cache. Pinned for the same reason as the two above: a
 # cache that is present on one machine and absent on another produces two
 # different build times and one confused bug report.
-"aqua:mozilla/sccache" = "0.17.0"
+"aqua:mozilla/sccache" = "0.19.0"
 
 # The harness `mise run wasm-browser` runs keylink's wasm module under. It is
 # the `wasm-bindgen-test-runner` binary out of the wasm-bindgen release archive;
-# `exe=` picks it, because that archive also carries `wasm-bindgen` itself and
-# `wasm2es6js`, which nothing here uses.
+# `filter_bins` exposes only it, because that archive also carries `wasm-bindgen`
+# itself and `wasm2es6js`, which nothing here uses. It was `[exe=...]` until mise
+# 2026.10 refused that option on the `github` backend ("option `exe` is not used
+# by the github backend") and stopped installing the tool at all.
 #
 # **The version is not a preference, it is Cargo.lock.** The runner refuses a
 # module built against a different `wasm-bindgen` and says so by version, so
@@ -58,7 +60,7 @@
 #
 # `github:` and not `ubi:`, unlike the line above: mise now warns that the `ubi`
 # backend is deprecated and removed in 2027.1. Same resolver, current spelling.
-"github:wasm-bindgen/wasm-bindgen[exe=wasm-bindgen-test-runner]" = "0.2.127"
+"github:wasm-bindgen/wasm-bindgen" = { version = "0.2.130", filter_bins = "wasm-bindgen-test-runner" }
 
 # The WebDriver the runner drives Chrome through. Pinned so that the gate runs
 # in a browser that is the same one everywhere, and so a machine without a
@@ -66,8 +68,8 @@
 #
 # **This pin is coupled to the installed Chrome, not to keylink.** chromedriver
 # refuses a browser whose MAJOR version differs from its own, so a Chrome that
-# auto-updates past 151 reddens `wasm-browser` with
-# `This version of ChromeDriver only supports Chrome version 151`. The fix is to
+# auto-updates past 155 reddens `wasm-browser` with
+# `This version of ChromeDriver only supports Chrome version 155`. The fix is to
 # move this number to the new Chrome, not to bypass the task. Chrome for Testing
 # would remove the coupling by downloading its own browser — about 150 MB per
 # machine — and that trade was refused: a real browser already on the machine is
@@ -76,7 +78,7 @@
 # `asdf:` because there is no aqua entry and chromedriver has no GitHub release
 # to point `github:` at. The plugin fetches from Chrome for Testing's own
 # endpoint, once, at install time. Nothing downloads at test time.
-"asdf:mise-plugins/mise-chromedriver" = "151.0.7922.76"
+"asdf:mise-plugins/mise-chromedriver" = "155.0.8059.84"
 
 # ── the build environment ───────────────────────────────────────────────────
 
