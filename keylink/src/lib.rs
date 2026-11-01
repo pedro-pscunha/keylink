@@ -253,7 +253,10 @@ pub use actor::{
     KeyedService, Lifecycle, LocalError, LocalTellError, Mailbox, MountError, Mountable, Origin,
     Registry, RegistryBuilder,
 };
-pub use admission::{Admission, Admittance, DynamicAdmission, Refusal, Revocable, Revocation};
+/// Signed delegation, resource-scoped calls, and live trust decisions.
+pub mod trust;
+
+pub use admission::{Admission, Admittance, DynamicAdmission, LiveConnection, Refusal, Revocable};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{
     BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Grant, Granting, Missing,
@@ -312,6 +315,9 @@ pub mod inspect {
         Permit, RegistryClient, RestartingSetup, StateSetup,
     };
 }
+#[doc(hidden)]
+pub use middleware::Carries;
+
 pub use authz::{Authorization, Compiled, Rules};
 #[cfg(feature = "persist")]
 pub use durable::{DurableRecords, RecordError, RecordFault};

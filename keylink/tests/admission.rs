@@ -136,7 +136,7 @@ impl Admission for TrackingAnyone {
         Admittance::Admitted
     }
 
-    fn admitted(&self, _peer: &keylink::AdmittedPeer, _live: keylink::Revocation) {
+    fn admitted(&self, _peer: &keylink::AdmittedPeer, _live: keylink::LiveConnection) {
         self.admitted.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -259,10 +259,10 @@ fn an_unknown_rule_method_fails_during_compilation() {
 
 /// Required authorization stays outside ordinary layers on both sides of install.
 ///
-/// Search `        for layer in self.required_layers.into_iter().rev() {`.
-///
-/// Made red by `scripts/break-once.sh` adding `.take(0)` to that iterator. The
-/// closure-installed cache returned `777` without authorization or dispatch.
+/// The former required-layer break is spent: authorization no longer wraps
+/// middleware. Search `    for policy in required {` in the preflight helper.
+/// Made red by `scripts/break-once.sh` replacing it with
+/// `    for policy in required.iter().take(0) {`: the cache returned `777`.
 #[tokio::test]
 async fn compiled_authorization_wraps_short_circuits_added_before_and_after_install() {
     let node = local_node().await;
@@ -460,18 +460,18 @@ async fn later_admission_cannot_replace_compiled_peer_admission() {
 }
 
 /// One compiled value installs two separate decisions: connection admission and
-/// typed per-method middleware authorization.
+/// typed per-method preflight authorization.
 ///
 /// Search `            .is_some_and(|methods| methods.contains(method))`,
 /// `        let allow = Allowlist::only(allowed.keys().copied());`, and
-/// `            .require_authorization(self.authorization)`.
+/// `            .require(self.authorization)`.
 ///
 /// Made red three ways with `scripts/break-once.sh`:
 ///
 /// - changing the method predicate to `true` let `Write` dispatch and return `9`;
 /// - changing the compiled allowlist to `Allowlist::anyone()` returned
 ///   `Remote(Unauthorized("Read"))` where the test requires a transport close;
-/// - replacing `.require_authorization(self.authorization)` with the empty
+/// - replacing `.require(self.authorization)` with the empty
 ///   string `""` let `Write` dispatch and return `9`.
 #[tokio::test]
 async fn compiled_rules_admit_the_peer_once_and_authorize_each_method() {
@@ -530,14 +530,15 @@ async fn compiled_rules_admit_the_peer_once_and_authorize_each_method() {
 }
 
 /// Method authorization runs before a same-peer idempotency replay.
+/// The former inline-loop break is spent; this record now breaks the shared preflight helper.
 ///
 /// A peer first records `Read` under one key. Reusing that key for denied
 /// `Write` must not reveal or replay the earlier response.
 ///
-/// Search `    for policy in required_authorization.iter() {`.
+/// Search `    for policy in required {`.
 ///
 /// Made red by `scripts/break-once.sh` replacing it with
-/// `    for policy in required_authorization.iter().take(0) {`. The peer got
+/// `    for policy in required.iter().take(0) {`. The peer got
 /// `UnexpectedResponse { expected: "Write", actual: "Read" }`.
 #[tokio::test]
 async fn denied_method_cannot_replay_an_allowed_method_under_the_same_key() {
@@ -597,13 +598,14 @@ async fn denied_method_cannot_replay_an_allowed_method_under_the_same_key() {
 
 /// Every nested required method policy runs before a same-peer replay.
 ///
+/// The former inline-loop break is spent; this record now breaks the shared preflight helper.
 /// The first policy permits both methods, while the second permits only `Read`.
 /// Reusing a recorded `Read` key for `Write` must reach the second refusal first.
 ///
-/// Search `    for policy in required_authorization.iter() {`.
+/// Search `    for policy in required {`.
 ///
 /// Made red with `scripts/break-once.sh` by replacing it with
-/// `    for policy in required_authorization.iter().take(1) {`. The peer got
+/// `    for policy in required.iter().take(1) {`. The peer got
 /// `UnexpectedResponse { expected: "Write", actual: "Read" }`.
 #[tokio::test]
 async fn every_nested_method_policy_precedes_same_peer_replay() {
@@ -670,13 +672,14 @@ async fn every_nested_method_policy_precedes_same_peer_replay() {
 
 /// Authorization also precedes the idempotency policy lookup.
 ///
+/// The former inline-loop break is spent; this record now breaks the shared preflight helper.
 /// `Keyable::None` would return `NotKeyable` if the ledger policy ran first.
 /// The required policy must instead return the exact method denial.
 ///
-/// Search `    for policy in required_authorization.iter() {`.
+/// Search `    for policy in required {`.
 ///
 /// Made red by `scripts/break-once.sh` replacing it with
-/// `    for policy in required_authorization.iter().take(0) {`. The peer got
+/// `    for policy in required.iter().take(0) {`. The peer got
 /// `Remote(Idempotency(NotKeyable { method: "Write" }))`.
 #[tokio::test]
 async fn denied_method_does_not_reach_the_idempotency_policy() {
@@ -803,7 +806,7 @@ async fn a_newly_added_peer_is_admitted_without_a_restart() {
         "a peer not on the list must not be answered"
     );
 
-    let closed = policy.replace(Allowlist::only([welcome.id(), latecomer.id()]));
+    let closed = policy.apply(Allowlist::only([welcome.id(), latecomer.id()]));
     assert!(
         closed.is_empty(),
         "widening a policy closes nobody: {closed:?}"
@@ -822,7 +825,7 @@ async fn a_newly_added_peer_is_admitted_without_a_restart() {
     assert_eq!(inside.knock().await.expect("still answers"), 1);
 }
 
-/// Revocation reaches a connection that is already open, which is the
+/// LiveConnection reaches a connection that is already open, which is the
 /// capability a plain [`Admission`] cannot have: it is consulted at accept and
 /// never again, so without this a revoked peer keeps its connection until it
 /// chooses to hang up.
@@ -854,7 +857,7 @@ async fn revoking_a_peer_closes_its_connection() {
     assert_eq!(revoked.knock().await.expect("answers"), 1);
     assert_eq!(kept.knock().await.expect("answers"), 1);
 
-    let closed = policy.replace(Allowlist::only([keeper.id()]));
+    let closed = policy.apply(Allowlist::only([keeper.id()]));
     assert_eq!(closed, vec![peer.id()], "exactly one peer was revoked");
 
     let error = revoked
@@ -898,7 +901,7 @@ async fn a_revoked_peer_cannot_reconnect_during_the_revocation() {
         .expect("dials");
     assert_eq!(first.knock().await.expect("answers"), 1);
 
-    let closed = policy.replace(Allowlist::only([node.id()]));
+    let closed = policy.apply(Allowlist::only([node.id()]));
     assert_eq!(closed, vec![peer.id()]);
 
     let again = gate::Client::connect(&peer, node.endpoint().addr())
@@ -976,7 +979,7 @@ async fn a_departed_peer_is_not_reported_as_revoked() {
     assert_eq!(policy.live(), 0, "a departed peer must be forgotten");
 
     assert!(
-        policy.replace(Allowlist::only([node.id()])).is_empty(),
+        policy.apply(Allowlist::only([node.id()])).is_empty(),
         "revoking a peer that already left closes nothing"
     );
 }

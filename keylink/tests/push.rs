@@ -324,7 +324,7 @@ async fn a_peer_can_unsubscribe_without_leaving() {
 ///
 /// The result is a peer that believes it is subscribed and a desk that has
 /// forgotten it: pushes stop, and nothing reports a fault. In the admission
-/// adapter, which instantiates this same registry at `Revocation`, the same race
+/// adapter, which instantiates this same registry at `LiveConnection`, the same race
 /// is worse than a lost push — the surviving connection leaves the registry, so
 /// a later `replace` can neither see nor close it, and a revoked peer keeps a
 /// live connection. That is an authorization bypass reached through a

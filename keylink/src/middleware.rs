@@ -206,16 +206,11 @@ impl Progress {
     }
 }
 
-#[derive(Clone)]
-enum MethodAuthorizationState {
-    Unchecked,
-    Authorized(Arc<[Arc<dyn crate::rpc::MethodAuthorization>]>),
-}
-
 /// Who is calling, and what they are calling.
 ///
 /// `peer` is the key iroh proved during the handshake — not a claim carried in
 /// the request body, which is why it is safe to authorize against.
+/// `credential` is the authority a trust guard verified for this call.
 #[derive(Clone)]
 pub struct Context {
     peer: EndpointId,
@@ -225,7 +220,7 @@ pub struct Context {
     progress: Progress,
     queueing: Option<Queueing>,
     call: Option<CallId>,
-    method_authorized: MethodAuthorizationState,
+    credential: Option<Arc<crate::trust::Credential>>,
 }
 
 impl std::fmt::Debug for Context {
@@ -252,7 +247,7 @@ impl Context {
             progress: Progress::new(),
             queueing: None,
             call: None,
-            method_authorized: MethodAuthorizationState::Unchecked,
+            credential: None,
         }
     }
 
@@ -294,26 +289,17 @@ impl Context {
         self
     }
 
-    /// Carry the required policy set that authorized this call before idempotency.
-    pub(crate) fn with_method_authorized(
+    pub(crate) fn with_credential(
         mut self,
-        authorization: Arc<[Arc<dyn crate::rpc::MethodAuthorization>]>,
+        credential: Option<Arc<crate::trust::Credential>>,
     ) -> Self {
-        self.method_authorized = MethodAuthorizationState::Authorized(authorization);
+        self.credential = credential;
         self
     }
 
-    /// Whether this exact required policy already authorized the call.
-    pub(crate) fn method_authorized_by(
-        &self,
-        authorization: &Arc<dyn crate::rpc::MethodAuthorization>,
-    ) -> bool {
-        match &self.method_authorized {
-            MethodAuthorizationState::Unchecked => false,
-            MethodAuthorizationState::Authorized(required) => required
-                .iter()
-                .any(|policy| Arc::ptr_eq(policy, authorization)),
-        }
+    /// The authority verified by a trust guard, or `None` on an unguarded service.
+    pub fn credential(&self) -> Option<&crate::trust::Credential> {
+        self.credential.as_deref()
     }
 
     /// The proven public key of the calling peer.
@@ -759,6 +745,18 @@ pub(crate) fn wrap<Req: Send + 'static, Resp: Send + 'static>(
     inner: Next<Req, Resp>,
 ) -> Next<Req, Resp> {
     Arc::new(move |cx, req, body| layer.handle(cx, req, body, inner.clone()))
+}
+
+/// A wire request that carries `Req`, directly or in an actor address.
+#[doc(hidden)]
+pub trait Carries<Req>: Rpc {
+    /// The typed request inside this wire request.
+    fn carried(&self) -> &Req;
+}
+impl<R: Rpc> Carries<R> for R {
+    fn carried(&self) -> &R {
+        self
+    }
 }
 
 #[cfg(test)]

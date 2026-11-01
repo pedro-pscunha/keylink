@@ -74,6 +74,9 @@ use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 /// [`MailboxFull`](Self::MailboxFull) by the served singleton door. Each move was
 /// a separate commit from the one that paid the ALPN for it, which is what the
 /// sentence was really recording.
+///
+/// [`AccessUnavailable`](Self::AccessUnavailable) comes from a trust guard whose
+/// application policy could not be consulted. It is not a forbidden caller.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
 )]
@@ -296,6 +299,9 @@ pub enum RemoteError {
     /// admitted when the call started and is not any more.
     #[error("the holder withdrew this peer's grants while the call ran")]
     GrantsWithdrawn,
+    /// The access policy could not be consulted; try later, not forbidden.
+    #[error("the access policy could not be consulted")]
+    AccessUnavailable,
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.

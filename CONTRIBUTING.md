@@ -326,6 +326,7 @@ so a Chrome that auto-updates past it reddens the task until the pin follows.
 
 **What now runs in a browser**, under `--no-default-features --features web`:
 
+- `trust::Chain::verify` — two-link delegation and caveats, without sockets.
 - `derive_alpn` — the schema hash is computed, is stable across two calls, and
   still moves when a field is added.
 - `postcard` encode and decode of `WireResponse<u32>`, in both the `Ok` and the

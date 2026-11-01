@@ -64,8 +64,8 @@ use std::time::Duration;
 use keylink::prelude::*;
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Compiled, ConfigError, Context, Departure,
-    DynamicAdmission, Error, Node, ProvenPeer, Refusal, RemoteError, Revocable, Revocation, Rules,
-    SecretKey, Server, Watch,
+    DynamicAdmission, Error, LiveConnection, Node, ProvenPeer, Refusal, RemoteError, Revocable,
+    Rules, SecretKey, Server, Watch,
 };
 
 keylink::service! {
@@ -150,14 +150,16 @@ impl Admission for Doorman {
     /// Forwarding is not optional. The inner policy keeps the live connections
     /// it will later close, so a wrapper that swallows this hands back a
     /// [`Revocable`] that can revoke nothing.
-    fn admitted(&self, peer: &AdmittedPeer, live: Revocation) {
+    fn admitted(&self, peer: &AdmittedPeer, live: LiveConnection) {
         self.inner.admitted(peer, live);
     }
 }
 
 impl Revocable for Doorman {
-    fn replace(&self, next: Allowlist) -> Vec<keylink::EndpointId> {
-        self.inner.replace(next)
+    type Change = Allowlist;
+
+    fn apply(&self, next: Self::Change) -> Vec<keylink::EndpointId> {
+        self.inner.apply(next)
     }
 }
 
@@ -263,7 +265,7 @@ async fn run() -> Result<(), Box<dyn StdError>> {
         what_now(&turned_away)
     );
 
-    // ── 3. Revocation, which is the capability a plain `Admission` cannot have.
+    // ── 3. LiveConnection, which is the capability a plain `Admission` cannot have.
     //
     //  A policy is consulted at accept and never again, so without this a peer
     //  removed from the list keeps its open connection until it chooses to hang
@@ -295,7 +297,7 @@ async fn run() -> Result<(), Box<dyn StdError>> {
     //  so taking one after the close would have nothing left to register on.
     let watch: Watch = leaving.watch();
 
-    let closed = policy.replace(Allowlist::only([auditor_node.id()]));
+    let closed = policy.apply(Allowlist::only([auditor_node.id()]));
     assert_eq!(
         closed,
         vec![clerk_node.id()],

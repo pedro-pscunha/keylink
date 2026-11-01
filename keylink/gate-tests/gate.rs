@@ -48,6 +48,7 @@ gate_modules! {
     supervision => "../tests/supervision.rs",
     surfaces => "../tests/surfaces.rs",
     tell => "../tests/tell.rs",
+    trust => "../tests/trust.rs",
     watch => "../tests/watch.rs",
 }
 

@@ -237,6 +237,12 @@ iroh proves *who* a peer is; it never decides whether they are welcome.
 must be typed out, and `from_env` errors at startup rather than bouncing every
 peer at runtime.
 
+`trust::Trust` admits peers from signed delegation chains rooted in explicitly trusted keys. Every child narrows resources, operations, validity, and delegation depth. Push chains with `insert`, or let peers offer their own through `trust::present` before dialing. `Revocable::apply` records signed revocations or replaces roots before closing connections that no longer qualify.
+
+`trust::Signed<T>` carries a forwardable value and its delegation chain. A verifier supplies a `Purpose`, trusted roots, and a time; `open` verifies signatures and authority before decoding the value. Signatures are domain-separated from certificates and revocations. Postcard bytes must round-trip exactly, so nondeterministically ordered values may be refused. Use `Trust::open` when revocations must count.
+
+`trust.guard::<Request, _>(WithinCaveats).resource(extract).install(...)` requires admission and checks principal, service, method, and resource before idempotency, every layer, and actor lookup. A keyed resource starts with the actor id; an extractor refines it to `actor/name`. Singleton services use the extracted name. An application's `trust::Access` adds policy after caveats. A policy outage is `AccessUnavailable`, not a forbidden caller. The runnable recipe is `keylink/examples/trust_chain.rs`.
+
 ### Retry safety
 
 A call that fails mid-flight leaves the caller unable to say whether it ran.
@@ -1021,6 +1027,11 @@ handshake. This holds until keylink has a stable version, which is when the pins
 come back and reversing it is the point of reaching one.
 
 Known gaps, in rough priority order:
+
+- **Trust is a local view.** Revocations reach other nodes only through the application's feeder. Records are permanent and the revocation set grows without pruning. Idle expired connections close only when the application applies `trust::Change::Expire`; expiry is checked on every call regardless. Already-dispatched calls finish after revocation. The host clock is trusted, with no skew allowance.
+- **Closing RPC connections does not retract blob grants.** Wiring the separate `Blobs::revoke_peer` capability into trust changes is still needed. A peer may otherwise retain access to previously granted hashes.
+- **Signed values are replayable.** The application supplies freshness in `T`. Its shape is not part of a service contract hash; drift is refused at `open`. Idempotency records remain per device key, not per delegated principal.
+- **Trust stores remember one connection per peer.** Multiple simultaneous connections from one key are not all retained. The open presentation protocol has byte, depth, and per-holder caps, but no rate limit. Browsers can verify chains and signed values, not serve guarded QUIC connections.
 
 - **No connection has ever run in a browser.** `mise run wasm-browser` loads the
   module into headless Chrome and runs every test in `keylink/tests/browser.rs`

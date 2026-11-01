@@ -113,7 +113,7 @@ impl<C> Subscribers<C> {
     ///
     /// The result is a peer that believes it is subscribed, a registry that has
     /// forgotten it, and — in the admission adapter that instantiates this at
-    /// `Revocation` — a live connection no `replace` can see or close. That is
+    /// `LiveConnection` — a live connection no `apply` can see or close. That is
     /// an authorization bypass reached through a bookkeeping race, so the
     /// generation is not an optimisation.
     pub fn insert(&self, peer: EndpointId, client: C, departure: Watch)

@@ -189,13 +189,31 @@ pub trait Governed: GovernedSeal {}
 #[doc(hidden)]
 pub trait GovernedSeal {}
 
-/// A compiled method policy checked before idempotency state is touched.
-pub(crate) trait MethodAuthorization: Send + Sync + 'static {
-    /// Bind a typed layer to the same policy object used by preflight.
-    fn bind(&mut self, installed: std::sync::Weak<dyn MethodAuthorization>);
+pub(crate) type Checked<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<Option<Arc<crate::trust::Credential>>, RemoteError>,
+            > + Send
+            + 'a,
+    >,
+>;
+pub(crate) trait Preflight<Req>: Send + Sync + 'static {
+    fn check<'a>(&'a self, peer: EndpointId, request: &'a Req) -> Checked<'a>;
+}
 
-    /// Whether `peer` may call `method`.
-    fn authorizes(&self, peer: EndpointId, method: &'static str) -> bool;
+async fn preflight<Req: 'static>(
+    required: &[Arc<dyn Preflight<Req>>],
+    peer: EndpointId,
+    req: &Req,
+) -> std::result::Result<Option<Arc<crate::trust::Credential>>, RemoteError> {
+    let mut credential = None;
+    for policy in required {
+        let checked = policy.check(peer, req).await?;
+        if credential.is_none() {
+            credential = checked;
+        }
+    }
+    Ok(credential)
 }
 
 /// Serves one protocol: authorizes the peer once per connection, then answers
@@ -207,7 +225,7 @@ pub(crate) struct RpcService<Req, Resp> {
     /// I/O, and a generic would reach every `service!` user's type errors.
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
-    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -224,7 +242,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
             next: self.next.clone(),
             admission: self.admission.clone(),
             required_admission: self.required_admission.clone(),
-            required_authorization: self.required_authorization.clone(),
+            required: self.required.clone(),
             blobs: self.blobs.clone(),
             keys: self.keys.clone(),
             _p: PhantomData,
@@ -594,12 +612,13 @@ fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
 /// needs an answer must be an `rpc`.
 async fn serve_one_tell<Req, Resp>(
     next: Next<Req, Resp>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     blobs: Option<Blobs>,
     peer: AdmittedPeer,
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
@@ -614,8 +633,12 @@ where
         return Ok(());
     };
 
+    let Ok(credential) = preflight(&required, peer.id(), &message).await else {
+        return Ok(());
+    };
     let cx = Context::new(peer.id(), Req::SERVICE, message.method())
-        .with_actor(message.actor().cloned());
+        .with_actor(message.actor().cloned())
+        .with_credential(credential);
 
     // The body reader is handed over for symmetry with `serve_one`: a `tell`
     // carries no body today, and a future kind that does will find the seam
@@ -628,7 +651,7 @@ where
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
-    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     keys: Keys,
     grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
@@ -636,7 +659,7 @@ async fn serve_one<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
     let peer = admitted.id();
@@ -654,18 +677,13 @@ where
         WireRequest::Call(message) => message,
     };
 
-    // Required method policy runs before key validation, claim, attach, replay,
+    // Required policy runs before key validation, claim, attach, replay,
     // or refusal. The ledger is scoped to `(peer, key)`, so a replay cannot be
     // allowed to answer a method this policy denies.
-    for policy in required_authorization.iter() {
-        if !policy.authorizes(peer, message.method()) {
-            return refuse::<Resp>(
-                &mut send,
-                RemoteError::Unauthorized(message.method().to_owned()),
-            )
-            .await;
-        }
-    }
+    let credential = match preflight(&required, peer, &message).await {
+        Ok(credential) => credential,
+        Err(error) => return refuse::<Resp>(&mut send, error).await,
+    };
 
     // Named BEFORE the key is consumed below, and by reference rather than by
     // clone: this is the one place both halves of the digest exist, exactly as it
@@ -674,17 +692,15 @@ where
     // Computed for a key that has not been validated yet, which is harmless and
     // worth saying: `claim_key` refuses a malformed key before the chain is
     // entered, so no handler ever sees a `CallId` derived from one.
-    let mut cx = Context::new(peer, Req::SERVICE, message.method())
+    let cx = Context::new(peer, Req::SERVICE, message.method())
         .with_actor(message.actor().cloned())
         .with_call(
             request
                 .idempotency
                 .as_ref()
                 .map(|idem| CallId::of(peer, idem.key())),
-        );
-    if !required_authorization.is_empty() {
-        cx = cx.with_method_authorized(required_authorization.clone());
-    }
+        )
+        .with_credential(credential);
     // Kept while the chain runs, because the chain's own `Outcome` cannot say
     // whether the work was entered — see `Reached`.
     let progress = cx.progress();
@@ -905,7 +921,7 @@ where
                     };
                     calls.spawn(serve_one(
                         self.next.clone(),
-                        self.required_authorization.clone(),
+                        self.required.clone(),
                         self.keys.clone(),
                         grants,
                         admitted,
@@ -916,6 +932,7 @@ where
                 Ok(Stream::Uni(recv)) => {
                     calls.spawn(serve_one_tell(
                         self.next.clone(),
+                        self.required.clone(),
                         self.blobs.clone(),
                         admitted,
                         recv,
@@ -1501,10 +1518,9 @@ pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
-    required_authorization: Vec<Arc<dyn MethodAuthorization>>,
+    required: Vec<Arc<dyn Preflight<Req>>>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
-    required_layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     blobs: Option<Blobs>,
     /// Set by generated code from `DECLARES_BLOBS`. Compared against `blobs` at
     /// spawn, so "this service serves content but was given no store" is a
@@ -1534,10 +1550,9 @@ where
             alpn,
             admission: Arc::new(allow),
             required_admission: Vec::new(),
-            required_authorization: Vec::new(),
+            required: Vec::new(),
             base: dispatch,
             layers: Vec::new(),
-            required_layers: Vec::new(),
             blobs: None,
             declares_blobs: false,
             // Spelled out rather than reached through `Default`, and neither type
@@ -1592,19 +1607,14 @@ where
         self
     }
 
-    pub(crate) fn require_authorization<A>(mut self, mut authorization: A) -> Self
-    where
-        A: MethodAuthorization + Middleware<Req, Resp>,
-    {
-        let authorization = Arc::new_cyclic(|installed| {
-            authorization.bind(installed.clone() as std::sync::Weak<dyn MethodAuthorization>);
-            authorization
-        });
-        self.required_authorization.push(authorization.clone());
-        self.required_layers.push(authorization);
+    pub(crate) fn require(mut self, policy: impl Preflight<Req>) -> Self {
+        self.required.push(Arc::new(policy));
         self
     }
 
+    /// Required policies installed by `Compiled` or `trust::Guard` run before
+    /// every layer and cannot be replaced by this setting.
+    ///
     /// Admit against a policy rather than against the fixed list this was built
     /// with.
     ///
@@ -1621,7 +1631,7 @@ where
     ///     .admission(policy.clone())
     ///     .build();
     /// // ... later, without a restart, and closing whoever is no longer welcome
-    /// let closed = policy.replace(Allowlist::only([second]));
+    /// let closed = policy.apply(Allowlist::only([second]));
     /// ```
     #[must_use]
     pub fn admission(mut self, admission: Arc<dyn Admission>) -> Self {
@@ -1630,8 +1640,9 @@ where
     }
 
     /// Add a layer. The first ordinary layer added is the outermost: it sees the
-    /// request first and the reply last. Required layers installed by
-    /// [`Compiled`](crate::Compiled) remain outside every ordinary layer.
+    /// request first and the reply last. Required policies installed by
+    /// [`Compiled`](crate::Compiled) or [`Guard`](crate::trust::Guard) run
+    /// before every ordinary layer, on both call and tell paths.
     #[must_use]
     pub fn layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
         self.layers.push(Arc::new(layer));
@@ -1875,16 +1886,13 @@ where
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);
         }
-        for layer in self.required_layers.into_iter().rev() {
-            chain = wrap(layer, chain);
-        }
         Service {
             alpn: self.alpn,
             handler: Box::new(RpcService {
                 next: chain,
                 admission: self.admission,
                 required_admission: self.required_admission,
-                required_authorization: self.required_authorization.into(),
+                required: self.required.into(),
                 blobs: self.blobs.clone(),
                 keys: Keys::new(self.keyable, self.records, self.limits),
                 _p: PhantomData,
