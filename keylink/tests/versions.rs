@@ -660,10 +660,13 @@ mod blob_versions {
                 content::Response::Get((0, _)) => {
                     Err(Unsupported::new("Get", "no older representation"))
                 }
-                content::Response::Get((n, _)) => Ok(content::version_1::Response::Get((
-                    n,
+                content::Response::Get((1, _)) => Ok(content::version_1::Response::Get((
+                    1,
                     *REPLACEMENT.get().unwrap(),
                 ))),
+                content::Response::Get((n, id)) => {
+                    Ok(content::version_1::Response::Get((n + 10, id)))
+                }
                 _ => unreachable!(),
             }
         }
@@ -677,8 +680,12 @@ mod blob_versions {
     /// Watched red: grant the current response's address instead of the
     /// encoded response's address. The refusal leaked a grant in this isolated
     /// test: 0 passed, 1 failed. Restored the converted grant source.
+    ///
+    /// The identity guard was also watched red by allowing the converted blob
+    /// address to differ: this test accepted the substituted reply instead of
+    /// UnsupportedResponse (0 passed, 1 failed). Restored identity preservation.
     #[tokio::test]
-    async fn only_the_transmitted_converted_blob_is_granted() {
+    async fn blob_conversions_keep_identity_and_refuse_address_changes() {
         let server = node().await;
         let caller = node().await;
         let store = keylink::Blobs::memory();
@@ -707,16 +714,30 @@ mod blob_versions {
             matches!(guessed.verified_len().await, Err(Error::BlobRefused { .. })),
             "a conversion refusal must grant no address"
         );
-        let (metadata, handle) = c.get(1).await.unwrap();
-        assert_eq!(metadata, 1);
-        assert_eq!(handle.id(), replacement);
-        assert_eq!(handle.verified_len().await.unwrap(), 11);
+        assert!(matches!(
+            c.get(1).await,
+            Err(Error::Remote(
+                keylink::RemoteError::UnsupportedResponse { .. }
+            ))
+        ));
         assert!(
             matches!(guessed.verified_len().await, Err(Error::BlobRefused { .. })),
-            "the unsent current address must remain ungranted"
+            "an address-changing conversion must not grant the current address"
         );
-        // The shared ledger holds the current address. A retry negotiated at
-        // current must grant that address even if the first reply carried another.
+        let substituted = keylink::BlobHandle::new(&caller, server.endpoint().addr(), replacement);
+        assert!(
+            matches!(
+                substituted.verified_len().await,
+                Err(Error::BlobRefused { .. })
+            ),
+            "an address-changing conversion must not grant its substituted address"
+        );
+        let (metadata, handle) = c.get(2).await.unwrap();
+        assert_eq!(metadata, 12);
+        assert_eq!(handle.id(), original);
+        assert_eq!(handle.verified_len().await.unwrap(), 8);
+        // The shared record and both negotiated replies carry the same address.
+        // Replay relies on the existing grant; it does not renew one.
         let key = keylink::IdempotencyKey::new("blob-replay").unwrap();
         let old_raw =
             keylink::RpcClient::connect(&caller, server.endpoint().addr(), old::content::lineage())
@@ -725,7 +746,7 @@ mod blob_versions {
         let _ = old_raw
             .with_idempotency(key.clone())
             .call(
-                old::content::Request::Get { mode: 1 },
+                old::content::Request::Get { mode: 2 },
                 keylink::Body::empty(),
             )
             .await
@@ -736,7 +757,7 @@ mod blob_versions {
                 .unwrap();
         let _ = current_raw
             .with_idempotency(key)
-            .call(content::Request::Get { mode: 1 }, keylink::Body::empty())
+            .call(content::Request::Get { mode: 2 }, keylink::Body::empty())
             .await
             .unwrap();
         assert_eq!(guessed.verified_len().await.unwrap(), 8);

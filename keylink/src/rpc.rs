@@ -59,7 +59,7 @@ use crate::error::ConfigError;
 use crate::blobs::{Fence, Permit};
 use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
-use crate::version::{read_probe, Codec, GrantSource, Lineage, PeerWindow, Probe, Version};
+use crate::version::{read_probe, Codec, Lineage, PeerWindow, Probe, Version};
 use crate::wire::FrameReader;
 use crate::{
     wire, Admission, AdmittedPeer, Allowlist, BlobHandle, Blobs, Body, BodyReader, CallId, Content,
@@ -546,12 +546,9 @@ async fn replay<Req, Resp>(
     send: &mut SendStream,
     frame: Bytes,
     codec: &dyn Codec<Req, Resp>,
-    grants: Option<(&Blobs, &AdmittedPeer)>,
 ) -> Result<()> {
-    let encoded = codec.reencode_response(frame, GrantSource::Recorded)?;
-    if let (Some((blobs, admitted)), Some(id)) = (grants, encoded.grant) {
-        blobs.grant(admitted, id);
-    }
+    // A recorded reply is data, never authority to create or renew a grant.
+    let encoded = codec.reencode_response(frame, None)?;
     wire::write_frame(send, encoded.frame).await?;
     send.finish()?;
     Ok(())
@@ -571,7 +568,6 @@ async fn refuse<Req, Resp: Serialize>(
             &WireResponse::<Resp>::Call(Outcome::Err(refusal)),
         )?,
         codec,
-        None,
     )
     .await
 }
@@ -627,7 +623,6 @@ async fn answer_key_state<Req, Resp: Serialize>(
         send,
         wire::encode_header(Some(0), None, &WireResponse::<Resp>::KeyState(state))?,
         codec,
-        None,
     )
     .await
 }
@@ -816,15 +811,7 @@ where
         // connection ended, the server shut down — still settles honestly, even
         // though `Drop` is then the only code left running.
         Claimed::Run(guard) => Some(guard.watching(progress.clone())),
-        Claimed::Replay(frame) => {
-            return replay(
-                &mut send,
-                frame,
-                codec.as_ref(),
-                blobs.as_ref().map(|store| (store, &admitted)),
-            )
-            .await
-        }
+        Claimed::Replay(frame) => return replay(&mut send, frame, codec.as_ref()).await,
         Claimed::Refuse(refusal) => return refuse(&mut send, refusal, codec.as_ref()).await,
     };
 

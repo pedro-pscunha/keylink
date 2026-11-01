@@ -2444,10 +2444,10 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_was_revoked_and_
     assert_eq!(
         entered.load(std::sync::atomic::Ordering::Relaxed),
         1,
-        "renewing the replay's grant must not rerun the handler"
+        "a replay must not rerun the handler"
     );
     let mut sink = Vec::new();
-    replayed
+    let error = replayed
         .copy_to(&mut sink)
         .await
         .expect_err("a replayed address whose grant was revoked must be refused");

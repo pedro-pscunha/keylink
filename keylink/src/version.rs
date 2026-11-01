@@ -257,10 +257,6 @@ impl<Req: 'static, Resp: 'static, P: Toward<Req, Resp>> Toward<Addressed<Req>, R
     }
 }
 
-pub(crate) enum GrantSource {
-    Current(Option<crate::BlobId>),
-    Recorded,
-}
 pub(crate) struct EncodedReply {
     pub(crate) frame: Bytes,
     pub(crate) carry_body: bool,
@@ -280,7 +276,11 @@ pub(crate) trait Codec<Req, Resp>: Send + Sync + fmt::Debug {
         bytes: &[u8],
     ) -> Result<std::result::Result<Envelope<WireRequest<Req>>, RemoteError>>;
     /// The encoded header and whether the handler's body can follow it.
-    fn reencode_response(&self, frame: Bytes, grant_source: GrantSource) -> Result<EncodedReply>;
+    fn reencode_response(
+        &self,
+        frame: Bytes,
+        current_grant: Option<crate::BlobId>,
+    ) -> Result<EncodedReply>;
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes>;
 }
@@ -312,6 +312,13 @@ fn response_map<A, B>(
         WireResponse::KeyState(k) => WireResponse::KeyState(k),
     })
 }
+fn response_grant<T: crate::Granting>(response: &WireResponse<T>) -> Option<crate::BlobId> {
+    match response {
+        WireResponse::Call(Outcome::Ok(value)) => value.granted(),
+        _ => None,
+    }
+}
+
 impl<Req, Resp, P> Codec<Req, Resp> for At<P>
 where
     Req: Serialize + DeserializeOwned + 'static,
@@ -362,29 +369,30 @@ where
                 detail: e.to_string(),
             }))
     }
-    fn reencode_response(&self, frame: Bytes, grant_source: GrantSource) -> Result<EncodedReply> {
+    fn reencode_response(
+        &self,
+        frame: Bytes,
+        current_grant: Option<crate::BlobId>,
+    ) -> Result<EncodedReply> {
         if P::CURRENT {
-            let grant = match grant_source {
-                GrantSource::Current(grant) => grant,
-                GrantSource::Recorded => {
-                    let current: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
-                    match current.message {
-                        WireResponse::Call(Outcome::Ok(response)) => {
-                            crate::Granting::granted(&response)
-                        }
-                        _ => None,
-                    }
-                }
-            };
             return Ok(EncodedReply {
                 frame,
                 carry_body: true,
-                grant,
+                grant: current_grant,
             });
         }
         let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
+        let original_grant = response_grant(&r.message);
         let (message, len, carry_body) = match response_map(r.message, P::down_response) {
-            Ok(m) => (m, r.body_len, true),
+            Ok(m) if response_grant(&m) == original_grant => (m, r.body_len, true),
+            Ok(_) => (
+                WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
+                    version: self.version.label,
+                    detail: "a contract conversion cannot change the blob address".into(),
+                })),
+                Some(0),
+                false,
+            ),
             Err(e) => (
                 WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
                     version: self.version.label,
@@ -394,10 +402,7 @@ where
                 false,
             ),
         };
-        let grant = match &message {
-            WireResponse::Call(Outcome::Ok(response)) => crate::Granting::granted(response),
-            _ => None,
-        };
+        let grant = response_grant(&message);
         Ok(EncodedReply {
             frame: wire::encode_header(len, r.idempotency.as_ref(), &message)?,
             carry_body,
@@ -677,7 +682,7 @@ mod tests {
         let current = wire::encode_header(Some(17), None, &WireResponse::Call(Outcome::Ok(7_u8)))
             .expect("encodes");
         let encoded = codec
-            .reencode_response(current, GrantSource::Current(None))
+            .reencode_response(current, None)
             .expect("refusal encodes");
         let frame = encoded.frame;
         let carry_body = encoded.carry_body;
