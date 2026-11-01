@@ -533,8 +533,8 @@ pub enum IdempotencyRefusal {
         "this service could not record the key, so nothing ran - the same key is safe to send again"
     )]
     NotClaimed,
-    /// This key was claimed for different encoded request bytes.
-    #[error("this idempotency key belongs to a different request")]
+    /// This key was claimed for different received message bytes or authority.
+    #[error("this idempotency key belongs to a different request or authority")]
     RequestMismatch,
 }
 

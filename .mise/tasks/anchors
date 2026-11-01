@@ -537,6 +537,17 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ('RR1', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '            hash.update(credential.principal().as_bytes());'),
+    ('RR2', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
+    ('RR3', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
+    ('RR4', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                || self.usage.get(key).copied().unwrap_or(0) >= super::MAX_ACCEPTED_PER_REVOKER'),
+    ('RR5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '            .chain(path.iter().rev().copied())'),
+    ('RR6', 'keylink/tests/trust.rs', 'keylink/src/trust/chain.rs', '            if revoked.is_exhausted(&key) {'),
+    ('RR7', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        let closed = self.sweep();'),
+    ('RR8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/sign.rs', '            if revoked.is_exhausted(&self.signer) {'),
+    ('RR9', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '        if self.roots.contains(&peer) && !self.revoked.is_exhausted(&peer) {'),
+    ('RR10', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                        refusal.get_or_insert(super::ChangeError::RevokerExhausted {'),
+    ('RR11', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '            .map_or(path, |end| &path[..end]);'),
     ('RF1', 'keylink/tests/trust.rs', 'keylink/src/idempotency.rs', '                if entry.fingerprint != fingerprint {'),
     ('RF2', 'keylink/src/trust/sign_tests.rs', 'keylink/src/trust/sign.rs', '    for certificate in chain.links() {'),
     ('RF3', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            store.standing(credential.chain(), now).is_ok()'),

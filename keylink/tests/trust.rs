@@ -806,6 +806,9 @@ async fn learning_pending_revocation_authority_also_closes_existing_connections(
 }
 
 #[tokio::test]
+// Search `            hash.update(credential.principal().as_bytes());`.
+// Made red with scripts/break-once.sh replacing it with `            hash.update(&[0; 32]);`.
+// Watched: a retry under B received A's cached value instead of RequestMismatch.
 async fn a_recorded_reply_cannot_cross_principals_for_the_same_request() {
     struct PrincipalData {
         a: keylink::EndpointId,
@@ -871,6 +874,12 @@ async fn a_recorded_reply_cannot_cross_principals_for_the_same_request() {
 }
 
 #[tokio::test]
+// Search `            if revoked.is_exhausted(&key) {`.
+// Made red with scripts/break-once.sh replacing it with `            if false {`.
+// Watched: the exhausted subtree retained its live connection.
+// Search `        let closed = self.sweep();`.
+// Made red with scripts/break-once.sh replacing it with `        let closed = if result.is_ok() { self.sweep() } else { Vec::new() };`.
+// Watched: an exhaustion error left the revoked subtree connection open.
 async fn revoker_exhaustion_closes_its_live_subtree_and_keeps_a_sibling_open() {
     let root = SecretKey::from_bytes(&[1; 32]);
     let delegate = SecretKey::from_bytes(&[2; 32]);

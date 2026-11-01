@@ -45,6 +45,12 @@ impl Revoked {
             self.pending.remove(&id);
             return Ok(());
         }
+        // Only the signer's ancestry is charged. Downstream issuers did not
+        // authorize this revoker and must not lose their independent budgets.
+        let path = path
+            .iter()
+            .position(|key| *key == revoker)
+            .map_or(path, |end| &path[..end]);
         let mut seen = BTreeSet::new();
         let charged: Vec<_> = std::iter::once(revoker)
             .chain(path.iter().rev().copied())
@@ -105,25 +111,33 @@ impl Revoked {
         Ok(())
     }
     pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {
-        let promotions: Vec<_> = self
-            .pending
-            .iter()
-            .filter_map(|(id, revokers)| {
-                revokers
-                    .iter()
-                    .find(|key| roots.contains(key) && !self.is_exhausted(key))
-                    .map(|key| (*id, *key))
-            })
-            .collect();
-        for (id, revoker) in promotions {
-            self.accept(id, revoker, &[]).map_err(|revoker| {
-                super::ChangeError::RevokerExhausted {
-                    revoker,
-                    max: super::MAX_ACCEPTED_PER_REVOKER,
+        let ids: Vec<_> = self.pending.keys().copied().collect();
+        let mut refusal = None;
+        for id in ids {
+            let revokers: Vec<_> = self
+                .pending
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter(|key| roots.contains(key) && !self.is_exhausted(key))
+                .copied()
+                .collect();
+            for revoker in revokers {
+                match self.accept(id, revoker, &[]) {
+                    Ok(()) => break,
+                    Err(revoker) => {
+                        // Finish the new roots' view before the connection sweep.
+                        // A budget error must not defer other roots' promotions
+                        // until admission reads inside that sweep.
+                        refusal.get_or_insert(super::ChangeError::RevokerExhausted {
+                            revoker,
+                            max: super::MAX_ACCEPTED_PER_REVOKER,
+                        });
+                    }
                 }
-            })?;
+            }
         }
-        Ok(())
+        refusal.map_or(Ok(()), Err)
     }
     fn revokes(
         &mut self,
@@ -410,8 +424,9 @@ pub enum Widening {
     Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, postcard_schema::Schema,
 )]
 pub enum ChainError {
-    /// A key on this chain exhausted its accepted-revocation budget.
-    #[error("a key on the chain exhausted its revocation budget")]
+    /// A revocation authority exhausted its budget while checking this chain.
+    /// The exhausted key's subtree remains refused.
+    #[error("a revocation authority exhausted its accepted-record budget")]
     RevokerExhausted {
         /// The exhausted public key, in its 32-byte wire form.
         revoker: [u8; 32],

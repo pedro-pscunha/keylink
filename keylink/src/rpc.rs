@@ -1015,6 +1015,52 @@ mod tests {
 
     // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
+
+    #[test]
+    // Made red with scripts/break-once.sh by zeroing the holder contribution in replay_binding with `hash.update(&[0; 32]);`.
+    // This same-file edit is described rather than quoted.
+    // Watched: different holders produced the same replay commitment.
+    fn replay_authority_commitments_include_principal_and_holder() {
+        use crate::trust::{
+            Caveats, Certificate, Chain, Delegation, Roots, Scope, Timestamp, Validity,
+        };
+        let a = iroh::SecretKey::from_bytes(&[20; 32]);
+        let b = iroh::SecretKey::from_bytes(&[21; 32]);
+        let first = iroh::SecretKey::from_bytes(&[22; 32]);
+        let second = iroh::SecretKey::from_bytes(&[23; 32]);
+        let credential = |root: &iroh::SecretKey, holder: iroh::PublicKey| {
+            Chain::new(vec![Certificate::issue(
+                root,
+                Delegation {
+                    subject: holder,
+                    delegate: 0,
+                    serial: 0,
+                    caveats: Caveats {
+                        resources: Scope::any(),
+                        operations: Scope::any(),
+                        validity: Validity::new(
+                            Timestamp::from_unix_secs(0),
+                            Timestamp::from_unix_secs(u64::MAX),
+                        )
+                        .unwrap(),
+                    },
+                },
+            )
+            .unwrap()])
+            .verify(
+                &Roots::only([root.public()]).unwrap(),
+                Timestamp::from_unix_secs(1),
+            )
+            .unwrap()
+        };
+        let original = credential(&a, first.public());
+        let different_principal = credential(&b, first.public());
+        let different_holder = credential(&a, second.public());
+        let bound = replay_binding([9; 32], Some(&original));
+        assert_ne!(bound, replay_binding([9; 32], Some(&different_principal)));
+        assert_ne!(bound, replay_binding([9; 32], Some(&different_holder)));
+        assert_ne!(bound, replay_binding([9; 32], None));
+    }
     use crate::idempotency::{MAX_ATTACH, MAX_WAITING_PER_PEER};
 
     /// A valid endpoint id, reused from `idempotency.rs` for the same reason.

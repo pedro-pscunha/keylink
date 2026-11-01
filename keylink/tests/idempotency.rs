@@ -2701,6 +2701,12 @@ impl map_counter::Handler for MapCounter {
     }
 }
 #[tokio::test]
+// Search `        let fingerprint = *blake3::hash(message_bytes).as_bytes();`.
+// Made red with scripts/break-once.sh replacing it with `        let fingerprint = [0; 32];`.
+// Watched: changed message bytes replayed instead of being refused.
+// Search `        let fingerprint = *blake3::hash(message_bytes).as_bytes();`.
+// Made red with scripts/break-once.sh replacing it with `        let fingerprint = *blake3::hash(&frame).as_bytes();`.
+// Watched: changing only attach controls prevented an identical-message replay.
 async fn identical_received_map_bytes_replay_despite_fresh_hashers_and_retry_controls() {
     #[derive(Deserialize)]
     struct Reply {

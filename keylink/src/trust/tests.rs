@@ -409,6 +409,9 @@ fn trust_store_budgets_bound_pending_records_and_never_drop_tombstones() {
 }
 
 #[test]
+// Search `                || self.usage.get(key).copied().unwrap_or(0) >= super::MAX_ACCEPTED_PER_REVOKER`.
+// Made red with scripts/break-once.sh replacing it with `                || self.usage.get(key).copied().unwrap_or(0) > super::MAX_ACCEPTED_PER_REVOKER`.
+// Watched: one additional tombstone was accepted rather than exhausting the revoker.
 fn revoked_leaf_churn_exhausts_its_revoker_without_retaining_the_leaves() {
     let (root, delegate, holder) = keys();
     let parent = Certificate::issue(&root, grant(delegate.public(), "repo", 1)).unwrap();
@@ -450,6 +453,9 @@ fn revoked_leaf_churn_exhausts_its_revoker_without_retaining_the_leaves() {
 }
 
 #[test]
+// Search `            .chain(path.iter().rev().copied())`.
+// Made red with scripts/break-once.sh replacing it with `            .chain(std::iter::empty())`.
+// Watched: fresh revoker keys bypassed the common issuer budget.
 fn fresh_revoker_keys_cannot_bypass_the_common_issuer_budget() {
     let (root, delegate, holder) = keys();
     let parent = Certificate::issue(&root, grant(delegate.public(), "repo", 2)).unwrap();
@@ -492,6 +498,12 @@ fn fresh_revoker_keys_cannot_bypass_the_common_issuer_budget() {
 }
 
 #[test]
+// Search `            if revoked.is_exhausted(&self.signer) {`.
+// Made red with scripts/break-once.sh replacing it with `            if false {`.
+// Watched: an exhausted root could still open signed claims.
+// Search `        if self.roots.contains(&peer) && !self.revoked.is_exhausted(&peer) {`.
+// Made red with scripts/break-once.sh replacing it with `        if self.roots.contains(&peer) {`.
+// Watched: an exhausted root was still admitted directly.
 fn direct_and_root_promoted_budgets_never_evict_accepted_tombstones() {
     let (root, _, holder) = keys();
     let revoker = budget_key(20000);
@@ -559,4 +571,86 @@ fn direct_and_root_promoted_budgets_never_evict_accepted_tombstones() {
         let last = Chain::new(vec![certificates[MAX_ACCEPTED_PER_REVOKER].clone()]);
         assert!(trust.verify(&last, Timestamp::now()).is_ok());
     }
+}
+
+#[test]
+// Search `                        refusal.get_or_insert(super::ChangeError::RevokerExhausted {`.
+// Made red with scripts/break-once.sh replacing it with `                        return Err(super::ChangeError::RevokerExhausted { revoker, max: super::MAX_ACCEPTED_PER_REVOKER });
+//                         refusal.get_or_insert(super::ChangeError::RevokerExhausted {`.
+// Watched: the second root's promotions were deferred instead of establishing the whole new view before sweeping.
+fn one_exhausted_root_does_not_defer_other_pending_root_promotions() {
+    let (root, _, holder) = keys();
+    let a = budget_key(100000);
+    let b = budget_key(100001);
+    let trust = Trust::new(Roots::only([root.public()]).unwrap());
+    let mut certificates: Vec<_> = (0..2 * (MAX_ACCEPTED_PER_REVOKER + 1))
+        .map(|serial| {
+            let mut delegation = grant(holder.public(), "repo/a", 0);
+            delegation.serial = serial as u64;
+            Certificate::issue(&root, delegation).unwrap()
+        })
+        .collect();
+    certificates.sort_by_key(Certificate::id);
+    for (index, certificate) in certificates.iter().enumerate() {
+        let revoker = if index <= MAX_ACCEPTED_PER_REVOKER {
+            &a
+        } else {
+            &b
+        };
+        trust
+            .apply(Change::Revoke(Revocation::issue(revoker, certificate.id())))
+            .unwrap();
+    }
+    assert!(matches!(
+        trust.apply(Change::Roots(
+            Roots::only([root.public(), a.public(), b.public()]).unwrap()
+        )),
+        Err(ChangeError::RevokerExhausted { .. })
+    ));
+    assert_eq!(
+        trust.store().revoked.revision(),
+        (2 * MAX_ACCEPTED_PER_REVOKER, 2)
+    );
+    assert!(!trust.admitting(a.public()));
+    assert!(!trust.admitting(b.public()));
+    assert!(trust.admitting(root.public()));
+}
+
+#[test]
+// Search `            .map_or(path, |end| &path[..end]);`.
+// Made red with scripts/break-once.sh replacing it with `            .map_or(path, |_| path);`.
+// Watched: an upstream revocation exhausted a downstream issuer by charging beyond the signer.
+fn an_upstream_revocation_does_not_charge_a_downstream_issuers_budget() {
+    let (root, delegate, issuer) = keys();
+    let holder = budget_key(30000);
+    let trust = Trust::new(Roots::only([root.public(), issuer.public()]).unwrap());
+    for serial in 1000..1000 + MAX_ACCEPTED_PER_REVOKER as u64 {
+        let mut delegation = grant(holder.public(), "repo/b", 0);
+        delegation.serial = serial;
+        let certificate = Certificate::issue(&root, delegation).unwrap();
+        trust
+            .apply(Change::Revoke(Revocation::issue(&issuer, certificate.id())))
+            .unwrap();
+    }
+    // The downstream issuer has used its own root budget, but has not attempted
+    // another acceptance. Its upstream delegate must not exhaust it by proxy.
+    let leaf = Certificate::issue(&issuer, grant(holder.public(), "repo/a", 0)).unwrap();
+    trust
+        .apply(Change::Revoke(Revocation::issue(&delegate, leaf.id())))
+        .unwrap();
+    let chain = Chain::new(vec![
+        Certificate::issue(&root, grant(delegate.public(), "repo", 2)).unwrap(),
+        Certificate::issue(&delegate, grant(issuer.public(), "repo", 1)).unwrap(),
+        leaf,
+    ]);
+    assert_eq!(
+        trust.verify(&chain, Timestamp::now()).unwrap_err(),
+        ChainError::Revoked { at: 2 }
+    );
+    assert!(trust.admitting(issuer.public()));
+    assert!(!trust.store().revoked.is_exhausted(&issuer.public()));
+    assert_eq!(
+        trust.store().revoked.revision().0,
+        MAX_ACCEPTED_PER_REVOKER + 1
+    );
 }
