@@ -1115,15 +1115,16 @@ async fn an_idle_actor_is_evicted_without_anyone_asking() {
 /// Wait until the sweeper has evicted every actor in `system`.
 ///
 /// Bounded, so a sweeper that never evicts is a red test and not a hung one; the
-/// bound is far past anything load can spend and names what it waited for.
+/// bound is far past anything load can spend (a whole-process stall of 35 s was
+/// measured on a loaded machine) and names what it waited for.
 async fn until_empty(system: &journal::Registry) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         while !system.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the sweeper evicted every idle actor within 30 s");
+    .expect("the sweeper evicted every idle actor within 120 s");
 }
 
 /// Eviction is `shutdown`, not `abort`: the actor is not cut off mid-turn, and
@@ -1292,7 +1293,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
         let behind = fixture.client.at(id("doc"));
         let queued = behind.apply(2, 0);
         let stopping = async {
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(Duration::from_secs(120), async {
                 while fixture.system.serving(&id("doc")).map(|row| row.queued) != Some(1) {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }

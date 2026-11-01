@@ -1693,7 +1693,7 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
     // call refused at the mailbox is a different path, and already correct. Asked
     // of the mailbox, not slept for: the factory is held, so the call can only be
     // sitting in it.
-    for _ in 0..30_000 {
+    for _ in 0..120_000 {
         if ticker.status().queued == 1 {
             break;
         }

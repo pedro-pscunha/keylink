@@ -174,13 +174,13 @@ fn key(text: &str) -> IdempotencyKey {
 /// call that reaches the server first takes the claim itself, and the test is then
 /// about something else. Bounded, so a claim that never lands is a red test.
 async fn until_running(client: &till::Client, name: &str) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         while client.key_state(key(name)).await.expect("asks") != keylink::KeyState::Running {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the first call's claim reached the ledger within 30 s");
+    .expect("the first call's claim reached the ledger within 120 s");
 }
 
 /// An oversized key, built the only way a peer can build one.
@@ -2370,7 +2370,7 @@ mod stored {
             // waits for the claim itself instead of for a duration that happens to
             // be long enough on this machine.
             let mut claimed = false;
-            for _ in 0..3_000 {
+            for _ in 0..12_000 {
                 if fixture
                     .client
                     .key_state(key("in-flight"))

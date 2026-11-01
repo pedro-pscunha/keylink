@@ -291,7 +291,7 @@ async fn a_subscriber_is_dropped_when_its_connection_ends() {
         client.close().await.expect("closes");
     }
 
-    for _ in 0..600 {
+    for _ in 0..2_400 {
         if subscribers.is_empty() {
             return;
         }

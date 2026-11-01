@@ -452,11 +452,11 @@ async fn an_actor_that_ends_itself_is_delisted_and_reported_to_the_console() {
 
     // The delisting is asked first, and as a **bounded poll that prints**: a
     // guard whose failure is a hang is much weaker than one that says what it
-    // saw. Three hundred reads over thirty seconds, which a pass leaves at the
+    // saw. Twelve hundred reads over two minutes, which a pass leaves at the
     // first one or two — and when it is broken, the last `rows` is the whole
     // evidence.
     let mut rows = Vec::new();
-    for _ in 0..300 {
+    for _ in 0..1_200 {
         rows = console.actors().await.expect("the inspect actor answers");
         if !rows.iter().any(|row| row.id == who) {
             break;

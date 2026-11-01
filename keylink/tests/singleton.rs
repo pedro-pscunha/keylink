@@ -150,13 +150,13 @@ async fn served() -> (Server, ledger::Handle<Ledger>, ledger::Client) {
 /// returns can race the turn it means to queue behind. Bounded, so a turn that
 /// never starts is a red test and not a hung one.
 async fn until_busy(actor: &ledger::Handle<Ledger>) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         while !actor.status().busy {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the held turn entered the actor within 30 s");
+    .expect("the held turn entered the actor within 120 s");
 }
 
 /// Let the held turn go, but only once a message is queued behind it and its
@@ -172,13 +172,13 @@ async fn release_after_the_queued_budget(
     release: &Semaphore,
     budget: Duration,
 ) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         while actor.status().queued != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the second message reached the mailbox within 30 s");
+    .expect("the second message reached the mailbox within 120 s");
     tokio::time::sleep(budget * 2).await;
     // Every turn after the held one passes too.
     release.add_permits(16);
