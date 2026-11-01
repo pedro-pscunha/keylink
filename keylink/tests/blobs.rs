@@ -2984,3 +2984,56 @@ async fn a_peer_revoke_lands_on_a_call_whose_handler_is_still_running() {
         .expect_err("the withdrawn grant admits nothing");
     assert_refused(&error, "content a revoked peer's running call returned");
 }
+
+// ═══════════════════════════════════════ a few bytes cannot make the holder walk
+
+/// Review finding 3, end to end. A request that selects nothing until offset
+/// `1 << 60` is a few bytes on the wire, and iroh-blobs walks the empty offsets
+/// one at a time before it looks at the sequence, so a closure grant that
+/// admitted it would hold a thread of the holder for good.
+///
+/// Sent as raw bytes, because iroh-blobs' own client walks the same offsets
+/// before it sends, and so does the request builder. The holder must answer
+/// with a refusal and not with silence.
+///
+/// **Without the guard this test hangs rather than failing**, on any runtime:
+/// the walk never yields, so it starves the timeout below on the default
+/// single-threaded runtime, and on a multi-threaded one it still keeps the
+/// runtime from shutting down after the timeout has panicked. Watched that way
+/// with `scripts/break-once.sh` (row `HK56`), replacing
+/// `if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
+/// with `if false {` in `keylink/src/blobs.rs`: the run was still going after
+/// two minutes and was ended by its process id. The unit test
+/// `a_closure_request_for_a_far_offset_is_refused_without_walking_to_it` is
+/// the one that goes red cleanly. The wait below asserts nothing about time.
+#[tokio::test]
+async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
+    let cluster = cluster().await;
+    let ids = add_members(&cluster.blobs, 4).await;
+    let seq = cluster.blobs.add_seq(ids).await.expect("stores");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .await;
+
+    for offset in [1u64 << 60, u64::MAX - 1] {
+        let wire = postcard::to_stdvec(&vec![(offset, vec![0u64]), (1u64, Vec::<u64>::new())])
+            .expect("encodes the runs");
+        let ranges: ChunkRangesSeq = postcard::from_bytes(&wire).expect("a valid sparse request");
+        let request = GetRequest::new(hash_of(seq.id()), ranges);
+
+        let connection = cluster.dial_blobs(&cluster.peer).await;
+        let (mut send, mut recv) = connection.open_bi().await.expect("opens a stream");
+        let asked = postcard::to_stdvec(&iroh_blobs::protocol::Request::Get(request))
+            .expect("encodes the request");
+        send.write_all(&asked).await.expect("writes the request");
+        send.finish().expect("finishes the request");
+
+        let answer = tokio::time::timeout(Duration::from_secs(60), recv.read_to_end(1 << 20))
+            .await
+            .expect("the holder answered instead of walking to the offset");
+        assert!(
+            answer.is_err(),
+            "offset {offset} must be refused, got {answer:?}"
+        );
+    }
+}

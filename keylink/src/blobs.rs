@@ -112,6 +112,17 @@ use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, RemoteError, Resul
 /// Change it per store with [`Blobs::set_grant_budget`].
 pub const GRANT_BUDGET: usize = 64 * 1024 * 1024;
 
+/// The most members one closure may list: 262,144, a root of 8 MiB.
+///
+/// Both ends hold the line. A holder refuses a request that selects a member
+/// past it, because iroh-blobs walks the offsets of a request one at a time and
+/// a request can name an offset near `u64::MAX` in a few bytes. A fetcher
+/// refuses a root longer than this before it downloads or plans anything,
+/// because the member list is the holder's to make as long as it likes and the
+/// fetcher's memory pays for it. A tree that needs more is split across
+/// several closures.
+pub const MAX_CLOSURE_MEMBERS: usize = 1 << 18;
+
 /// Bytes the ledger charges for one grant.
 ///
 /// An upper bound on one `(BlobId, Entry)` slot of a hash table, computed from
@@ -1399,8 +1410,44 @@ fn admits_get(
         if scope != Scope::Closure {
             return Err(AbortReason::Permission);
         }
+        // And only as far as a closure can be listed. Refused here because
+        // iroh-blobs would otherwise walk every empty offset before it looks at
+        // the sequence.
+        if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {
+            return Err(AbortReason::Permission);
+        }
     }
     Ok(())
+}
+
+/// Whether `ranges` selects anything at an offset above `last_member`, where
+/// offset 0 is the root and offset `n + 1` is member `n`.
+///
+/// Read off the encoded runs and never expanded: a run is a start offset and the
+/// ranges that apply from there until the next run, so the work is the size of
+/// the request and not the size of the offsets it names. The runs are taken from
+/// the wire form of the value, which is the one view of them iroh-blobs offers
+/// and which a request has already been bounded to by its 1 MiB message cap. A
+/// value that will not encode counts as reaching past.
+fn selects_past(ranges: &ChunkRangesSeq, last_member: u64) -> bool {
+    let Ok(wire) = postcard::to_stdvec(ranges) else {
+        return true;
+    };
+    let Ok(runs) = postcard::from_bytes::<Vec<(u64, Vec<u64>)>>(&wire) else {
+        return true;
+    };
+    let mut offset = 0u64;
+    for (gap, spans) in runs {
+        let Some(start) = offset.checked_add(gap) else {
+            return true;
+        };
+        offset = start;
+        // A run with no spans selects nothing, wherever it starts.
+        if !spans.is_empty() && offset > last_member {
+            return true;
+        }
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────── the client
@@ -2759,6 +2806,58 @@ mod tests {
                 ChunkRanges::all()
             ])),
             "members only"
+        );
+    }
+
+    /// Review finding 3. A closure grant admitted any offset, and a request can
+    /// select nothing until offset `1 << 60` in a few bytes while iroh-blobs
+    /// walks the empty offsets one at a time before it looks at the sequence.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK56`) by replacing
+    /// `if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
+    /// with `if false {`: the far request is then admitted.
+    #[test]
+    fn a_closure_request_for_a_far_offset_is_refused_without_walking_to_it() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grant(&grants, 1, seq(1));
+        hung(&live, 1, 1);
+        // Built from its wire form: `GetRequest::builder` expands every offset
+        // below the one it is given into a vector, which is the very cost under
+        // test. One run: `offset` empty offsets, then everything, then nothing.
+        let far = |offset: u64| {
+            let wire = postcard::to_stdvec(&vec![(offset, vec![0u64]), (1u64, Vec::<u64>::new())])
+                .expect("encodes");
+            RequestReceived {
+                connection_id: 1,
+                request_id: 0,
+                request: GetRequest::new(
+                    blob(1).hash(),
+                    postcard::from_bytes(&wire).expect("a valid sparse request"),
+                ),
+            }
+        };
+        let last = MAX_CLOSURE_MEMBERS as u64;
+
+        assert!(
+            admits_get(&grants, &live, &far(last)).is_ok(),
+            "control: the offset of the last member a closure may list"
+        );
+        assert!(admits_get(&grants, &live, &far(last + 1)).is_err());
+        assert!(admits_get(&grants, &live, &far(1 << 60)).is_err());
+        assert!(admits_get(&grants, &live, &far(u64::MAX - 1)).is_err());
+        assert!(
+            admits_get(
+                &grants,
+                &live,
+                &get(
+                    1,
+                    blob(1),
+                    ChunkRangesSeq::from_ranges_infinite([ChunkRanges::all()])
+                )
+            )
+            .is_ok(),
+            "control: an open-ended request starts at the root and is walked as far as the list goes"
         );
     }
 
