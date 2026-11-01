@@ -454,6 +454,7 @@ where
     where
         P::Response: crate::Granting,
     {
+        __check_window_len(self.entries.len() + 1);
         self.entries.push(Entry {
             version,
             alpn: version.alpn(&self.window.service),
@@ -527,6 +528,14 @@ struct ProbeReply {
     versions: Vec<Version>,
 }
 const MAX_WINDOW: usize = 64;
+/// Check a generated window before any ALPN or probe can publish it.
+#[doc(hidden)]
+pub const fn __check_window_len(count: usize) {
+    ::core::assert!(
+        count <= MAX_WINDOW,
+        "a contract window holds at most 64 versions"
+    );
+}
 pub(crate) struct Probe {
     pub(crate) window: Window,
     pub(crate) admission: Arc<dyn Admission>,
@@ -776,5 +785,17 @@ mod tests {
             matches!(error, Error::SchemaMismatch(m) if matches!(m.theirs(), PeerWindow::Unknown))
         );
         closed.notified().await;
+    }
+    #[test]
+    #[should_panic(expected = "a contract window holds at most 64 versions")]
+    fn construction_refuses_a_window_its_probe_reader_would_reject() {
+        let hash = crate::__schema_hash::<u8>("wide");
+        let mut lineage =
+            Lineage::new::<Here<u8, u8>>("wide", Version::__new(MAX_WINDOW as u32, hash));
+        for label in (1..MAX_WINDOW as u32).rev() {
+            lineage = lineage.previous::<Here<u8, u8>>(Version::__new(label, hash));
+        }
+        assert_eq!(lineage.window().versions().len(), MAX_WINDOW);
+        let _ = lineage.previous::<Here<u8, u8>>(Version::__new(0, hash));
     }
 }

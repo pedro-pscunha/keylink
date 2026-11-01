@@ -422,6 +422,38 @@
 /// const-compatible no-op compile the invalid contract (0 passed, 1 failed each).
 /// Restored both qualified assertions.
 ///
+/// A window holds at most 64 versions, current included. Construction refuses
+/// the 65th entry, rather than publishing a probe its own reader would reject:
+///
+/// ```compile_fail
+/// # #![recursion_limit = "2048"]
+/// # mod frozen { keylink::service! { service Wide; version 1; rpc Ping() -> u8; } }
+/// # macro_rules! window {
+/// # ($($old:literal),*) => {
+/// keylink::service! {
+///     service Wide; version 65;
+///     rpc Ping() -> u8;
+/// # $(previous $old { hash frozen::wide::VERSION.hash(); keyed_hash frozen::wide::KEYED_VERSION.hash(); rpc Ping() -> u8; })*
+/// }
+/// # keylink::pastey::paste! { $(
+/// # impl wide::[<version_ $old>]::Convert for wide::[<version_ $old>]::Step {
+/// # fn upgrade_request(_: wide::[<version_ $old>]::Request) -> Result<<wide::[<version_ $old>]::Step as keylink::Hop>::NewerRequest, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: <wide::[<version_ $old>]::Step as keylink::Hop>::NewerRequest) -> Result<wide::[<version_ $old>]::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: wide::[<version_ $old>]::Response) -> Result<<wide::[<version_ $old>]::Step as keylink::Hop>::NewerResponse, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: <wide::[<version_ $old>]::Step as keylink::Hop>::NewerResponse) -> Result<wide::[<version_ $old>]::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # )* }
+/// # };
+/// # }
+/// # window!(64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1);
+/// # fn main() {}
+/// ```
+///
+/// The oversized-window fence was watched red by allowing 65 in the shared
+/// count guard: the complete fixture compiled (0 passed, 1 failed). All frozen
+/// conversions were present, so the failure cannot come from missing impls.
+/// Restored the 64-version construction limit.
+///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
 #[macro_export]
@@ -5660,6 +5692,7 @@ macro_rules! __keylink_service {
             $crate::__keylink_contract! { $svc, $version;
                 $( { [ $( #[$meta] )* ] [ $( #[$cfg] )* ] [ $( $defer )? ] $kind $rpc ( $( $arg : $ty ),* ) -> $ret } )+
             }
+            const _: () = $crate::__check_window_len(1usize $(+ { let _ = $older; 1usize })*);
             #[doc(hidden)] pub type __Toward = $crate::Here<Request, Response>;
             $crate::__keylink_previous! { @chain [$svc] [$version] [super] $( previous $older { $( $old )* } )* }
 

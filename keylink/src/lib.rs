@@ -253,7 +253,7 @@ mod wire;
 #[doc(hidden)]
 pub use node::__schema_hash;
 #[doc(hidden)]
-pub use version::{Here, Hop, Keyed, Lineage, Toward};
+pub use version::{__check_window_len, Here, Hop, Keyed, Lineage, Toward};
 pub use version::{Mismatch, PeerWindow, Unsupported, Version, Window};
 
 pub use actor::{
