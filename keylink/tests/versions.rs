@@ -583,3 +583,36 @@ async fn conversion_failures_name_the_execution_stage() {
     ));
     assert_eq!(current.calls.load(Ordering::SeqCst), 1);
 }
+
+/// Watched red: replace the call health check's close reason with
+/// `None::<ConnectionError>`. The isolated test returned UnsupportedRequest
+/// instead of renegotiating: 0 passed, 1 failed. Restored.
+#[tokio::test]
+async fn a_closed_older_codec_cannot_block_renegotiation() {
+    let server = node().await;
+    let caller = node().await;
+    let handler = Current::default();
+    let _running = v3::ledger::serve(&server, handler.clone(), Allowlist::anyone()).unwrap();
+    // Initially advertise only 2. The router already has both handlers, so
+    // changing the advertised window models an upgrade without changing routes.
+    server
+        .endpoint()
+        .set_alpns(vec![v2::ledger::alpn().to_vec()]);
+    let peer: keylink::Peer<v3::ledger::Client> =
+        keylink::Peer::new(&caller, server.endpoint().addr());
+    let cached = peer.connect().await.unwrap();
+    assert_eq!(cached.version().label(), 2);
+    cached.as_ref().clone().close().await.unwrap();
+    server.endpoint().set_alpns(vec![
+        v3::ledger::alpn().to_vec(),
+        v2::ledger::alpn().to_vec(),
+    ]);
+    assert_eq!(
+        peer.call(|client| async move { client.purge().await })
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(peer.connect().await.unwrap().version().label(), 3);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+}

@@ -2631,6 +2631,10 @@ where
     /// [`Error::Closed`] when the peer finishes the stream without answering,
     /// plus any transport or codec failure.
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
+        // A dead connection must reach Peer before its stale codec can refuse.
+        if let Some(error) = self.conn.close_reason() {
+            return Err(error.into());
+        }
         let frame = self.codec.encode_request(
             body.declared_len(),
             self.idempotency.as_ref(),
@@ -2736,6 +2740,9 @@ where
         &self,
         request: Req,
     ) -> std::result::Result<crate::Transmitted, crate::TellError> {
+        if let Some(error) = self.conn.close_reason() {
+            return Err(error.into());
+        }
         let frame = self
             .codec
             .encode_request(Some(0), None, WireRequest::Call(request))
