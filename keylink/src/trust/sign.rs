@@ -93,6 +93,12 @@ struct SignedWire {
 /// `open` checks the signature before decoding the value. Values must round-trip
 /// through postcard byte for byte; a nondeterministically ordered `HashMap` may
 /// be refused as `NonCanonical`. The value's schema is not in a contract hash.
+/// `MAX_SIGNED` bounds encoded bytes, not decoded allocation or work. `T` must
+/// not contain collections of elements that encode to zero bytes (for example,
+/// an element whose fields are all `#[serde(skip)]`). A tiny encoded length can
+/// otherwise construct an enormous collection before canonical checking. Use
+/// explicitly bounded application wire types; a valid signature is not a decode budget.
+///
 /// The signature commits to the ordered certificate IDs of the carried chain.
 /// Freshness and replay prevention belong in the application value.
 #[derive(Debug, Clone)]
