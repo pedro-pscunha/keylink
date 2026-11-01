@@ -649,6 +649,9 @@ mod blob_versions {
             r: content::version_1::Response,
         ) -> Result<content::Response, Unsupported> {
             match r {
+                content::version_1::Response::Get((3, _)) => {
+                    Ok(content::Response::Get((13, *REPLACEMENT.get().unwrap())))
+                }
                 content::version_1::Response::Get(v) => Ok(content::Response::Get(v)),
                 _ => unreachable!(),
             }
@@ -673,6 +676,11 @@ mod blob_versions {
     }
     struct Handler(keylink::BlobId);
     impl content::Handler for Handler {
+        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::BlobId) {
+            (mode, self.0)
+        }
+    }
+    impl old::content::Handler for Handler {
         async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::BlobId) {
             (mode, self.0)
         }
@@ -761,6 +769,25 @@ mod blob_versions {
             .await
             .unwrap();
         assert_eq!(guessed.verified_len().await.unwrap(), 8);
+        let older_server = node().await;
+        let _old_running = keylink::Server::builder(&older_server)
+            .service(
+                old::content::service(Handler(original), Allowlist::anyone())
+                    .with_blobs(&store)
+                    .build(),
+            )
+            .spawn()
+            .unwrap();
+        let newer_client = content::Client::connect(&caller, older_server.endpoint().addr())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                newer_client.get(3).await,
+                Err(Error::UnsupportedResponse { .. })
+            ),
+            "client reply upgrades cannot substitute the blob address either"
+        );
     }
 }
 

@@ -302,16 +302,25 @@ fn request_map<A, B>(
         WireRequest::KeyState(k) => WireRequest::KeyState(k),
     })
 }
-fn response_map<A, B>(
+fn response_map<A: crate::Granting, B: crate::Granting>(
     r: WireResponse<A>,
     f: impl FnOnce(A) -> std::result::Result<B, Unsupported>,
 ) -> std::result::Result<WireResponse<B>, Unsupported> {
-    Ok(match r {
+    let original_grant = response_grant(&r);
+    let converted = match r {
         WireResponse::Call(Outcome::Ok(r)) => WireResponse::Call(Outcome::Ok(f(r)?)),
         WireResponse::Call(Outcome::Err(e)) => WireResponse::Call(Outcome::Err(e)),
         WireResponse::KeyState(k) => WireResponse::KeyState(k),
-    })
+    };
+    if response_grant(&converted) != original_grant {
+        return Err(Unsupported::new(
+            "blob",
+            "a contract conversion cannot change the blob address",
+        ));
+    }
+    Ok(converted)
 }
+
 /// Only complete, bounded header frames can enter the reply ledger.
 fn frame_payload(frame: &[u8]) -> Option<&[u8]> {
     let (prefix, payload) = frame.split_first_chunk::<4>()?;
@@ -390,17 +399,8 @@ where
         }
         let payload = frame_payload(&frame).ok_or(postcard::Error::DeserializeBadEncoding)?;
         let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(payload)?;
-        let original_grant = response_grant(&r.message);
         let (message, len, carry_body) = match response_map(r.message, P::down_response) {
-            Ok(m) if response_grant(&m) == original_grant => (m, r.body_len, true),
-            Ok(_) => (
-                WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
-                    version: self.version.label,
-                    detail: "a contract conversion cannot change the blob address".into(),
-                })),
-                Some(0),
-                false,
-            ),
+            Ok(m) => (m, r.body_len, true),
             Err(e) => (
                 WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
                     version: self.version.label,
@@ -821,5 +821,60 @@ mod tests {
         }
         assert_eq!(lineage.window().versions().len(), MAX_WINDOW);
         let _ = lineage.previous::<Here<u8, u8>>(Version::__new(0, hash));
+    }
+    /// Watched red by disabling the shared response identity check. Recovery
+    /// returned the substituted address rather than forgetting it (0 passed,
+    /// 1 failed). Restored the same policy used by live reply conversions.
+    #[cfg(feature = "persist")]
+    #[test]
+    fn recorded_reply_upgrades_cannot_substitute_a_blob_address() {
+        #[derive(Serialize, Deserialize, Schema)]
+        struct Address(crate::BlobId);
+        impl crate::Granting for Address {
+            fn granted(&self) -> Option<crate::BlobId> {
+                Some(self.0)
+            }
+        }
+        fn blob(byte: u8) -> crate::BlobId {
+            postcard::from_bytes(&[byte; 32]).expect("a well-formed hash")
+        }
+        struct Swap;
+        impl Hop for Swap {
+            type Request = u8;
+            type Response = Address;
+            type NewerRequest = u8;
+            type NewerResponse = Address;
+            fn upgrade_request(r: u8) -> std::result::Result<u8, Unsupported> {
+                Ok(r)
+            }
+            fn downgrade_request(r: u8) -> std::result::Result<u8, Unsupported> {
+                Ok(r)
+            }
+            fn upgrade_response(_: Address) -> std::result::Result<Address, Unsupported> {
+                Ok(Address(blob(2)))
+            }
+            fn downgrade_response(r: Address) -> std::result::Result<Address, Unsupported> {
+                Ok(r)
+            }
+        }
+        let hash = crate::__schema_hash::<Address>("records/blob");
+        let old = Version::__new(1, hash);
+        let current = Version::__new(2, hash);
+        let lineage = Box::leak(Box::new(
+            Lineage::new::<Here<u8, Address>>("records/blob", current)
+                .previous::<(Swap, Here<u8, Address>)>(old),
+        ));
+        let recorded = wire::encode_header(
+            Some(0),
+            None,
+            &WireResponse::Call(Outcome::Ok(Address(blob(1)))),
+        )
+        .expect("encodes");
+        let recovery = lineage.records();
+        assert!(
+            (recovery.upgrade)(old, &recorded).is_none(),
+            "an address-changing recovery conversion must become Forgotten"
+        );
+        assert_eq!((recovery.upgrade)(current, &recorded), Some(recorded));
     }
 }
