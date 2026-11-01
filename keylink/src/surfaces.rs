@@ -98,7 +98,7 @@ pub trait Own: Sized {
 /// Build or directly serve a generated service.
 pub trait Servable {
     /// The request carried by the service.
-    type Request: Rpc + DeserializeOwned + Send + Sync + 'static;
+    type Request: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static;
     /// The response carried by the service.
     type Response: Serialize + Granting + Send + Sync + 'static;
 
@@ -118,7 +118,7 @@ pub trait Servable {
 #[doc(hidden)]
 pub trait RegistryDispatch: Sized + Send + 'static {
     /// The service request inside [`Addressed`].
-    type Request: Rpc + DeserializeOwned + Send + Sync + 'static;
+    type Request: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static;
     /// The service response.
     type Response: Serialize + Granting + Send + Sync + 'static;
 

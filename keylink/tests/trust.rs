@@ -541,3 +541,46 @@ async fn presentation_never_reports_held_for_an_evicted_offer() {
         Presented::Refused(ChainError::NotRetained)
     );
 }
+
+#[tokio::test]
+async fn a_request_fingerprint_prevents_cross_resource_replay_after_revocation() {
+    let (root, device, _, trust) = fixture();
+    let a = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/a", 0),
+    )
+    .unwrap()]);
+    let b = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    trust.insert(a.clone()).unwrap();
+    trust.insert(b).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<files::Request, _>(WithinCaveats)
+        .resource(file_resource)
+        .install(|allow| files::service(Files(Arc::new(AtomicUsize::new(0))), allow))
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = files::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let keyed = client.with_idempotency(keylink::IdempotencyKey::new("resource-bound").unwrap());
+    assert_eq!(keyed.read("repo/a/file".into()).await.unwrap(), 7);
+    assert_eq!(keyed.read("repo/a/file".into()).await.unwrap(), 7);
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(&root, a.links()[0].id())))
+        .unwrap()
+        .is_empty());
+    denied(keyed.read("repo/a/file".into()).await.unwrap_err());
+    assert!(matches!(
+        keyed.read("repo/b/file".into()).await.unwrap_err(),
+        Error::Remote(RemoteError::Idempotency(
+            keylink::IdempotencyRefusal::RequestMismatch
+        ))
+    ));
+    assert_eq!(client.read("repo/b/file".into()).await.unwrap(), 7);
+}

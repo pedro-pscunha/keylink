@@ -201,6 +201,7 @@ impl GatewayError {
                     keylink::IdempotencyRefusal::Malformed(_) => Self::InvalidIdempotencyKey,
                     keylink::IdempotencyRefusal::NotKeyable { .. } => Self::IdempotencyNotSupported,
                     keylink::IdempotencyRefusal::TooManyRunning { .. } => Self::IdempotencyCapacity,
+                    keylink::IdempotencyRefusal::RequestMismatch => Self::IdempotencyConflict,
                     keylink::IdempotencyRefusal::InFlight
                     | keylink::IdempotencyRefusal::Interrupted
                     | keylink::IdempotencyRefusal::Unrecordable

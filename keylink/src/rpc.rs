@@ -421,6 +421,7 @@ async fn claim_key(
     method: &'static str,
     peer: EndpointId,
     idem: Option<Idempotency>,
+    fingerprint: [u8; 32],
 ) -> Claimed {
     let Some(idem) = idem else {
         return Claimed::None;
@@ -450,7 +451,7 @@ async fn claim_key(
     ledger.housekeep().await;
     let key = idem.key().clone();
 
-    let notify = match ledger.claim_durably(peer, key.clone()).await {
+    let notify = match ledger.claim_durably(peer, key.clone(), fingerprint).await {
         Claim::Running(notify) => notify,
         settled => return resolve(settled),
     };
@@ -502,14 +503,14 @@ async fn claim_key(
     // under load.
     notified.as_mut().enable();
 
-    match ledger.claim_durably(peer, key.clone()).await {
+    match ledger.claim_durably(peer, key.clone(), fingerprint).await {
         Claim::Running(_) => {}
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
-    resolve(ledger.claim_durably(peer, key).await)
+    resolve(ledger.claim_durably(peer, key, fingerprint).await)
 }
 
 /// Write a recorded reply again, byte for byte.
@@ -628,7 +629,7 @@ async fn serve_one_tell<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned + 'static,
+    Req: Rpc + Serialize + DeserializeOwned + 'static,
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
@@ -669,7 +670,7 @@ async fn serve_one<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned + 'static,
+    Req: Rpc + Serialize + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
     let peer = admitted.id();
@@ -723,7 +724,20 @@ where
     // and a key on any other is refused here rather than quietly dropped. An
     // UNKEYED call still costs nothing: `request.idempotency` is `None`, which is
     // the first thing `claim_key` reads and the only thing it needs.
-    let keyed = match claim_key(&keys, message.method(), peer, request.idempotency).await {
+    let fingerprint = if request.idempotency.is_some() {
+        *blake3::hash(&postcard::to_stdvec(&message)?).as_bytes()
+    } else {
+        [0; 32]
+    };
+    let keyed = match claim_key(
+        &keys,
+        message.method(),
+        peer,
+        request.idempotency,
+        fingerprint,
+    )
+    .await
+    {
         Claimed::None => None,
         // The guard watches the marker, so this task being ABORTED — the
         // connection ended, the server shut down — still settles honestly, even
@@ -879,7 +893,7 @@ pub(crate) fn is_clean_close(error: &ConnectionError) -> bool {
 
 impl<Req, Resp> ProtocolHandler for RpcService<Req, Resp>
 where
-    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
@@ -1075,7 +1089,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
@@ -1087,6 +1101,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
         )
         .await;
 
@@ -1125,7 +1140,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         // Every place but one, so the attacher below takes the last.
@@ -1141,6 +1156,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
         ));
         let answered = poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await;
         assert!(
@@ -1173,7 +1189,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
 
@@ -1183,6 +1199,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, asked)),
+            [0; 32],
         )
         .await;
         let held = started.elapsed();
@@ -1384,7 +1401,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
@@ -1395,7 +1412,7 @@ mod tests {
             Some(budget) => Idempotency::attaching_for(key, budget),
             None => key.into(),
         };
-        let keyed = claim_key(&any(&ledger), "Probe", peer, Some(idem)).await;
+        let keyed = claim_key(&any(&ledger), "Probe", peer, Some(idem), [0; 32]).await;
 
         // Exhaustive, with no catch-all, for the reason
         // `an_attacher_over_the_cap_is_refused_before_it_parks` gives: the arm that
@@ -1550,7 +1567,7 @@ pub struct ServiceBuilder<Req, Resp> {
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
 where
-    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     /// Called by generated code. `dispatch` is the call into the user's handler.
@@ -2216,10 +2233,9 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     ///
     /// The key goes on EVERY call made through the returned client, so it is
     /// meant for one. A second, DIFFERENT call through the same handle is
-    /// answered from the first call's record, and the generated client refuses
-    /// a reply to a question it did not ask
-    /// ([`Error::UnexpectedResponse`]). That is a loud failure rather than a
-    /// wrong answer, but it is still a mistake worth not making.
+    /// refused as [`IdempotencyRefusal::RequestMismatch`] before any recorded
+    /// reply is returned. The binding covers the encoded request message,
+    /// including method, actor and arguments; retries must send the same bytes.
     ///
     /// # Why this returns a different type
     ///

@@ -1132,7 +1132,7 @@ async fn a_refusal_after_dispatch_settles_interrupted() {
 
     let repeat = client
         .with_idempotency(key("slow"))
-        .slow(0)
+        .slow(5_000)
         .await
         .expect_err("the repeat must not be answered with the layer's refusal");
     assert!(
@@ -1801,8 +1801,8 @@ async fn a_tombstone_bound_below_the_churn_runs_the_work_twice() {
 
 /// A scoped client carries its key into every call made through it, so it is
 /// meant for one. Making a second, DIFFERENT call through it does not corrupt
-/// anything: the record answers with the first call's reply, and the generated
-/// client refuses a reply to a question it did not ask.
+/// anything: the ledger refuses a different request fingerprint before it can
+/// return a reply to a question the caller did not ask.
 #[tokio::test]
 async fn a_second_different_call_through_one_scoped_client_is_refused() {
     let fixture = start().await;
@@ -1812,10 +1812,15 @@ async fn a_second_different_call_through_one_scoped_client_is_refused() {
     let error = scoped
         .slow(1)
         .await
-        .expect_err("the record answers Reserve, and this call asked Slow");
+        .expect_err("the key was bound to Reserve, and this call asked Slow");
 
     assert!(
-        matches!(error, Error::UnexpectedResponse { .. }),
+        matches!(
+            error,
+            Error::Remote(RemoteError::Idempotency(
+                IdempotencyRefusal::RequestMismatch
+            ))
+        ),
         "the misuse must be caught, not silently mis-answered: got {error:?}"
     );
 }
@@ -2019,7 +2024,7 @@ async fn an_attach_that_outlives_its_budget_returns() {
             key("k"),
             Duration::from_millis(150),
         ))
-        .slow(0)
+        .slow(3_000)
         .await
         .expect_err("the budget runs out while the first call is still running");
 
@@ -2150,7 +2155,7 @@ async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
 
     let repeat = client
         .with_idempotency(key("k"))
-        .slow(0)
+        .slow(500)
         .await
         .expect_err("the repeat must not be told the layer's refusal");
     assert_eq!(
@@ -2303,14 +2308,14 @@ mod stored {
     const ROOMY: u64 = 64 * 1024;
 
     /// The claim record's exact size: nine bytes of framing, a 32-byte peer id, the
-    /// key, and one byte of state.
+    /// key, one version byte, a 32-byte request fingerprint, and one state byte.
     ///
     /// A ceiling set to exactly this admits every claim and refuses every settled
     /// record, because a settled record is the same thing with a reply frame after
     /// it. The two writes are told apart by their size and by nothing else, which is
     /// what lets a test refuse one of them through the real adapter.
     const fn claim_record(key: &str) -> u64 {
-        9 + 32 + key.len() as u64 + 1
+        9 + 32 + key.len() as u64 + 1 + 32 + 1
     }
 
     /// A key answered before a restart is still answered after one.
@@ -2504,7 +2509,7 @@ mod stored {
         let error = fixture
             .client
             .with_idempotency(key("in-flight"))
-            .slow(0)
+            .slow(600_000)
             .await
             .expect_err("the key is not free");
         assert_eq!(refusal(&error), IdempotencyRefusal::Interrupted);
