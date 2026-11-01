@@ -6,7 +6,7 @@ The crate is a port and one adapter. The port says what durable state needs: one
 
 The crate does not depend on keylink. keylink depends on it through its `persist` feature.
 
-Every stored value carries a version frame, and a state migrates one version at a time on load. A load never writes.
+A snapshot stored through `Versioned` carries a version frame, and it migrates one version at a time on load. A load never writes. The keyed records are opaque bytes; whoever writes them owns their format.
 
 **Status: early.** Nothing here has run in production, and the API will move. Read keylink's README before you build on it.
 

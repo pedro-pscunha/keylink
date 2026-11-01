@@ -966,10 +966,10 @@ Known gaps, in rough priority order:
   nothing ran. Past that point, bound the work inside the method. RFC-05 §7.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
-- Idempotency records are in memory. They die with the process, so a retry
-  across a restart runs the handler again. `keylink-persist` is durability for an
-  actor's *state*, not for the ledger. The other six limits of the guarantee are
-  in **Reliable delivery** above.
+- Idempotency records are in memory by default, so a retry across a restart
+  runs the handler again. `Records::Durable` keeps them on disk instead, at the
+  storage cost and with the in-flight recovery rule **Reliable delivery** above
+  describes, along with the other limits of the guarantee.
 - A keyed instance's `Registry::ended(&id)` future must be subscribed while the id
   is mounted; it returns `None` for an id that is not live and never inserts one.
   The future reports the entry's final loop-or-teardown ending, while

@@ -570,7 +570,15 @@ description = "Every publishable workspace crate still packages"
 # nothing. `keylink-openapi` is NOT excluded — it is an opt-in crate a real
 # downstream user has to be able to depend on, so its path deps carry versions
 # and it packages like every other shipped crate.
-run = "cargo package --workspace --exclude demo --exclude imported-ledger --no-verify --allow-dirty"
+#
+# The licence check before it: each shipped crate carries its own copies of the
+# two root licence files, as regular files, because a symlink checked out with
+# `core.symlinks=false` (a Windows default) is a text file holding the path, and
+# cargo would package that as the licence. `cmp` fails on any difference.
+run = [
+    "for c in keylink keylink-persist keylink-http keylink-openapi; do cmp LICENSE-MIT $c/LICENSE-MIT && cmp LICENSE-APACHE $c/LICENSE-APACHE || exit 1; done",
+    "cargo package --workspace --exclude demo --exclude imported-ledger --no-verify --allow-dirty",
+]
 
 # ── supply chain ────────────────────────────────────────────────────────────
 
