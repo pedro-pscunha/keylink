@@ -260,12 +260,18 @@ impl Stream for Exploding {
 #[derive(Default)]
 struct Desk {
     parked: Vec<Deferred<u64>>,
+    /// Counts `place` turns across every incarnation, when a test wants to know
+    /// that an order has reached the actor without asking the actor a question.
+    placed: Option<Arc<AtomicU32>>,
 }
 
 impl desk::Actor for Desk {
     async fn place(&mut self, _cx: Caller<'_>, reply: Reply<u64>, _order: u64) -> Replied<u64> {
         let (deferred, replied) = reply.later();
         self.parked.push(deferred);
+        if let Some(placed) = &self.placed {
+            placed.fetch_add(1, Ordering::SeqCst);
+        }
         replied
     }
 
@@ -415,15 +421,41 @@ async fn store(name: &str) -> (Scratch, Files) {
 /// The second fault is the terminal one only if the incarnation the first fault
 /// built fails **before it has lived a whole span**: an incarnation that reaches
 /// `recovered_after` and then fails has recovered, and is granted a fresh
-/// restart. The test's own steps between the two faults (a park, a poll, a
-/// `boom` over a real connection) are what that incarnation lives through, so
-/// the span is the budget they must stay inside. It was 50 ms, which a loaded
-/// machine spends in one scheduling stall, and round 2 then read `Restarting`
-/// where it expected `Gone`.
+/// restart. That half is a statement about a clock, and it is pinned where the
+/// clock is paused: `a_failure_slower_than_its_recovery_span_never_gives_up`.
 ///
-/// Not larger, because the backoff is `recovered_after / max`: with a budget of
-/// one, every restart waits out this whole span in real time.
-const ONE_RESTART: Duration = Duration::from_secs(2);
+/// What these tests add is order: right after the first fault the next incarnation
+/// is still in its backoff, so the placed order and the fault behind it are queued
+/// before it exists and it meets them as consecutive turns (`until_placed`). The
+/// residual bet is the case where the incarnation was already up when the order
+/// was sent: then a stall of a whole span between its `place` and the `boom` reads
+/// `Restarting` where `Gone` is expected, and that needs a stall at the start of
+/// the backoff as well. The span is the backoff, `recovered_after / max`, so with
+/// a budget of one every restart waits it out in real time, which is why it is not
+/// larger.
+const ONE_RESTART: Duration = Duration::from_secs(1);
+
+/// Wait until the order a round placed has reached the actor, and return only
+/// when the fault that follows it cannot overtake it.
+///
+/// Either the `place` turn has run (`placed` counts it, after the reply is
+/// parked), or the order is sitting in the mailbox of an actor between
+/// incarnations (`queued`), where the one-slot mailbox puts it ahead of anything
+/// sent after this returns. The fault then arrives as the next turn of the
+/// incarnation that took the order, so how long a loaded machine takes to send it
+/// is not a window the incarnation has to beat.
+///
+/// This replaced a `parked()` poll followed by the `boom` call: two round trips
+/// during which the incarnation was alive, against a span a stall could spend.
+async fn until_placed(placed: &AtomicU32, round: u32, queued: impl Fn() -> u64) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while placed.load(Ordering::SeqCst) < round && queued() != 1 {
+            n0_future::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the order reached the actor, or its mailbox, within 120 s");
+}
 
 fn limit(max: u32, recovered_after: Duration) -> Intensity {
     Intensity::new(
@@ -1147,11 +1179,22 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
+    let placed = Arc::new(AtomicU32::new(0));
     let desk = desk::restarting(
-        move || async move {
-            let observers: Vec<Box<dyn Observer<Desk>>> =
-                vec![Box::new(RefuseFaults { fatal: false })];
-            Ok((Desk::default(), observers, ()))
+        {
+            let placed = placed.clone();
+            move || {
+                let placed = placed.clone();
+                async move {
+                    let observers: Vec<Box<dyn Observer<Desk>>> =
+                        vec![Box::new(RefuseFaults { fatal: false })];
+                    let desk = Desk {
+                        placed: Some(placed),
+                        ..Desk::default()
+                    };
+                    Ok((desk, observers, ()))
+                }
+            }
         },
         limit(1, ONE_RESTART),
     )
@@ -1174,18 +1217,10 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
         // **Asked, never assumed.** The two calls race on one connection, and a
         // fault that overtook the park would end the incarnation the park was
         // meant to be lost with — leaving the placed order sitting in the *next*
-        // one for ever. Observed as a hang before this loop existed.
-        for _ in 0..1_000 {
-            if client.parked().await.expect("the actor answers") == 1 {
-                break;
-            }
-            n0_future::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            client.parked().await.expect("the actor answers"),
-            1,
-            "round {round}: the order has to be parked before the fault"
-        );
+        // one for ever. Observed as a hang before this loop existed. The order is
+        // waited for where it can be seen without a round trip to the actor, and
+        // the fault goes in behind it: see `until_placed`.
+        until_placed(&placed, round.into(), || desk.status().queued).await;
 
         let faulted = client.boom().await.expect_err("boom panics");
         assert!(
@@ -1294,11 +1329,22 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 async fn a_local_caller_can_tell_restarting_from_gone() {
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
+    let placed = Arc::new(AtomicU32::new(0));
     let desk = desk::restarting(
-        move || async move {
-            let observers: Vec<Box<dyn Observer<Desk>>> =
-                vec![Box::new(RefuseFaults { fatal: false })];
-            Ok((Desk::default(), observers, ()))
+        {
+            let placed = placed.clone();
+            move || {
+                let placed = placed.clone();
+                async move {
+                    let observers: Vec<Box<dyn Observer<Desk>>> =
+                        vec![Box::new(RefuseFaults { fatal: false })];
+                    let desk = Desk {
+                        placed: Some(placed),
+                        ..Desk::default()
+                    };
+                    Ok((desk, observers, ()))
+                }
+            }
         },
         limit(1, ONE_RESTART),
     )
@@ -1322,18 +1368,8 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
         };
         // **Asked, never assumed.** A fault that overtook the park would end the
         // incarnation the park was meant to be lost with, leaving the placed
-        // order sitting in the *next* one for ever.
-        for _ in 0..1_000 {
-            if desk.parked().await.expect("the actor answers") == 1 {
-                break;
-            }
-            n0_future::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            desk.parked().await.expect("the actor answers"),
-            1,
-            "round {round}: the order has to be parked before the fault"
-        );
+        // order sitting in the *next* one for ever. See `until_placed`.
+        until_placed(&placed, round.into(), || desk.status().queued).await;
 
         let booming = {
             let desk = desk.clone();
@@ -1513,15 +1549,26 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
+    let placed = Arc::new(AtomicU32::new(0));
     let system = desk::Registry::builder(keylink::Eviction::Never).build();
     system
         .mount(
             desk_id.clone(),
             desk::restarting(
-                move || async move {
-                    let observers: Vec<Box<dyn Observer<Desk>>> =
-                        vec![Box::new(RefuseFaults { fatal: false })];
-                    Ok((Desk::default(), observers, ()))
+                {
+                    let placed = placed.clone();
+                    move || {
+                        let placed = placed.clone();
+                        async move {
+                            let observers: Vec<Box<dyn Observer<Desk>>> =
+                                vec![Box::new(RefuseFaults { fatal: false })];
+                            let desk = Desk {
+                                placed: Some(placed),
+                                ..Desk::default()
+                            };
+                            Ok((desk, observers, ()))
+                        }
+                    }
                 },
                 limit(1, ONE_RESTART),
             )
@@ -1546,28 +1593,12 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
         };
         // **Asked, never assumed**, for the singleton twin's reason: a fault that
         // overtook the park would end the incarnation the park was meant to be
-        // lost with, leaving the order sitting in the *next* one for ever.
-        for _ in 0..1_000 {
-            if client
-                .at(desk_id.clone())
-                .parked()
-                .await
-                .expect("the actor answers")
-                == 1
-            {
-                break;
-            }
-            n0_future::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            client
-                .at(desk_id.clone())
-                .parked()
-                .await
-                .expect("the actor answers"),
-            1,
-            "round {round}: the order has to be parked before the fault"
-        );
+        // lost with, leaving the order sitting in the *next* one for ever. See
+        // `until_placed`.
+        until_placed(&placed, round.into(), || {
+            system.serving(&desk_id).map_or(0, |serving| serving.queued)
+        })
+        .await;
 
         let faulted = client
             .at(desk_id.clone())
@@ -1599,7 +1630,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 
     // And it stays gone, through the other door: the loop returned its ending,
     // so the registry reaped its own entry and there is nothing left to route to.
-    for _ in 0..1_000 {
+    for _ in 0..120_000 {
         if !system.contains(&desk_id) {
             break;
         }
@@ -1769,7 +1800,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
     };
     // **Asked, never assumed.** `park` records its order, so this is the park
     // having happened rather than a guess that a peer's call won its race.
-    for _ in 0..1_000 {
+    for _ in 0..120_000 {
         if ticker.beats().await.expect("the actor is running") == 1 {
             break;
         }
@@ -1887,7 +1918,7 @@ async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
     // The next incarnation, asked rather than assumed: it answers only once the
     // supervisor has built it, and the answer is the state the snapshot holds.
     let mut entries = Vec::new();
-    for _ in 0..1_000 {
+    for _ in 0..120_000 {
         if let Ok(seen) = client.entries().await {
             if !seen.is_empty() {
                 entries = seen;
