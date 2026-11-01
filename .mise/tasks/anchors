@@ -4004,7 +4004,10 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 365
+# The event-log recovery-budget record describes swallowing the existing-identity
+# recovery refusal; it quotes no search anchor, so it needs no new ANCHORS row.
+# The population below is read from the pre-commit failure after that record landed.
+RECORD_BLOCKS = 366
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

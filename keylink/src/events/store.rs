@@ -117,7 +117,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
     use tokio::sync::Notify;
@@ -126,19 +126,31 @@ mod tests {
     struct State {
         held: AtomicBool,
         bytes: Mutex<Option<Vec<u8>>>,
+        records: Mutex<Vec<(keylink_persist::Seq, Vec<u8>)>>,
+        uncertain: AtomicBool,
+        appends: AtomicUsize,
         entered: Notify,
         release: Notify,
         dropped: Notify,
     }
     struct Port(Arc<State>);
-    struct Held(Arc<State>);
+    struct Held(Arc<State>, bool);
+    impl Held {
+        fn healthy(&self) -> keylink_persist::Result<()> {
+            if self.1 {
+                Err(std::io::Error::other("the test claim is poisoned").into())
+            } else {
+                Ok(())
+            }
+        }
+    }
     impl Snapshots for Port {
         type Claim = Held;
         async fn claim(&self, id: &StateId) -> keylink_persist::Result<Held> {
             if self.0.held.swap(true, Ordering::SeqCst) {
                 return Err(keylink_persist::Error::Busy { id: id.clone() });
             }
-            Ok(Held(self.0.clone()))
+            Ok(Held(self.0.clone(), false))
         }
     }
     impl Drop for Held {
@@ -149,9 +161,11 @@ mod tests {
     }
     impl Claim for Held {
         async fn load(&self) -> keylink_persist::Result<Option<Vec<u8>>> {
+            self.healthy()?;
             Ok(self.0.bytes.lock().unwrap().clone())
         }
         async fn store(&mut self, bytes: &[u8]) -> keylink_persist::Result<()> {
+            self.healthy()?;
             self.0.entered.notify_one();
             self.0.release.notified().await;
             *self.0.bytes.lock().unwrap() = Some(bytes.to_vec());
@@ -159,23 +173,121 @@ mod tests {
         }
         async fn append(
             &mut self,
-            _seq: keylink_persist::Seq,
-            _record: &[u8],
+            seq: keylink_persist::Seq,
+            record: &[u8],
         ) -> keylink_persist::Result<()> {
-            unreachable!("opening an empty log must not append events")
+            self.0.appends.fetch_add(1, Ordering::SeqCst);
+            self.healthy()?;
+            self.0.records.lock().unwrap().push((seq, record.to_vec()));
+            if self.0.uncertain.swap(false, Ordering::SeqCst) {
+                self.1 = true;
+                return Err(keylink_persist::Error::Indeterminate {
+                    append: std::io::Error::other("the append acknowledgement failed"),
+                    rollback: std::io::Error::other("the stored record could not be undone"),
+                });
+            }
+            Ok(())
         }
         async fn recover(
             &mut self,
-            _from: keylink_persist::Seq,
+            from: keylink_persist::Seq,
         ) -> keylink_persist::Result<keylink_persist::Tail> {
-            Ok(keylink_persist::Tail::default())
+            self.healthy()?;
+            let stored = self.0.records.lock().unwrap();
+            Ok(keylink_persist::Tail {
+                records: stored
+                    .iter()
+                    .filter(|(seq, _)| *seq >= from)
+                    .cloned()
+                    .collect(),
+                earlier: stored.iter().filter(|(seq, _)| *seq < from).count() as u64,
+                torn: None,
+            })
         }
         async fn truncate_before(
             &mut self,
-            _seq: keylink_persist::Seq,
+            seq: keylink_persist::Seq,
         ) -> keylink_persist::Result<()> {
-            unreachable!("opening an empty log must not truncate events")
+            self.healthy()?;
+            self.0
+                .records
+                .lock()
+                .unwrap()
+                .retain(|(stored, _)| *stored >= seq);
+            Ok(())
         }
+    }
+
+    /// Watched red before indeterminate writes poisoned the live log: the next
+    /// append reached the broken claim instead of returning AppendError::Poisoned.
+    #[tokio::test]
+    async fn an_indeterminate_append_poisoned_log_requires_recovery() {
+        use crate::events::{AppendError, Cursor, EventLog, PullRefused, Retention};
+        use n0_future::future::poll_once;
+        use std::num::{NonZeroU64, NonZeroUsize};
+        let state = Arc::new(State::default());
+        state.release.notify_one();
+        let port = Port(state.clone());
+        let id = StateId::new("events").unwrap();
+        let retention = Retention::new(
+            NonZeroUsize::new(100).unwrap(),
+            NonZeroU64::new(1 << 20).unwrap(),
+        );
+        let log = EventLog::<u64>::durable(&port, &id, retention)
+            .await
+            .unwrap();
+        log.append(1).await.unwrap();
+        let confirmed = log.head();
+        let mut waiting = Box::pin(log.pull(confirmed));
+        assert!(poll_once(waiting.as_mut()).await.is_none());
+        state.uncertain.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            log.append(2).await,
+            Err(AppendError::Store(
+                keylink_persist::Error::Indeterminate { .. }
+            ))
+        ));
+        assert_eq!(
+            log.head(),
+            confirmed,
+            "an uncertain record is not a confirmed head"
+        );
+        assert!(
+            matches!(log.append(3).await, Err(AppendError::Poisoned)),
+            "an indeterminate log must refuse later appends with Poisoned"
+        );
+        assert_eq!(
+            state.appends.load(Ordering::SeqCst),
+            2,
+            "no later operation may reach the poisoned claim"
+        );
+        assert!(
+            matches!(
+                poll_once(waiting.as_mut()).await,
+                Some(Err(PullRefused::Poisoned))
+            ),
+            "poisoning must wake a parked pull without waiting for its timer"
+        );
+        drop(waiting);
+        assert!(matches!(
+            log.pull(Cursor::ORIGIN).await,
+            Err(PullRefused::Poisoned)
+        ));
+        assert_eq!(PullRefused::Poisoned.head(), None);
+        drop(log);
+        // Recovery, not retry, establishes whether the uncertain record exists.
+        let log = EventLog::<u64>::durable(&port, &id, retention)
+            .await
+            .unwrap();
+        let page = log.pull(confirmed).await.unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|(seq, event)| (seq.get(), *event))
+                .collect::<Vec<_>>(),
+            [(2, 2)]
+        );
+        assert_eq!(log.head().seq().unwrap().get(), 2);
     }
 
     #[tokio::test]

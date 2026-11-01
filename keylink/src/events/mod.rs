@@ -26,6 +26,12 @@
 //! leave a phantom after a crash or a later observer refusal; Persist first can
 //! silently lose an event between the two writes. A transactional outbox is not built.
 //!
+//! A durable `Indeterminate` append may already be stored. It poisons the live
+//! log: future appends and pulls are refused as `Poisoned`, and parked pulls wake.
+//! Drop every log handle, reopen through recovery, and inspect what survived
+//! before deciding whether to submit another event. Never automatically retry
+//! the uncertain batch. `head()` remains only the last confirmed cursor.
+//!
 //! Appends never wait for followers. A slow follower falls behind into retention
 //! and is explicitly refused when it asks for removed history. Each caught-up pull
 //! holds a QUIC stream for at most [`PULL_WAIT`], capped by [`MAX_PULLERS`]. Many
@@ -176,6 +182,10 @@ pub enum PullRefused {
         /// The first event that could not be materialized.
         seq: Seq,
     },
+    /// An indeterminate durable append made the live log unavailable. The server
+    /// must drop its log handles and reopen through recovery; no head is claimed.
+    #[error("the event log requires recovery after an indeterminate append")]
+    Poisoned,
     /// No log is served under the requested name. Produced by keyed handlers only.
     #[error("no log is served under that name")]
     Unknown,
@@ -195,7 +205,7 @@ impl PullRefused {
             Self::Expired { head, .. } | Self::Replaced { head } | Self::Ahead { head, .. } => {
                 Some(*head)
             }
-            Self::Unknown | Self::Crowded { .. } | Self::Unreadable { .. } => None,
+            Self::Unknown | Self::Crowded { .. } | Self::Unreadable { .. } | Self::Poisoned => None,
         }
     }
 }

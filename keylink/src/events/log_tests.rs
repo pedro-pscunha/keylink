@@ -396,6 +396,56 @@ mod durable {
             .await
     }
 
+    /// Watched red with break-once.sh: swallowing the existing-identity recover
+    /// refusal in events/store.rs using `.await.unwrap_or_default()` made this
+    /// open appear successful instead of returning OpenError::Store(TooLarge).
+    #[tokio::test]
+    async fn a_recovery_budget_is_reported_without_changing_the_journal() {
+        let scratch = Scratch::new();
+        let files = Files::open(&scratch.0).await.unwrap();
+        let id = StateId::new("events").unwrap();
+        let log = EventLog::<u64>::durable(&files, &id, retention(100, 1 << 20))
+            .await
+            .unwrap();
+        log.append(1).await.unwrap();
+        let confirmed = log.head();
+        drop(log);
+        let journal = scratch.0.join("events.journal");
+        let original = std::fs::read(&journal).unwrap();
+        let offered = original.len() as u64;
+        let limit = offered - 1;
+        let bounded = files.clone().recovery_budget(limit);
+        assert!(
+            matches!(EventLog::<u64>::durable(&bounded, &id, retention(100, 1 << 20)).await,
+            Err(OpenError::Store(keylink_persist::Error::TooLarge { offered: size, limit: cap }))
+            if size == offered && cap == limit)
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            original,
+            "a refused recovery must leave the journal untouched"
+        );
+        let bounded = files.clone().recovery_budget(offered);
+        let log = EventLog::<u64>::durable(&bounded, &id, retention(100, 1 << 20))
+            .await
+            .unwrap();
+        assert!(matches!(
+            log.append(2).await,
+            Err(AppendError::Store(keylink_persist::Error::TooLarge { .. }))
+        ));
+        assert_eq!(log.head(), confirmed);
+        assert_eq!(
+            log.pull(Cursor::ORIGIN).await.unwrap().events,
+            [(Seq(1), 1)],
+            "a clean budget refusal must not poison a readable log"
+        );
+        drop(log);
+        let log = EventLog::<u64>::durable(&files, &id, retention(100, 1 << 20))
+            .await
+            .unwrap();
+        assert_eq!(log.append(2).await.unwrap(), Seq(2));
+    }
+
     /// Finding 2 was watched red before bytes became authoritative: changing
     /// the original shared value failed `producer mutation changed a committed event`.
     #[tokio::test]

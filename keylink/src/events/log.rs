@@ -72,7 +72,8 @@ struct Inner {
     retention: Retention,
     ring: Mutex<Ring>,
     writer: tokio::sync::Mutex<Writer>,
-    changed: watch::Sender<u64>,
+    // Some is the last published head; None is poisoned until recovery.
+    changed: watch::Sender<Option<u64>>,
     #[cfg(feature = "persist")]
     durable: bool,
 }
@@ -157,7 +158,7 @@ where
     }
 
     fn build(id: LogId, retention: Retention) -> Inner {
-        let (changed, _) = watch::channel(0);
+        let (changed, _) = watch::channel(Some(0));
         Inner {
             id,
             retention,
@@ -191,7 +192,9 @@ where
     /// # Errors
     ///
     /// [`OpenError`] for a busy or failed store, incompatible identity or record,
-    /// a gap, an oversized stored event, or a cut torn tail. Event schema migration
+    /// a gap, an oversized stored event, or a cut torn tail. Adapter recovery
+    /// budgets are surfaced as `OpenError::Store(Error::TooLarge)`, without
+    /// guessing at or skipping stored records. Event schema migration
     /// is not built. Reopen with the same `E`: overlapping encodings can silently
     /// change meaning. Use a fresh id for an incompatible event schema.
     #[cfg(feature = "persist")]
@@ -232,7 +235,7 @@ where
             previous = Some(last);
         }
         let head = inner.ring().head;
-        inner.changed.send_replace(head.0);
+        inner.changed.send_replace(Some(head.0));
         inner.durable = true;
         inner.writer.get_mut().store = Some(store);
         Ok(Self {
@@ -249,7 +252,13 @@ where
     /// # Errors
     ///
     /// [`AppendError`] for encoding, size, exhausted sequences or storage failure.
+    /// A store's `Indeterminate` error means the batch may be on disk: this log
+    /// then refuses appends and pulls with `Poisoned` until all handles are dropped
+    /// and it is reopened through recovery. Never automatically retry that batch.
     pub async fn append(&self, event: E) -> Result<Seq, AppendError> {
+        if self.inner.changed.borrow().is_none() {
+            return Err(AppendError::Poisoned);
+        }
         self.append_batch(vec![encode(event)?]).await
     }
 
@@ -267,7 +276,13 @@ where
 
     async fn commit(&self, batch: Vec<Bytes>) -> Result<Seq, AppendError> {
         let mut writer = self.inner.writer.lock().await;
-        let before = self.inner.ring().head.0;
+        let before = {
+            let ring = self.inner.ring();
+            if self.inner.changed.borrow().is_none() {
+                return Err(AppendError::Poisoned);
+            }
+            ring.head.0
+        };
         let last = before
             .checked_add(batch.len() as u64)
             .ok_or(AppendError::Exhausted)?;
@@ -276,10 +291,15 @@ where
         if let Some(store) = &mut writer.store {
             let bytes = super::store::encode_batch(at_ms, batch.iter().map(Bytes::as_ref))
                 .map_err(AppendError::Encode)?;
-            store
-                .append(last, &bytes)
-                .await
-                .map_err(AppendError::Store)?;
+            if let Err(error) = store.append(last, &bytes).await {
+                if matches!(&error, keylink_persist::Error::Indeterminate { .. }) {
+                    // The record may exist on disk. Stop advertising the ring
+                    // and wake parked readers; only a fresh recovery can decide.
+                    let _ring = self.inner.ring();
+                    self.inner.changed.send_replace(None);
+                }
+                return Err(AppendError::Store(error));
+            }
         }
         let (oldest, retained) = {
             let mut ring = self.inner.ring();
@@ -293,7 +313,7 @@ where
             ring.head = Seq(last);
             (ring.oldest(), ring.events.len())
         };
-        self.inner.changed.send_replace(last);
+        self.inner.changed.send_replace(Some(last));
         #[cfg(feature = "persist")]
         {
             // Count by position, including age evictions performed by pulls.
@@ -338,7 +358,11 @@ where
             after
         };
         let _park = ParkGuard(&self.inner);
-        let _ = n0_future::time::timeout(PULL_WAIT, changed.wait_for(|head| *head > after)).await;
+        let _ = n0_future::time::timeout(
+            PULL_WAIT,
+            changed.wait_for(|head| head.is_none_or(|head| head > after)),
+        )
+        .await;
         let mut ring = self.inner.ring();
         ring.trim(self.inner.retention, now_ms());
         self.position(&ring, from)?;
@@ -348,6 +372,9 @@ where
     }
 
     fn position(&self, ring: &Ring, from: Cursor) -> Result<u64, PullRefused> {
+        if self.inner.changed.borrow().is_none() {
+            return Err(PullRefused::Poisoned);
+        }
         let head = Cursor::after(self.inner.id, ring.head);
         let after = match from.0 {
             Position::Origin => 0,
@@ -423,7 +450,10 @@ where
         token
     }
 
-    /// This log's current identity and newest event sequence.
+    /// This log's identity and last confirmed event sequence.
+    ///
+    /// After an indeterminate append this remains the last confirmed cursor,
+    /// not a claim about the disk's head. Pulls are refused until recovery.
     #[must_use]
     pub fn head(&self) -> Cursor {
         Cursor::after(self.inner.id, self.inner.ring().head)
@@ -501,9 +531,11 @@ impl<E: Serialize> Stage<E> {
 
 /// An observer that publishes a completed turn's batch before its reply.
 ///
-/// A panicked turn clears the batch. A failed durable append publishes none of
-/// the batch and ends the actor with a refusal named `Publish`. The batch is one
-/// record, not several appends, so a crash cannot recover only part of a turn.
+/// A panicked turn clears the batch. A cleanly failed durable append publishes
+/// none of the batch and ends the actor with a refusal named `Publish`. An
+/// indeterminate append may already exist on disk: it poisons the log and ends
+/// the actor instead of inviting a retry. The batch is one record, not several
+/// appends, so recovery cannot expose only part of a turn.
 /// See the module's warning about ordering this observer against `Persist`.
 pub struct Publish<E> {
     log: EventLog<E>,
@@ -533,7 +565,7 @@ where
     }
 }
 
-/// Why an event or turn batch was not appended.
+/// Why an event or turn batch was not confirmed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AppendError {
@@ -551,7 +583,12 @@ pub enum AppendError {
     /// There are no sequence numbers left.
     #[error("the event sequence is exhausted")]
     Exhausted,
-    /// The store refused a batch. No part of it was appended.
+    /// The log is unavailable after an indeterminate write. Drop every handle
+    /// and reopen through recovery instead of retrying an append that may exist.
+    #[error("the event log is poisoned and requires recovery")]
+    Poisoned,
+    /// The store refused a batch. `Indeterminate` means the record may exist:
+    /// the live log is then poisoned, not safe to retry. Other errors append none.
     #[cfg(feature = "persist")]
     #[error(transparent)]
     Store(keylink_persist::Error),
@@ -566,7 +603,8 @@ pub enum AppendError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OpenError {
-    /// The claim could not be taken or read.
+    /// The claim could not be taken or read. Includes `TooLarge` when the
+    /// journal exceeds the adapter's recovery budget; nothing is skipped.
     #[error(transparent)]
     Store(#[from] keylink_persist::Error),
     /// A record or event did not decode.
