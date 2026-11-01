@@ -455,6 +455,8 @@ impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
+// Replay retention also belongs to the caller's data, never a library default.
+impl HasNoDefault for crate::events::Retention {}
 impl HasNoDefault for Intensity {}
 /// The fifth and sixth are the fan-out's, and they are the same family read one
 /// layer up: [`Overflow`] is the choice between *the publisher waits* and *the

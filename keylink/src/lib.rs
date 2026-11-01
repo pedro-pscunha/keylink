@@ -35,6 +35,8 @@
 //!   silently misparsing. See [`derive_alpn`].
 //! - **Authorization.** iroh proves *who* a peer is; [`Allowlist`] decides
 //!   whether they are welcome, and fails closed.
+//! - **Replayable events.** [`events`] retains sequenced events and follows an
+//!   application's long-poll RPC across disconnects, with explicit resync refusals.
 //! - **Departure.** A peer going away is something you can await, rather than
 //!   an error you meet on your next call. See [`Watch`].
 //! - **State, when sharing it is the awkward part.** The same `service!` block
@@ -216,6 +218,7 @@ mod console;
 #[cfg(feature = "persist")]
 mod durable;
 mod error;
+pub mod events;
 pub mod extend;
 mod external;
 mod idempotency;

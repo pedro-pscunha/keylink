@@ -325,6 +325,7 @@ run = [
     "cargo run -p keylink --example toll_booth",
     "cargo run -p keylink --example control_room",
     "cargo run -p keylink --example noticeboard",
+    "cargo run -p keylink --example event_feed",
     "cargo run -p keylink --example foundry",
     "cargo run -p keylink --example toolroom",
     "cargo run -p keylink --example bridge",

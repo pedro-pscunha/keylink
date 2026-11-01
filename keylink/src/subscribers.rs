@@ -55,7 +55,8 @@
 //!   an [`EndpointId`] is the identity and there is only one of those.
 //! - **No ordering, no fan-out, no retry.** [`snapshot`](Subscribers::snapshot)
 //!   hands back a list; what to do with it is the caller's, and a broadcast
-//!   that must not lose messages needs a durable queue rather than a map.
+//!   that must replay missed messages uses `events::EventLog` instead. Dial-back
+//!   remains the shape for server-initiated RPC, not retained history.
 //!
 //! [`Connection::closed`]: iroh::endpoint::Connection::closed
 //! [`Weak`]: std::sync::Weak

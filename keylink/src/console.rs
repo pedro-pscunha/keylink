@@ -88,6 +88,9 @@
 //! instrument besides: a handler parked inside a turn fails them, while a flag
 //! can be wrong without anybody being kept waiting.
 //!
+//! `events::EventLog` is the general replayable log; this inspector keeps its
+//! own ring because its contract is lossy with a count, a different promise.
+//!
 //! # Three things this does not promise
 //!
 //! - **No event is guaranteed to arrive.** [`Events`] is a bounded channel and

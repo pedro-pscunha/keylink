@@ -7,6 +7,9 @@
 //! Three nodes on the loopback interface. `Node::bind_local` binds with no relay
 //! and no discovery, so this runs offline.
 //!
+//! For replayable events without a callback service, see `event_feed.rs` and
+//! `keylink::events`. This example deliberately keeps no offline history.
+//!
 //! # A push is two contracts, not one
 //!
 //! Every other example that binds a node is a caller asking a server —

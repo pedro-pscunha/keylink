@@ -537,6 +537,8 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ("EVENT1", "keylink/tests/event_log.rs", "keylink/src/events/log.rs",
+     "let mut writer = self.inner.writer.lock().await;"),
     ("R15", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
      "Self::Only(named) => named.contains(&method),"),
     ("R16", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",

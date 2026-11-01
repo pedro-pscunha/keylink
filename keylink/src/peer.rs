@@ -90,6 +90,10 @@ impl<C: Dial + Send + Sync> Peer<C> {
         }
     }
 
+    pub(crate) fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The address this handle dials.
     pub fn addr(&self) -> &EndpointAddr {
         &self.addr

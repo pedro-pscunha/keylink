@@ -34,6 +34,7 @@ gate_modules! {
     declaration_seam => "../tests/declaration_seam.rs",
     defer => "../tests/defer.rs",
     durable => "../tests/durable.rs",
+    event_log => "../tests/event_log.rs",
     feeds => "../tests/feeds.rs",
     idempotency => "../tests/idempotency.rs",
     inspect => "../tests/inspect.rs",

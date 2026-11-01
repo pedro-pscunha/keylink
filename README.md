@@ -395,6 +395,34 @@ A feed that ends, and a feed handler that panics, both end the actor — a fault
 with no caller to resume it into would otherwise be dropped onto a state the
 handler may have left half applied — and `Ended` names which happened.
 
+### Following a log over the network
+
+`keylink::events::EventLog<E>` retains sequenced events. Declare an ordinary `rpc Events(from: Cursor) -> Pull<E>;` in your service. A concurrent handler awaits `log.pull(from)`. An actor declares the method `#[defer]` and returns `log.answer(reply, from)` so a waiting follower never holds its turn. The event type enters the service's schema hash, and every pull goes through the usual admission, authorization and layers.
+
+Create a memory log with `EventLog::memory(retention)` or, with `persist`, open `EventLog::durable(&snapshots, &id, retention).await?`. The durable log claims one id exclusively, stores its identity once in the snapshot slot, and appends each turn's batch as one checksummed `Claim` record. A torn batch is cut and reported, never recovered in part. `Retention::new(events, bytes)` takes nonzero bounds; `.max_age(age)` adds a wall-clock bound. The newest event is always kept, even when it exceeds that bound.
+
+```rust
+keylink::service! {
+    service History;
+    rpc Events(from: keylink::events::Cursor) -> keylink::events::Pull<u64>;
+}
+
+// Several followers share one Arc<Peer<history::Client>> and one connection.
+let mut events = keylink::events::follow(peer, saved_cursor, |client, from| async move {
+    client.events(from).await
+});
+// For each Delivery: process event, then save resume. Retrying lapses continue;
+// every other lapse ends the stream and must be handled, not skipped.
+```
+
+A follower resumes after its last delivered event, not after the page it buffered. Reconnects use surfaced backoff and do not skip a cursor. A consumer restart is at-least-once: save the cursor after processing and deduplicate by sequence when necessary. `Expired`, `Replaced` and `Ahead` are explicit resync answers. Take the refusal's head **first**, read authoritative state that includes everything through that head, then follow from it. Events between that head and the state read can appear twice. `Cursor::ORIGIN` also gets `Expired` once event 1 has been removed.
+
+Appends never wait for followers. A stalled follower falls behind into retention and eventually gets `Expired`. A caught-up pull waits at most 30 seconds, and a log holds at most 1,024 parked pulls. Each holds a QUIC stream, so many logs on one connection compete with ordinary RPCs. Memory holds the retained window and clones pages; the byte bound counts encoded events, not the in-memory size of `E`. Disk is for recovery, not page reads.
+
+For actor producers, `log.stage()` returns `(Stage, Publish)`: keep `Stage` in one actor and pass `Publish` to `.observe(publish)`. `stage.push(event)` encodes and size-checks inside the turn; the observer appends only completed turns, before the reply. A panicked turn publishes nothing. An earlier observer refusal ends the actor before Publish runs. Build a fresh pair in a restarting factory. Put Publish **before** Persist when missing an event is worse than a redundant state read: two stores are not atomic, so Publish first can leave an event for state that was not stored, while Persist first can lose an event between writes. A transactional outbox is not built.
+
+Run `cargo run -p keylink --example event_feed` for a checked disconnect-and-resume in one process. For two machines, run `event_feed serve`, then `event_feed follow <EndpointId>` using the printed id; these modes use `Node::bind()` and its public free relay/discovery preset. The follower ends with `event_feed: OK` only after checking the burst, connection loss and gap-free resume. Reopen a durable log with the same event type: its type is not stored, and overlapping encodings can silently change meaning. Event schema migrations, server-held subscriber cursors, HTTP proxy timeout behavior and network connections in a browser are not verified or built by this module.
+
 ### Many instances behind one ALPN
 
 Keyed actors, addressed by an id inside the request, live in
@@ -767,7 +795,8 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
 7. **A `feed` has no delivery guarantee at all.** It is a local stream into an
    actor rather than a call: nobody sent it, nothing acks an item, nothing refuses
    one, and no key applies. It never reaches the wire. A feed that dies takes the
-   actor with it, which is the only report a feed can make.
+   actor with it, which is the only report a feed can make. `events::EventLog`
+   is the separate networked, at-least-once log; a `feed` remains local and unacknowledged.
 
 
 ## HTTP/JSON gateway
