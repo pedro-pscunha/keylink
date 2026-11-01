@@ -352,6 +352,11 @@ pub enum ErrorKind {
     UpstreamUnavailable,
     /// The upstream operation exceeded its deadline.
     UpstreamTimeout,
+    /// The upstream ran the work and cannot say whether it committed.
+    ///
+    /// The one upstream failure after which a retry is not safe, so it is not
+    /// folded into [`UpstreamError`](Self::UpstreamError). Reconcile first.
+    UpstreamIndeterminate,
     /// A successful response exceeds its configured metadata limit.
     ResponseTooLarge,
     /// No byte resource of this identity is available to this caller.
@@ -389,6 +394,7 @@ impl ErrorKind {
         Self::UpstreamError,
         Self::UpstreamUnavailable,
         Self::UpstreamTimeout,
+        Self::UpstreamIndeterminate,
         Self::ResponseTooLarge,
         Self::BlobNotFound,
         Self::BlobGone,
@@ -418,6 +424,7 @@ impl ErrorKind {
             Self::UpstreamError => &UPSTREAM_ERROR,
             Self::UpstreamUnavailable => &UPSTREAM_UNAVAILABLE,
             Self::UpstreamTimeout => &UPSTREAM_TIMEOUT,
+            Self::UpstreamIndeterminate => &UPSTREAM_INDETERMINATE,
             Self::ResponseTooLarge => &RESPONSE_TOO_LARGE,
             Self::BlobNotFound => &BLOB_NOT_FOUND,
             Self::BlobGone => &BLOB_GONE,
@@ -637,6 +644,13 @@ error_spec!(
     GATEWAY_TIMEOUT,
     "upstream_timeout",
     "the upstream call timed out"
+);
+error_spec!(
+    UPSTREAM_INDETERMINATE,
+    UpstreamIndeterminate,
+    BAD_GATEWAY,
+    "upstream_indeterminate",
+    "the work may have committed; reconcile before retrying"
 );
 error_spec!(
     RESPONSE_TOO_LARGE,

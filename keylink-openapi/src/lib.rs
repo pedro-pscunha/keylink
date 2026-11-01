@@ -609,6 +609,7 @@ fn errors_for(kind: RouteKind) -> Vec<ErrorKind> {
     ];
     let extra: &[ErrorKind] = match kind {
         RouteKind::Rpc => &[
+            ErrorKind::UpstreamIndeterminate,
             ErrorKind::InvalidIdempotencyKey,
             ErrorKind::IdempotencyConflict,
             ErrorKind::IdempotencyCapacity,
@@ -618,6 +619,7 @@ fn errors_for(kind: RouteKind) -> Vec<ErrorKind> {
             ErrorKind::ActorNotFound,
         ],
         RouteKind::Send => &[
+            ErrorKind::UpstreamIndeterminate,
             ErrorKind::IdempotencyNotSupported,
             ErrorKind::InvalidStreamMetadata,
             ErrorKind::RangeNotSupported,
@@ -626,6 +628,7 @@ fn errors_for(kind: RouteKind) -> Vec<ErrorKind> {
             ErrorKind::ResponseTooLarge,
         ],
         RouteKind::Recv => &[
+            ErrorKind::UpstreamIndeterminate,
             ErrorKind::IdempotencyNotSupported,
             ErrorKind::RangeNotSupported,
             ErrorKind::RequestTooLarge,
@@ -635,6 +638,7 @@ fn errors_for(kind: RouteKind) -> Vec<ErrorKind> {
             ErrorKind::ActorNotFound,
         ],
         RouteKind::BlobLookup => &[
+            ErrorKind::UpstreamIndeterminate,
             ErrorKind::IdempotencyNotSupported,
             ErrorKind::RequestTooLarge,
             ErrorKind::UnsupportedMediaType,

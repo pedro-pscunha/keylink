@@ -179,6 +179,7 @@ The gateway does not include credentials, principal bytes, authorization details
 | 502 | `response_stream_too_large` | The download exceeds its byte limit. |
 | 502 | `upstream_error` | The upstream call failed. |
 | 503 | `upstream_unavailable` | The upstream service is unavailable. |
+| 502 | `upstream_indeterminate` | The upstream ran the work and cannot say whether it committed. Reconcile before retrying: an idempotency key does not make this call safe to replay, because the server settles the key as interrupted and refuses the replay. |
 | 504 | `upstream_timeout` | The upstream call timed out. |
 
 A `401` response includes the configured `WWW-Authenticate` challenge.

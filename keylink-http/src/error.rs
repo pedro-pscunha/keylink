@@ -72,6 +72,7 @@ pub(crate) enum GatewayError {
     UpstreamError,
     UpstreamUnavailable,
     UpstreamTimeout,
+    UpstreamIndeterminate,
     ResponseTooLarge,
     BlobNotFound,
     BlobGone,
@@ -112,6 +113,7 @@ impl GatewayError {
             Self::UpstreamError => ErrorKind::UpstreamError,
             Self::UpstreamUnavailable => ErrorKind::UpstreamUnavailable,
             Self::UpstreamTimeout => ErrorKind::UpstreamTimeout,
+            Self::UpstreamIndeterminate => ErrorKind::UpstreamIndeterminate,
             Self::ResponseTooLarge => ErrorKind::ResponseTooLarge,
             Self::BlobNotFound => ErrorKind::BlobNotFound,
             Self::BlobGone => ErrorKind::BlobGone,
@@ -191,6 +193,13 @@ impl GatewayError {
             keylink::Error::Remote(remote) => match remote {
                 keylink::RemoteError::Unauthorized(_) => Self::Forbidden,
                 keylink::RemoteError::TimedOut { .. } => Self::UpstreamTimeout,
+                // Not `UpstreamError`: that one invites a retry, and this turn may
+                // have committed. The transport idempotency key does not change
+                // that: the server settles the key as interrupted, and replaying it
+                // is refused rather than re-run.
+                keylink::RemoteError::Withheld(keylink::Withheld::Indeterminate { .. }) => {
+                    Self::UpstreamIndeterminate
+                }
                 keylink::RemoteError::NoSuchActor { .. } => Self::ActorNotFound,
                 keylink::RemoteError::AtCapacity { .. } | keylink::RemoteError::MailboxFull => {
                     Self::UpstreamUnavailable
@@ -332,6 +341,12 @@ mod tests {
                 "the upstream call timed out",
             ),
             (
+                GatewayError::UpstreamIndeterminate,
+                StatusCode::BAD_GATEWAY,
+                "upstream_indeterminate",
+                "the work may have committed; reconcile before retrying",
+            ),
+            (
                 GatewayError::ResponseTooLarge,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "response_too_large",
@@ -435,6 +450,16 @@ mod tests {
             (
                 Error::Remote(RemoteError::TimedOut { millis: 9 }),
                 GatewayError::UpstreamTimeout,
+            ),
+            // **The mapping that keeps a retry from being offered.** Without its own
+            // arm this fell into `UpstreamError`, whose text invites one, for a turn
+            // that may have committed. Made red by deleting the arm in
+            // `from_keylink`: the code comes back `upstream_error`.
+            (
+                Error::Remote(RemoteError::Withheld(keylink::Withheld::Indeterminate {
+                    name: "persist".into(),
+                })),
+                GatewayError::UpstreamIndeterminate,
             ),
             (
                 Error::Remote(RemoteError::NoSuchActor { id: secret.into() }),

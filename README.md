@@ -834,7 +834,7 @@ The stable codes are `invalid_request`, `invalid_idempotency_key`,
 `method_not_allowed`, `blob_not_found`, `idempotency_conflict`, `blob_gone`,
 `request_too_large`, `request_stream_too_large`, `unsupported_media_type`,
 `range_not_satisfiable`, `idempotency_capacity`, `response_too_large`,
-`response_stream_too_large`, `upstream_error`, `upstream_unavailable` and
+`response_stream_too_large`, `upstream_error`, `upstream_indeterminate`, `upstream_unavailable` and
 `upstream_timeout`. The [package README](keylink-http/README.md) carries the same
 set with each status. `the_readme_documents_every_error_code` reads **both** files
 and fails when a code the gateway can answer with is missing from either, so this
