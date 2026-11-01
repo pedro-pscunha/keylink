@@ -220,7 +220,7 @@ fn file_resource(request: &files::Request) -> Option<Cow<'_, str>> {
     }
 }
 #[tokio::test]
-async fn singleton_resources_are_checked_before_idempotency_and_layers() {
+async fn singleton_resources_are_checked_before_the_idempotency_policy() {
     let (_, device, chain, trust) = fixture();
     let node = Node::bind_local().await.unwrap();
     let peer = Node::bind_local_with_secret(device).await.unwrap();
@@ -583,4 +583,99 @@ async fn a_request_fingerprint_prevents_cross_resource_replay_after_revocation()
         ))
     ));
     assert_eq!(client.read("repo/b/file".into()).await.unwrap(), 7);
+}
+
+struct ResourceCache {
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<AtomicUsize>,
+}
+impl keylink::Middleware<files::Request, files::Response> for ResourceCache {
+    fn handle(
+        &self,
+        cx: Context,
+        req: files::Request,
+        body: keylink::BodyReader,
+        next: keylink::Next<files::Request, files::Response>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (keylink::Outcome<files::Response>, keylink::Body)>
+                + Send,
+        >,
+    > {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        if self.enabled.load(Ordering::SeqCst) && matches!(req, files::Request::Read { .. }) {
+            Box::pin(async {
+                (
+                    keylink::Outcome::Ok(files::Response::Read(777)),
+                    keylink::Body::empty(),
+                )
+            })
+        } else {
+            next(cx, req, body)
+        }
+    }
+}
+#[tokio::test]
+async fn resource_changes_refuse_before_real_replays_and_short_circuit_layers() {
+    let (root, device, _, trust) = fixture();
+    let a = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/a", 0),
+    )
+    .unwrap()]);
+    let b = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    trust.insert(a.clone()).unwrap();
+    trust.insert(b).unwrap();
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<files::Request, _>(WithinCaveats)
+        .resource(file_resource)
+        .install(|allow| files::service(Files(Arc::new(AtomicUsize::new(0))), allow))
+        .layer(ResourceCache {
+            enabled: enabled.clone(),
+            entered: entered.clone(),
+        })
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = files::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let key = keylink::IdempotencyKey::new("real-record").unwrap();
+    let keyed = client.with_idempotency(key.clone());
+    assert_eq!(keyed.read("repo/a/file".into()).await.unwrap(), 7);
+    assert_eq!(
+        client.key_state(key.clone()).await.unwrap(),
+        keylink::KeyState::Done
+    );
+    enabled.store(true, Ordering::SeqCst);
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(&root, a.links()[0].id())))
+        .unwrap()
+        .is_empty());
+    denied(keyed.read("repo/a/file".into()).await.unwrap_err());
+    denied(client.read("repo/a/file".into()).await.unwrap_err());
+    assert!(matches!(
+        keyed.read("repo/b/file".into()).await.unwrap_err(),
+        Error::Remote(RemoteError::Idempotency(
+            keylink::IdempotencyRefusal::RequestMismatch
+        ))
+    ));
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "neither denial nor mismatched replay reaches the cache"
+    );
+    assert_eq!(client.read("repo/b/file".into()).await.unwrap(), 777);
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        client.key_state(key).await.unwrap(),
+        keylink::KeyState::Done
+    );
 }
