@@ -921,8 +921,8 @@ where
 }
 
 impl Forgery {
-    fn handle(&self, id: BlobId) -> BlobHandle {
-        BlobHandle::new(&self.reader, self.holder.clone(), id)
+    fn handle(&self, content: impl Into<Content>) -> BlobHandle {
+        BlobHandle::new(&self.reader, self.holder.clone(), content)
     }
 
     fn asked(&self) -> Vec<GetRequest> {
@@ -2594,10 +2594,15 @@ async fn a_closure_of_5000_members_is_fetched_with_one_grant() {
         .fetch_into(&local)
         .await
         .expect("fetches the closure");
+    // The member list is 160000 bytes, and the size proof that precedes it
+    // carries the list's last chunk (the remainder after 156 whole chunks).
+    let list = 5000 * 32;
+    let proof = (list - 1) % 1024 + 1;
     assert_eq!(
         moved,
-        5000 * 1024 + 5000 * 32,
-        "every member's payload and the member list, once"
+        5000 * 1024 + list + proof,
+        "every member's payload, the member list, and the last chunk of it the \
+         size proof carried: all payload that crossed the wire"
     );
     assert_eq!(
         local.missing(handle.content()).await.expect("answers"),
@@ -3001,7 +3006,7 @@ async fn a_peer_revoke_lands_on_a_call_whose_handler_is_still_running() {
 /// single-threaded runtime, and on a multi-threaded one it still keeps the
 /// runtime from shutting down after the timeout has panicked. Watched that way
 /// with `scripts/break-once.sh` (row `HK56`), replacing
-/// `if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
+/// `if starts_run_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
 /// with `if false {` in `keylink/src/blobs.rs`: the run was still going after
 /// two minutes and was ended by its process id. The unit test
 /// `a_closure_request_for_a_far_offset_is_refused_without_walking_to_it` is
@@ -3153,4 +3158,150 @@ async fn a_root_that_is_not_a_whole_number_of_addresses_is_refused_by_both_calls
             .expect_err("not a sequence");
         assert!(refused(&error), "{len} bytes, held missing: {error:?}");
     }
+}
+
+// ═══════════════════════════════════════ a closure bigger than one window
+
+/// Second-round review finding 3. A closure is fetched a window of 4096 members
+/// at a time, each window planned from its own slice of the member list. 20,000
+/// members cross four boundaries, and the holder is asked for the root once and
+/// for each window once and for nothing else.
+#[tokio::test]
+async fn a_closure_of_20000_members_is_fetched_window_by_window() {
+    let cluster = cluster().await;
+    let ids = add_members(&cluster.blobs, 20_000).await;
+    let seq = cluster.blobs.add_seq(ids.clone()).await.expect("stores");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+
+    // Relayed through a holder that records what it is asked, so the requests
+    // themselves can be read and not only their total.
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let holder = forgery(move |request: GetRequest| {
+        let (from, to) = (from.clone(), to.clone());
+        async move { ask(from, to, request).await }
+    })
+    .await;
+    let handle = holder.handle(seq);
+
+    let local = Blobs::memory();
+    let moved = handle.fetch_into(&local).await.expect("fetches 20,000");
+    let list = 20_000 * 32;
+    let proof = (list - 1) % 1024 + 1;
+    assert_eq!(moved, 20_000 * 1024 + list + proof);
+    assert_eq!(
+        local.missing(handle.content()).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+
+    // The size proof, the root, and five windows (4096 four times, then 3616).
+    let asked: Vec<GetRequest> = holder
+        .asked()
+        .into_iter()
+        .filter(|request| request.ranges != preflight_ranges())
+        .collect();
+    assert_eq!(asked.len(), 6, "the root and five windows: {asked:?}");
+    assert!(
+        asked[0].ranges.is_blob(),
+        "the first thing fetched is the root alone"
+    );
+    for window in &asked[1..] {
+        let wire = postcard::to_stdvec(&window.ranges).expect("encodes");
+        assert!(
+            wire.len() < 16 * 1024,
+            "a window's request is a few bytes per run, not the closure: {} bytes",
+            wire.len()
+        );
+    }
+
+    // Members either side of each window boundary, read back out of the store.
+    let probes = [
+        0usize, 4095, 4096, 8191, 8192, 12_287, 12_288, 16_383, 16_384, 19_999,
+    ];
+    let probed: Vec<BlobId> = probes.iter().map(|nth| ids[*nth]).collect();
+    let read = read_back(&local, &probed).await;
+    for (nth, bytes) in probes.iter().zip(read) {
+        assert_eq!(bytes, member(*nth as u32), "member {nth} reads back intact");
+    }
+}
+
+/// Second-round review finding 3, resume. The holder cuts the answer to the
+/// third window in half. The fetch fails, the store keeps what verified, and
+/// the next fetch asks only for the members it still lacks: it does not go back
+/// over the two windows already held, nor over the members of the third that
+/// arrived whole.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK62`) by replacing
+/// `lacking.push(!store.has(*member).await?);`
+/// with `lacking.push(true);` in `keylink/src/blobs.rs`: every window then asks
+/// for all of its members, and the retry moves every member again (20,480,000
+/// bytes) instead of the roughly half it lacked.
+#[tokio::test]
+async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds() {
+    let cluster = cluster().await;
+    let ids = add_members(&cluster.blobs, 20_000).await;
+    let seq = cluster.blobs.add_seq(ids).await.expect("stores");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let data_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holder = forgery({
+        let data_requests = Arc::clone(&data_requests);
+        move |request: GetRequest| {
+            let (from, to) = (from.clone(), to.clone());
+            let data_requests = Arc::clone(&data_requests);
+            async move {
+                let answer = ask(from, to, request.clone()).await;
+                if request.ranges == preflight_ranges() {
+                    return answer;
+                }
+                // 1 is the root, 2 and 3 the first two windows, 4 the third.
+                let nth = data_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if nth == 4 {
+                    answer[..answer.len() / 2].to_vec()
+                } else {
+                    answer
+                }
+            }
+        }
+    })
+    .await;
+    let handle = holder.handle(seq);
+    let local = Blobs::memory();
+
+    handle
+        .fetch_into(&local)
+        .await
+        .expect_err("an answer that stops half way does not complete a fetch");
+    let held_after_cut = match local.missing(handle.content()).await.expect("answers") {
+        keylink::Missing::Members(lacking) => 20_000 - lacking.len(),
+        other => panic!("expected a partial closure, got {other:?}"),
+    };
+    assert!(
+        held_after_cut >= 2 * 4096,
+        "the two windows before the cut are held: {held_after_cut}"
+    );
+
+    let second = handle
+        .fetch_into(&local)
+        .await
+        .expect("the retry completes");
+    let lacking_before = (20_000 - held_after_cut) as u64;
+    assert_eq!(
+        second,
+        lacking_before * 1024,
+        "exactly the members that were lacking: the root is held, the windows already \
+         fetched are not asked for again, and the members of the third window that \
+         arrived whole are not either"
+    );
+    assert_eq!(
+        local.missing(handle.content()).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
 }

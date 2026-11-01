@@ -111,21 +111,40 @@ use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, RemoteError, Resul
 
 /// Default byte budget of one node's grant ledger: 64 MiB.
 ///
-/// The ledger charges [`GRANT_COST`] for each grant and [`PEER_COST`] for each
-/// peer that holds at least one, and refuses a grant that would take the total
-/// past the budget. One closure is one grant, however many blobs it lists.
-/// Change it per store with [`Blobs::set_grant_budget`].
+/// The ledger charges [`GRANT_COST`] for each grant slot and [`PEER_COST`] for
+/// each peer slot its tables have needed since they were last rebuilt, and
+/// refuses a grant that would take the total past the budget. One closure is one
+/// grant, however many blobs it lists. Change it per store with
+/// [`Blobs::set_grant_budget`].
+///
+/// # What the budget bounds, and what it does not
+///
+/// It bounds **entries times a per-entry cost derived from type sizes**. A
+/// table is charged for the most entries it has held at once since it was last
+/// rebuilt (its high-water mark), not for the entries it holds now, and it is
+/// rebuilt, which gives its memory back and lowers the charge, when it falls to
+/// under half that mark. hashbrown only grows a table when its live entries
+/// need it, so a table's allocation follows its high-water mark, and the charge
+/// is therefore not lowered by a revoke that leaves the table allocated.
+///
+/// It does not bound the allocator's own overhead, the two smallest tables (the
+/// peers' table alone is about 340 bytes before its first peer), or the table of
+/// calls in flight, which is bounded by the calls the node is already running
+/// and is rebuilt by the same rule.
 pub const GRANT_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The most members one closure may list: 262,144, a root of 8 MiB.
 ///
-/// Both ends hold the line. A holder refuses a request that selects a member
-/// past it, because iroh-blobs walks the offsets of a request one at a time and
-/// a request can name an offset near `u64::MAX` in a few bytes. A fetcher
-/// refuses a root longer than this before it downloads or plans anything,
-/// because the member list is the holder's to make as long as it likes and the
-/// fetcher's memory pays for it. A tree that needs more is split across
-/// several closures.
+/// **Two different rules, and only one is a member cap.** A fetcher refuses a
+/// root longer than this before it downloads or plans anything, because the
+/// member list is the holder's to make as long as it likes and the fetcher's
+/// memory pays for it. A holder refuses a request that *starts* a non-empty run
+/// of offsets past it, because iroh-blobs walks the offsets of a request one at
+/// a time and a request can name an offset near `u64::MAX` in a few bytes. A run
+/// that starts below it may extend as far as the holder's own sequence does, as
+/// an open-ended fetch of a whole closure legitimately does, and
+/// [`Blobs::add_seq`] does not refuse a longer sequence: it is the fetcher that
+/// will not read one. A tree that needs more is split across several closures.
 pub const MAX_CLOSURE_MEMBERS: usize = 1 << 18;
 
 /// Bytes the ledger charges for one grant.
@@ -133,16 +152,18 @@ pub const MAX_CLOSURE_MEMBERS: usize = 1 << 18;
 /// An upper bound on one `(BlobId, Entry)` slot of a hash table, computed from
 /// `size_of` at compile time rather than written down: one control byte per
 /// slot, times 16/7, which is the emptiest a hashbrown table is just after it
-/// grows. **Derived from the type layout, not measured.** A counting-allocator
-/// test could pin it; none does yet.
+/// grows. **Derived from the type layout.** A counting-allocator test in this
+/// module checks that a table churned under the rebuild rule retains no more
+/// than it is charged, on the platform it runs on.
 pub const GRANT_COST: usize = ((size_of::<(BlobId, Entry)>() + 1) * 16).div_ceil(7);
 
-/// Bytes the ledger charges for each peer that holds at least one grant.
+/// Bytes the ledger charges for each peer slot.
 ///
 /// The peer's slot in the outer table at the same worst load as [`GRANT_COST`],
 /// plus the smallest inner table (4 buckets, their control bytes and one group
-/// of padding). **Derived from the type layout, not measured.**
-pub const PEER_COST: usize = ((size_of::<(EndpointId, HashMap<BlobId, Entry>)>() + 1) * 16)
+/// of padding). **Derived from the type layout.** The smallest outer table is
+/// outside the budget; see [`GRANT_BUDGET`].
+pub const PEER_COST: usize = ((size_of::<(EndpointId, Marked<BlobId, Entry>)>() + 1) * 16)
     .div_ceil(7)
     + 4 * (size_of::<(BlobId, Entry)>() + 1)
     + 16;
@@ -414,6 +435,83 @@ struct Entry {
     generation: u64,
 }
 
+/// A hash table that remembers the most entries it has held at once since it
+/// was last rebuilt.
+///
+/// hashbrown reports capacity as live entries plus room before the next growth,
+/// and a deleted slot stays a tombstone, so neither `capacity()` nor `len()`
+/// says how much is allocated. What does is the high-water mark: the table
+/// grows only when its live entries need it, so its allocation follows the
+/// largest live count it has had. Charging for that mark, and rebuilding the
+/// table when it falls under half the mark, bounds what the table retains by a
+/// constant times what it has been charged for.
+#[derive(Debug)]
+struct Marked<K, V> {
+    map: HashMap<K, V>,
+    high: usize,
+}
+
+impl<K, V> Default for Marked<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            high: 0,
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> Marked<K, V> {
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
+    /// Whether one more new key raises the mark, which is when it costs.
+    fn would_grow(&self) -> bool {
+        self.map.len() + 1 > self.high
+    }
+
+    /// Raise the mark to the current length. Returns how far it moved.
+    fn raise(&mut self) -> usize {
+        let grew = self.map.len().saturating_sub(self.high);
+        self.high += grew;
+        grew
+    }
+
+    fn insert(&mut self, key: K, value: V) -> usize {
+        self.map.insert(key, value);
+        self.raise()
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        self.map.remove(key)
+    }
+
+    /// Rebuild the table if it has fallen under half its mark, and give back an
+    /// empty one entirely. Returns how far the mark dropped.
+    fn settle(&mut self) -> usize {
+        let before = self.high;
+        if self.map.is_empty() {
+            *self = Self::default();
+        } else if 2 * self.map.len() < self.high {
+            self.map.shrink_to_fit();
+            self.high = self.map.len();
+        }
+        before - self.high
+    }
+}
+
 /// Which peer may fetch which content.
 ///
 /// Written when a handler returns [`Content`], read by blobs admission. The
@@ -430,16 +528,18 @@ struct Grants {
 #[derive(Debug)]
 struct Book {
     /// Keyed by `EndpointId` so a revoke is one lookup.
-    by_peer: HashMap<EndpointId, HashMap<BlobId, Entry>>,
-    /// Bytes charged: [`GRANT_COST`] per entry plus [`PEER_COST`] per key of
-    /// `by_peer`.
+    by_peer: Marked<EndpointId, Marked<BlobId, Entry>>,
+    /// Bytes charged: [`GRANT_COST`] per slot of each peer's table, up to its
+    /// mark, plus [`PEER_COST`] per slot of `by_peer`, up to its mark.
     used: usize,
     budget: usize,
     next_generation: u64,
     /// Calls that were dispatched for a peer and have not finished, with the
     /// peer's revocation epoch. An entry exists only while one is in flight, so
-    /// this is bounded by the calls the node is already running.
-    inflight: HashMap<EndpointId, Flight>,
+    /// the live entries are bounded by the calls the node is already running,
+    /// and the table is rebuilt by the same rule as the others so its
+    /// allocation is too. Not charged to `used`.
+    inflight: Marked<EndpointId, Flight>,
 }
 
 #[derive(Debug, Default)]
@@ -466,7 +566,8 @@ pub(crate) enum NotGranted {
 /// The reservation is made only when the handler returns, which is too late to
 /// give a revoke anything to invalidate: a handler still running while the peer
 /// is revoked would reserve and commit afterwards, for a peer nobody admits any
-/// more. The fence is taken at dispatch and checked at reservation.
+/// more. The fence is taken when the call's stream is accepted, before anything
+/// else is done for it, and checked at reservation.
 #[derive(Debug)]
 pub(crate) struct Fence {
     grants: Arc<Grants>,
@@ -477,11 +578,13 @@ pub(crate) struct Fence {
 impl Drop for Fence {
     fn drop(&mut self) {
         let mut book = self.grants.lock();
-        if let Some(flight) = book.inflight.get_mut(&self.peer) {
+        let last = book.inflight.get_mut(&self.peer).is_some_and(|flight| {
             flight.calls -= 1;
-            if flight.calls == 0 {
-                book.inflight.remove(&self.peer);
-            }
+            flight.calls == 0
+        });
+        if last {
+            book.inflight.remove(&self.peer);
+            book.inflight.settle();
         }
     }
 }
@@ -510,11 +613,11 @@ impl Grants {
     fn with_budget(budget: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Book {
-                by_peer: HashMap::new(),
+                by_peer: Marked::default(),
                 used: 0,
                 budget,
                 next_generation: 0,
-                inflight: HashMap::new(),
+                inflight: Marked::default(),
             }),
         })
     }
@@ -532,13 +635,38 @@ impl Grants {
         self.lock().budget = budget;
     }
 
-    /// Fence a call that is about to be dispatched for `peer`.
-    fn fence(self: &Arc<Self>, peer: &AdmittedPeer) -> Fence {
+    /// Fence a call that was just accepted for `peer`, then ask `open` whether
+    /// the admission it came in under still stands.
+    ///
+    /// **In that order, and the order is the point.** Admission is decided once
+    /// per connection and copied into every call, so a call that was accepted
+    /// before the peer was removed can still be on its way to its fence when
+    /// the removal and `revoke_peer` both land; the fence would then read the
+    /// new epoch and look like a call admitted after the revoke. The recipe for
+    /// removing a peer closes its connection first, so a fence taken after
+    /// `revoke_peer` finds the connection closed, and one taken before it
+    /// carries the old epoch. Either way the call cannot grant.
+    fn fence(
+        self: &Arc<Self>,
+        peer: &AdmittedPeer,
+        open: impl FnOnce() -> bool,
+    ) -> std::result::Result<Fence, NotGranted> {
+        let fence = self.take(peer);
+        if open() {
+            Ok(fence)
+        } else {
+            Err(NotGranted::Withdrawn)
+        }
+    }
+
+    /// Count one more call in flight for `peer`, at its current epoch.
+    fn take(self: &Arc<Self>, peer: &AdmittedPeer) -> Fence {
         let peer = peer.id();
         let mut book = self.lock();
-        let flight = book.inflight.entry(peer).or_default();
+        let flight = book.inflight.map.entry(peer).or_default();
         flight.calls += 1;
         let epoch = flight.epoch;
+        book.inflight.raise();
         Fence {
             grants: Arc::clone(self),
             peer,
@@ -578,12 +706,12 @@ impl Grants {
             entry.pending += 1;
             entry.generation
         } else {
-            let cost = GRANT_COST
-                + if book.by_peer.contains_key(&peer) {
-                    0
-                } else {
-                    PEER_COST
-                };
+            // A slot costs only when it raises its table's mark: one the table
+            // has already needed is paid for.
+            let known = book.by_peer.get(&peer);
+            let peer_slot = known.is_none() && book.by_peer.would_grow();
+            let grant_slot = known.is_none_or(Marked::would_grow);
+            let cost = PEER_COST * usize::from(peer_slot) + GRANT_COST * usize::from(grant_slot);
             if book.used.saturating_add(cost) > book.budget {
                 return Err(NotGranted::Exhausted {
                     budget: book.budget,
@@ -592,14 +720,19 @@ impl Grants {
             let generation = book.next_generation;
             book.next_generation += 1;
             book.used += cost;
-            book.by_peer.entry(peer).or_default().insert(
-                root,
-                Entry {
-                    committed: None,
-                    pending: 1,
-                    generation,
-                },
-            );
+            if !book.by_peer.contains_key(&peer) {
+                book.by_peer.insert(peer, Marked::default());
+            }
+            if let Some(held) = book.by_peer.get_mut(&peer) {
+                held.insert(
+                    root,
+                    Entry {
+                        committed: None,
+                        pending: 1,
+                        generation,
+                    },
+                );
+            }
             generation
         };
         Ok(Permit {
@@ -643,9 +776,10 @@ impl Grants {
         let Some(held) = book.by_peer.remove(&peer) else {
             return 0;
         };
-        trim(&mut book.by_peer);
-        book.used -= PEER_COST + GRANT_COST * held.len();
-        held.values()
+        book.used -= GRANT_COST * held.high;
+        book.used -= PEER_COST * book.by_peer.settle();
+        held.map
+            .values()
             .filter(|entry| entry.committed.is_some())
             .count()
     }
@@ -654,6 +788,7 @@ impl Grants {
         let mut book = self.lock();
         let peers: Vec<EndpointId> = book
             .by_peer
+            .map
             .iter()
             .filter(|(_, held)| held.contains_key(&root))
             .map(|(peer, _)| *peer)
@@ -665,37 +800,20 @@ impl Grants {
             .count()
     }
 
-    /// Take one entry out and uncharge it, and its peer when it was the last.
+    /// Take one entry out and uncharge what its table gives back, and the peer
+    /// when it was the last.
     fn remove(book: &mut Book, peer: EndpointId, root: &BlobId) -> Option<Entry> {
         let held = book.by_peer.get_mut(&peer)?;
         let entry = held.remove(root)?;
-        trim(held);
-        book.used -= GRANT_COST;
+        book.used -= GRANT_COST * held.settle();
         if held.is_empty() {
             // Not tidiness: `knows` reads this map, so a peer left behind with
             // an empty table would keep passing connection admission while
             // holding no grant at all.
             book.by_peer.remove(&peer);
-            trim(&mut book.by_peer);
-            book.used -= PEER_COST;
+            book.used -= PEER_COST * book.by_peer.settle();
         }
         Some(entry)
-    }
-}
-
-/// Give back the memory a table no longer needs.
-///
-/// A hash table keeps its allocation when entries leave, so refunding
-/// [`GRANT_COST`] on every revoke would let churn retain far more than the
-/// budget says: fill a peer's table, revoke all but one root, and the refund
-/// pays for filling another peer's table while the first keeps its buckets.
-/// Shrinking whenever the capacity passes twice the length keeps the retained
-/// buckets within the 16/7 per-slot charge the constants are derived from, at
-/// both levels (a peer's roots, and the peers). It is the same check at every
-/// call, and a no-op when the table is already as small as it can be.
-fn trim<K: Eq + std::hash::Hash, V>(table: &mut HashMap<K, V>) {
-    if table.capacity() > 2 * table.len() {
-        table.shrink_to_fit();
     }
 }
 
@@ -1104,6 +1222,25 @@ impl Blobs {
         })
     }
 
+    /// The members `range` of the sequence at `root`, read off this store and
+    /// nothing else of it. The root must be held in full and checked.
+    async fn listed(&self, root: BlobId, range: Range<u64>) -> Result<Vec<BlobId>> {
+        let bytes = self
+            .store()
+            .export_ranges(root.hash(), range.start * 32..range.end * 32)
+            .concatenate()
+            .await
+            .map_err(store_error)?;
+        let (members, rest) = bytes.as_chunks::<32>();
+        if !rest.is_empty() || members.len() as u64 != range.end - range.start {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "closure root {root} returned {} bytes for members {range:?}",
+                bytes.len()
+            ))));
+        }
+        Ok(members.iter().map(|member| BlobId(*member)).collect())
+    }
+
     /// How many members the sequence at `root` lists, if this store holds it in
     /// full, and an error when what it holds is not a closure this crate will
     /// plan for: not a whole number of addresses, or more than
@@ -1236,16 +1373,23 @@ impl Blobs {
     /// budget refuses it.
     #[doc(hidden)]
     pub fn grant(&self, peer: &AdmittedPeer, content: Content) -> Result<()> {
-        let fence = self.fence(peer);
+        let fence = self
+            .fence(peer, || true)
+            .map_err(|refused| Error::Remote(refusal(&refused)))?;
         self.reserve(peer, content, &fence)
             .map_err(|refused| Error::Remote(refusal(&refused)))?
             .commit();
         Ok(())
     }
 
-    /// Fence a call about to be dispatched for `peer`. See [`Fence`].
-    pub(crate) fn fence(&self, peer: &AdmittedPeer) -> Fence {
-        self.inner.grants.fence(peer)
+    /// Fence a call just accepted for `peer`, refusing it when `open` says the
+    /// admission it came in under is gone. See [`Fence`] and the order it takes.
+    pub(crate) fn fence(
+        &self,
+        peer: &AdmittedPeer,
+        open: impl FnOnce() -> bool,
+    ) -> std::result::Result<Fence, NotGranted> {
+        self.inner.grants.fence(peer, open)
     }
 
     /// Reserve a grant, to be committed once the reply that carries it is
@@ -1321,10 +1465,12 @@ const ROOT_WINDOW: u64 = 32 * 1024;
 
 /// How many members one request of a closure fetch asks for.
 ///
-/// iroh-blobs plans a request by building a map entry per member it names, and
-/// encodes one run per missing member, so asking for a closure in windows
-/// bounds both the plan's memory and the request's size (4096 members is about
-/// 12 KB, against a 1 MiB cap) whatever the closure's length.
+/// Each window is planned from its own slice of the member list: the slice is
+/// read off the store, each of its members is asked of the store, and the
+/// request names the ones it lacks, one run per stretch of them. So the plan's
+/// memory is a window's and the request is a few bytes per gap (4096 members at
+/// worst about 12 KB, against a 1 MiB cap), whatever the closure's length. The
+/// work across windows is linear in the closure, not repeated per window.
 const FETCH_WINDOW: u64 = 4096;
 
 /// The member count of a root of `size` bytes, or why it is not a closure.
@@ -1348,14 +1494,32 @@ fn count_members(root: BlobId, size: u64) -> Result<u64> {
     Ok(members)
 }
 
-/// The request for members `start..end` of the closure at `root`, and nothing
-/// else: no bytes of the root, and nothing past `end`.
+/// The request for exactly the members of `root` that `lacking` marks, where
+/// `lacking[i]` is member `start + i`, and nothing else: no bytes of the root,
+/// and no member that is not marked.
 ///
-/// Built from its wire form (a run from offset `start + 1` that selects
-/// everything, then a run that selects nothing) rather than with the request
-/// builder, which expands a vector of every offset below the last one it is given.
-fn window_request(root: BlobId, start: u64, end: u64) -> Result<GetRequest> {
-    let runs = vec![(start + 1, vec![0u64]), (end - start, Vec::<u64>::new())];
+/// Built from its wire form, a run for each stretch of marked members (from its
+/// first offset, selecting everything) and a run that selects nothing after it,
+/// rather than with the request builder, which expands a vector of every offset
+/// below the last one it is given. Offset 0 is the root and member `n` is offset
+/// `n + 1`. One run per stretch keeps a window's request to a few bytes per gap,
+/// which for 4096 members is at most about 12 KB against a 1 MiB cap.
+fn missing_request(root: BlobId, start: u64, lacking: &[bool]) -> Result<GetRequest> {
+    let mut runs: Vec<(u64, Vec<u64>)> = Vec::new();
+    let mut at = 0u64;
+    let mut selected = false;
+    for (index, lack) in (0u64..).zip(lacking) {
+        if *lack != selected {
+            let offset = start + index + 1;
+            runs.push((offset - at, if *lack { vec![0] } else { Vec::new() }));
+            at = offset;
+            selected = *lack;
+        }
+    }
+    if selected {
+        let end = start + lacking.len() as u64 + 1;
+        runs.push((end - at, Vec::new()));
+    }
     let wire = postcard::to_stdvec(&runs).map_err(store_error)?;
     let ranges = postcard::from_bytes(&wire).map_err(store_error)?;
     Ok(GetRequest::new(root.hash(), ranges))
@@ -1576,18 +1740,24 @@ fn admits_get(
         if scope != Scope::Closure {
             return Err(AbortReason::Permission);
         }
-        // And only as far as a closure can be listed. Refused here because
-        // iroh-blobs would otherwise walk every empty offset before it looks at
-        // the sequence.
-        if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {
+        // And no run may START past the last offset a closure can be listed at.
+        // Refused here because iroh-blobs would otherwise walk every empty
+        // offset up to a far run before it looks at the sequence. A run that
+        // starts below the limit and goes on is fine: it yields members until
+        // the sequence ends, which is how a whole closure is asked for.
+        if starts_run_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {
             return Err(AbortReason::Permission);
         }
     }
     Ok(())
 }
 
-/// Whether `ranges` selects anything at an offset above `last_member`, where
-/// offset 0 is the root and offset `n + 1` is member `n`.
+/// Whether `ranges` has a non-empty run that **starts** above `last_offset`,
+/// where offset 0 is the root and offset `n + 1` is member `n`.
+///
+/// This bounds where a run begins, which is what makes the walk to it long. It
+/// does not bound where a run ends, and an open-ended request passes on
+/// purpose; see [`MAX_CLOSURE_MEMBERS`].
 ///
 /// Read off the encoded runs and never expanded: a run is a start offset and the
 /// ranges that apply from there until the next run, so the work is the size of
@@ -1595,7 +1765,7 @@ fn admits_get(
 /// the wire form of the value, which is the one view of them iroh-blobs offers
 /// and which a request has already been bounded to by its 1 MiB message cap. A
 /// value that will not encode counts as reaching past.
-fn selects_past(ranges: &ChunkRangesSeq, last_member: u64) -> bool {
+fn starts_run_past(ranges: &ChunkRangesSeq, last_offset: u64) -> bool {
     let Ok(wire) = postcard::to_stdvec(ranges) else {
         return true;
     };
@@ -1609,7 +1779,7 @@ fn selects_past(ranges: &ChunkRangesSeq, last_member: u64) -> bool {
         };
         offset = start;
         // A run with no spans selects nothing, wherever it starts.
-        if !spans.is_empty() && offset > last_member {
+        if !spans.is_empty() && offset > last_offset {
             return true;
         }
     }
@@ -1642,7 +1812,9 @@ impl BlobHandle {
     ///
     /// A `blob` method hands back a [`BlobHandle`] already built, and that is
     /// the ordinary route. This constructor is for the other one: a [`BlobId`]
-    /// or a [`SeqId`] is `Serialize`, so a peer can pass an address on to
+    /// is `Serialize`, and so is the [`Content`] a reply carries (pass a
+    /// closure on as `seq.id()` with [`Content::Closure`], since a [`SeqId`]
+    /// itself cannot be serialized), so a peer can pass an address on to
     /// somebody else, and that recipient needs a way to spend it.
     ///
     /// **An address is not a capability.** The grant is recorded for the exact
@@ -1912,24 +2084,28 @@ impl BlobHandle {
     /// First the root alone, which costs no request when the store already holds
     /// it, and which is checked for whole addresses and for
     /// [`MAX_CLOSURE_MEMBERS`] before it is downloaded. Then the members, and
-    /// only the members the store lacks, 4096 of them per request: iroh-blobs
-    /// computes what is missing from the local copy of the root and asks for
-    /// exactly that, and a window keeps both its plan and its request small
-    /// however long the closure is. Fetching the sequence in one request would
-    /// send the whole closure when the root is absent, because the fetcher
-    /// cannot know which members it holds until it holds the list. The holder's
-    /// grant is its claim that it has the closure.
+    /// only the members the store lacks, 4096 of them per request: each window
+    /// reads its slice of the root, asks the store which of those members it
+    /// holds in full, and requests the rest, so a window keeps both its plan and
+    /// its request small however long the closure is. A member the store holds
+    /// only in part is requested whole again. Fetching the sequence in one
+    /// request would send the whole closure when the root is absent, because
+    /// the fetcher cannot know which members it holds until it holds the list.
+    /// The holder's grant is its claim that it has the closure.
     ///
     /// # It does not inherit the reader's size guarantee, on purpose
     ///
-    /// This hands the connection to iroh-blobs' own `Remote::fetch`, which
-    /// decides what is missing and asks for exactly that. There is no
-    /// [`verified_len`](Self::verified_len) preflight and no comparison,
-    /// because there is no number handed back to announce: the content is
+    /// A blob goes through iroh-blobs' own `Remote::fetch`, which decides what is
+    /// missing and asks for exactly that, and a closure's members through
+    /// requests this crate builds from what the store lacks. Neither makes the
+    /// [`verified_len`](Self::verified_len) preflight and comparison the reader
+    /// does: there is no number handed back to announce. The content is
     /// validated against its address as it lands in the store, and the return
     /// value describes bytes that already arrived rather than bytes to expect.
-    /// Reach for [`open`](Self::open) when a length has to be trusted before
-    /// the transfer.
+    /// The one size check a closure makes is its root's, before it is
+    /// downloaded, and the last chunk that check carries is counted in the
+    /// return value. Reach for [`open`](Self::open) when a length has to be
+    /// trusted before the transfer.
     ///
     /// # Errors
     ///
@@ -1941,18 +2117,30 @@ impl BlobHandle {
             Content::Closure(_) => self.ensure_root(&connection, store).await?,
         };
         // The members, a window of them per request. The root is complete in
-        // the store by now, so each window plans from its own slice of the list.
+        // the store by now. Each window reads only its own 4096 addresses off
+        // it, asks the store which of them it lacks, and requests only those.
+        // iroh-blobs' planner (`Remote::local_for_request`) is not used here,
+        // because it indexes every member of the root before it looks at the
+        // window, which would repeat the whole-root work for every window.
+        //
+        // A member the store holds only in part is requested whole again: the
+        // question asked is whether it is held in full, and what is already
+        // there is verified and rewritten rather than skipped.
         let remote = store.store().remote();
         let mut start = 0;
         while start < members {
             let end = (start + FETCH_WINDOW).min(members);
-            let local = remote
-                .local_for_request(window_request(self.id(), start, end)?)
-                .await
-                .map_err(store_error)?;
-            if !local.is_complete() {
+            let listed = store.listed(self.id(), start..end).await?;
+            let mut lacking = Vec::with_capacity(listed.len());
+            for member in &listed {
+                lacking.push(!store.has(*member).await?);
+            }
+            if lacking.contains(&true) {
                 let stats = remote
-                    .execute_get(connection.clone(), local.missing())
+                    .execute_get(
+                        connection.clone(),
+                        missing_request(self.id(), start, &lacking)?,
+                    )
                     .await
                     .map_err(|error| self.classify(error, &connection))?;
                 bytes += stats.payload_bytes_read;
@@ -1980,11 +2168,13 @@ impl BlobHandle {
         if let Some(members) = store.members(self.id()).await? {
             return Ok((0, members));
         }
-        let (size, _) = get_verified_size(connection, &self.id().hash())
+        let (size, proof) = get_verified_size(connection, &self.id().hash())
             .await
             .map_err(|error| self.classify(error, connection))?;
         count_members(self.id(), size)?;
-        let bytes = self.fetch_root(connection, store).await?;
+        // The proof is payload that crossed the wire too: the root's last chunk,
+        // which the download below sends again.
+        let bytes = proof.payload_bytes_read + self.fetch_root(connection, store).await?;
         let members = store.members(self.id()).await?.ok_or_else(|| {
             Error::Io(std::io::Error::other(format!(
                 "closure root {} did not land in the store",
@@ -2384,13 +2574,22 @@ mod tests {
             .commit();
     }
 
+    fn reserve_under(
+        grants: &Arc<Grants>,
+        seed: u8,
+        content: impl Into<Content>,
+        fence: &Fence,
+    ) -> std::result::Result<Permit, NotGranted> {
+        grants.reserve(&admitted(seed), content.into(), fence)
+    }
+
     /// A reservation as dispatch makes it: under a fence taken at dispatch.
     fn reserve(
         grants: &Arc<Grants>,
         seed: u8,
         content: impl Into<Content>,
     ) -> std::result::Result<Permit, NotGranted> {
-        let fence = grants.fence(&admitted(seed));
+        let fence = grants.fence(&admitted(seed), || true).expect("open");
         grants.reserve(&admitted(seed), content.into(), &fence)
     }
 
@@ -2463,8 +2662,11 @@ mod tests {
 
         let book = grants.lock();
         assert_eq!(book.used, PEER_COST + GRANT_COST);
-        assert_eq!(book.by_peer.len(), 1);
-        assert_eq!(book.by_peer.values().next().map(HashMap::len), Some(1));
+        assert_eq!(book.by_peer.map.len(), 1);
+        assert_eq!(
+            book.by_peer.map.values().next().map(|held| held.map.len()),
+            Some(1)
+        );
     }
 
     /// The budget refuses, and refusing evicts nothing.
@@ -2486,7 +2688,7 @@ mod tests {
         assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
         assert_eq!(scope(&grants, 1, blob(3)), None);
         assert!(
-            !grants.lock().by_peer[&admitted(1).id()].contains_key(&blob(3)),
+            !grants.lock().by_peer.map[&admitted(1).id()].contains_key(&blob(3)),
             "a refused reservation leaves no entry behind"
         );
     }
@@ -2597,8 +2799,8 @@ mod tests {
     #[test]
     fn a_peer_revoke_defeats_a_grant_from_a_call_dispatched_before_it() {
         let grants = Grants::new();
-        let early = grants.fence(&admitted(1));
-        let other = grants.fence(&admitted(2));
+        let early = grants.fence(&admitted(1), || true).expect("open");
+        let other = grants.fence(&admitted(2), || true).expect("open");
         assert_eq!(grants.revoke_peer(admitted(1).id()), 0, "nothing held yet");
 
         assert_eq!(
@@ -2616,7 +2818,7 @@ mod tests {
             .commit();
 
         // A call dispatched after the revoke is a new admission decision.
-        let late = grants.fence(&admitted(1));
+        let late = grants.fence(&admitted(1), || true).expect("open");
         grants
             .reserve(&admitted(1), blob(1).into(), &late)
             .expect("dispatched after")
@@ -2625,70 +2827,196 @@ mod tests {
 
         drop((early, other, late));
         assert!(
-            grants.lock().inflight.is_empty(),
+            grants.lock().inflight.is_empty() && grants.lock().inflight.high == 0,
             "a finished call leaves nothing in the fence table"
         );
     }
 
-    /// What a hash table of `slot` bytes per entry retains for `capacity`: the
-    /// bucket count hashbrown derives from it, a control byte each, and one
-    /// group of padding.
-    fn retained(capacity: usize, slot: usize) -> usize {
-        let buckets = if capacity < 8 {
-            capacity + 1
-        } else {
-            capacity / 7 * 8
-        };
-        buckets * (slot + 1) + 16
+    /// Counts the bytes this thread has allocated and not yet freed, so a test
+    /// can measure what a ledger really retains instead of inferring it from
+    /// `HashMap::capacity()`, which reports room to grow and not allocation.
+    mod counting {
+        #![allow(unsafe_code)]
+
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub(super) struct Counting;
+
+        // SAFETY: every call is delegated unchanged to `System`; the counter is a
+        // plain thread-local cell with no destructor and no allocation of its own.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: the layout is passed through unchanged.
+                let pointer = unsafe { System.alloc(layout) };
+                if !pointer.is_null() {
+                    let _ = LIVE.try_with(|live| live.set(live.get() + layout.size() as isize));
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                let _ = LIVE.try_with(|live| live.set(live.get() - layout.size() as isize));
+                // SAFETY: `pointer` and `layout` came from the allocation above.
+                unsafe { System.dealloc(pointer, layout) }
+            }
+        }
+
+        /// Net bytes this thread has allocated.
+        pub(super) fn live() -> isize {
+            LIVE.with(Cell::get)
+        }
     }
 
-    /// Review finding 4. Revoking refunds [`GRANT_COST`], and a table that
-    /// keeps its allocation would make that refund pay for memory still held.
-    /// Fill each of many peers, revoke all but one root each, and compare what
-    /// the tables really retain with what the ledger says it has charged, at
-    /// both levels.
+    #[global_allocator]
+    static COUNTING: counting::Counting = counting::Counting;
+
+    fn root(nth: u32) -> BlobId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&nth.to_le_bytes());
+        BlobId(bytes)
+    }
+
+    /// The smallest outer table and the allocator's own bookkeeping are outside
+    /// the budget, and this is the room the test gives them.
+    const ALLOWANCE: isize = 1024;
+
+    /// Review findings 2 and 4 of the first and second rounds. Revoking refunds
+    /// the charge, and a table that keeps its allocation would make that refund
+    /// pay for memory still held. `HashMap::capacity()` cannot say what is held
+    /// (a deleted slot is a tombstone that lowers it without freeing anything),
+    /// so this counts the bytes the thread allocates and compares them with what
+    /// the ledger says it has charged, at both levels, after fill-and-revoke
+    /// churn, after a generation of peers leaving, and after tombstone-heavy
+    /// insert-and-delete cycles that keep a table at the same size.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK57`) by replacing
-    /// `if table.capacity() > 2 * table.len() {`
-    /// with `    if false {`: retained is then several times `used`.
+    /// `self.map.shrink_to_fit();`
+    /// with nothing: the mark and the charge then drop without the memory, and
+    /// the tables retain several times what is charged.
     #[test]
     fn churn_cannot_retain_more_than_the_budget_has_charged() {
         let grants = Grants::new();
+        // Keys are made first: deriving one costs far more than the ledger.
+        let who: Vec<AdmittedPeer> = (0..=110u8).map(admitted).collect();
+        let give = |seed: u8, nth: u32| {
+            let fence = grants
+                .fence(&who[usize::from(seed)], || true)
+                .expect("open");
+            grants
+                .reserve(&who[usize::from(seed)], root(nth).into(), &fence)
+                .expect("within budget")
+                .commit();
+        };
+        let take = |seed: u8, nth: u32| grants.revoke(who[usize::from(seed)].id(), root(nth));
+        let before = counting::live();
+
         for seed in 1..=60u8 {
             for nth in 0..400u32 {
-                let mut root = [0u8; 32];
-                root[..4].copy_from_slice(&nth.to_le_bytes());
-                grant(&grants, seed, BlobId(root));
+                give(seed, nth);
             }
             for nth in 1..400u32 {
-                let mut root = [0u8; 32];
-                root[..4].copy_from_slice(&nth.to_le_bytes());
-                assert!(grants.revoke(admitted(seed).id(), BlobId(root)));
+                assert!(take(seed, nth));
             }
         }
-        // And a whole generation of peers leaving, which empties the outer table.
+        // A whole generation of peers leaving.
         for seed in 1..=50u8 {
-            grants.revoke_peer(admitted(seed).id());
+            grants.revoke_peer(who[usize::from(seed)].id());
+        }
+        // Tombstones: ten peers each grow to 400, drop to 210 (not under half,
+        // so nothing is rebuilt), then trade a grant for a grant, which leaves
+        // the table at one size with its slots churned.
+        for seed in 100..110u8 {
+            for nth in 0..400u32 {
+                give(seed, nth);
+            }
+            for nth in 0..190u32 {
+                assert!(take(seed, nth));
+            }
+            for round in 0..1000u32 {
+                give(seed, 1000 + round);
+                assert!(take(seed, 190 + round) || round >= 210);
+                if round >= 210 {
+                    assert!(take(seed, 1000 + round - 210));
+                }
+            }
         }
 
-        let book = grants.lock();
-        let slot = size_of::<(BlobId, Entry)>();
-        let inner: usize = book
-            .by_peer
-            .values()
-            .map(|held| retained(held.capacity(), slot))
-            .sum();
-        let outer = retained(
-            book.by_peer.capacity(),
-            size_of::<(EndpointId, HashMap<BlobId, Entry>)>(),
-        );
-        assert_eq!(book.by_peer.len(), 10);
+        let used = grants.lock().used;
+        let retained = counting::live() - before;
         assert!(
-            inner + outer <= book.used,
-            "the tables retain {} bytes against {} charged",
-            inner + outer,
-            book.used
+            retained <= used as isize + ALLOWANCE,
+            "the ledger retains {retained} bytes against {used} charged"
         );
+
+        // And the refund is real: the budget is not left charged for tables that
+        // were rebuilt. Twenty peers hold at most 410 grants between them.
+        let book = grants.lock();
+        let slots: usize = book.by_peer.map.values().map(|held| held.high).sum();
+        assert!(
+            slots <= 2 * 10 * 410 + 2 * 10,
+            "{slots} grant slots charged"
+        );
+        assert_eq!(book.by_peer.map.len(), 20);
+    }
+
+    /// Second-round review finding 1. Admission is decided once per connection
+    /// and copied into every call, so a call accepted before a peer was removed
+    /// can still be on its way to its fence when the removal and `revoke_peer`
+    /// both land, and would read the new epoch as if it were admitted after.
+    /// The fence is taken first and the connection is asked second, so one of the
+    /// two always notices.
+    ///
+    /// Watched red with `scripts/break-once.sh`, with a search literal of two
+    /// lines that a registry row cannot quote (the lines are `let fence =
+    /// self.take(peer);` and `if open() {`), replaced by `let opened = open();`,
+    /// `let fence = self.take(peer);` and `if opened {`: the barrier case then
+    /// hands out a fresh fence, the reservation is granted, and the assertion
+    /// `the fence predates the revoke` panics.
+    #[test]
+    fn a_call_that_reaches_its_fence_after_a_peer_revoke_cannot_grant() {
+        let grants = Grants::new();
+
+        // The barrier: the revoke lands between taking the fence and asking
+        // whether the connection is open, which is the instant a call accepted
+        // under the old admission is deciding what it is.
+        let late = grants
+            .fence(&admitted(1), || {
+                grants.revoke_peer(admitted(1).id());
+                true
+            })
+            .expect("the connection was still open when it was asked");
+        assert_eq!(
+            grants
+                .reserve(&admitted(1), blob(1).into(), &late)
+                .expect_err("the fence predates the revoke"),
+            NotGranted::Withdrawn
+        );
+        drop(late);
+
+        // And one that reaches its fence after the revoke finds the connection
+        // closed, which is the first step of removing a peer.
+        assert_eq!(
+            grants
+                .fence(&admitted(1), || false)
+                .expect_err("closed before it was fenced"),
+            NotGranted::Withdrawn
+        );
+        assert!(
+            grants.lock().inflight.is_empty(),
+            "a refused call leaves nothing in the fence table"
+        );
+
+        // The control: a call on an open connection is fenced and may grant.
+        let fence = grants.fence(&admitted(1), || true).expect("open");
+        reserve_under(&grants, 1, blob(1), &fence)
+            .expect("an open connection grants")
+            .commit();
+        assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Blob));
     }
 
     #[test]
@@ -2717,7 +3045,9 @@ mod tests {
         // table would keep connecting while holding nothing.
         assert!(!grants.knows(&peer(1)));
         assert!(grants.knows(&peer(2)));
-        assert_eq!(grants.lock().used, PEER_COST + GRANT_COST);
+        // The peers' table has held two and holds one, which is not under half,
+        // so it is charged for two until it is rebuilt.
+        assert_eq!(grants.lock().used, 2 * PEER_COST + GRANT_COST);
         assert!(!grants.revoke(admitted(1).id(), blob(2)), "already gone");
     }
 
@@ -2736,7 +3066,9 @@ mod tests {
         assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
         assert_eq!(scope(&grants, 3, blob(3)), Some(Scope::Blob));
         assert!(!grants.knows(&peer(2)), "its only grant went");
-        assert_eq!(grants.lock().used, 2 * PEER_COST + 2 * GRANT_COST);
+        // Three peers held, two do: not under half, so still charged for three,
+        // and the first peer's table still holds one against a mark of two.
+        assert_eq!(grants.lock().used, 3 * PEER_COST + 3 * GRANT_COST);
     }
 
     #[test]
@@ -2762,7 +3094,7 @@ mod tests {
             "another peer's connection is left alone"
         );
         assert_eq!(scope(&grants, 2, blob(1)), Some(Scope::Blob));
-        assert_eq!(grants.lock().used, PEER_COST + GRANT_COST);
+        assert_eq!(grants.lock().used, 2 * PEER_COST + GRANT_COST);
     }
 
     /// `GRANT_COST` and `PEER_COST` are computed from `size_of`, and this pins
@@ -3116,7 +3448,7 @@ mod tests {
     /// walks the empty offsets one at a time before it looks at the sequence.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK56`) by replacing
-    /// `if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
+    /// `if starts_run_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
     /// with `if false {`: the far request is then admitted.
     #[test]
     fn a_closure_request_for_a_far_offset_is_refused_without_walking_to_it() {

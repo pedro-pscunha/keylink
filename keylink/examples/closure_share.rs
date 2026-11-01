@@ -7,7 +7,7 @@
 //! ```
 //!
 //! A holder lists N blobs in one hash sequence and hands a caller that sequence
-//! as [`Content::Closure`]. The caller holds **one** grant and may fetch all N
+//! as a closure grant. The caller holds **one** grant and may fetch all N
 //! blobs, which a ledger that granted blob by blob could not do past its cap.
 //! The fetcher already holds K of them, so it asks its own store what it lacks
 //! and moves only the other N - K. The holder then takes the grant back.

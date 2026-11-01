@@ -170,8 +170,10 @@ A closure lists at most `MAX_CLOSURE_MEMBERS` (262,144) members, and both ends
 hold the line. The fetcher checks the root's size, which the holder proves with
 the last chunk, before it downloads or plans anything, and refuses a longer one
 or one that is not a whole number of addresses with `BlobFault::TooManyMembers`
-or `NotASequence`. The holder refuses a request that selects a member past it,
-because a request can name an offset near `u64::MAX` in a few bytes.
+or `NotASequence`. The holder refuses a request that starts a run of offsets
+past it, because a request can name an offset near `u64::MAX` in a few bytes;
+that bounds where a run begins and not where it ends, so an open-ended request
+for a whole closure passes.
 
 A grant lasts until it is revoked. `Blobs::revoke(peer, root)` and
 `Blobs::revoke_everywhere(root)` refuse the next request; a request already
@@ -185,8 +187,12 @@ removing it from an allowlist does not touch its blob grants.
 The ledger is bounded in bytes, not in grants: `GRANT_BUDGET` is 64 MiB by
 default and `Blobs::set_grant_budget` changes it. A grant past the budget is
 answered `RemoteError::GrantsExhausted`, and nothing is evicted to make room.
-The per-grant and per-peer costs (`GRANT_COST`, `PEER_COST`) are derived from
-type sizes, not measured. Grants die with the process.
+The budget bounds entries times a per-entry cost (`GRANT_COST`, `PEER_COST`)
+derived from type sizes. Each table is charged for the most entries it has held
+since it was last rebuilt, and is rebuilt (which lowers the charge) when it falls
+to under half that, so a revoke refunds only what is really given back. It does
+not bound the allocator's own overhead or the smallest tables. Grants die with
+the process.
 
 The [`closure_share`](keylink/examples/closure_share.rs) example runs it end to
 end, in one process or between two machines.

@@ -630,7 +630,7 @@ async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
     required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
     keys: Keys,
-    blobs: Option<Blobs>,
+    grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
     mut send: SendStream,
     recv: RecvStream,
@@ -707,9 +707,9 @@ where
         Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
     };
 
-    // Fenced BEFORE the handler runs, so a revoke that lands while it runs
-    // reaches the grant it is about to make.
-    let fence = blobs.as_ref().map(|blobs| blobs.fence(&admitted));
+    // The fence in `grants` was taken when this stream was accepted, before the
+    // request was read or the key claimed, so a revoke that lands at any point
+    // after that reaches the grant this call is about to make.
     let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
 
     // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
@@ -731,7 +731,11 @@ where
     // settle, because a grant made live above and a record refused below would
     // leave the far side holding a live grant for an address this reply never
     // carried. An early return drops the permit, which releases the reservation.
-    let (outcome, permit) = grant_or_refuse(blobs.as_ref().zip(fence.as_ref()), &admitted, outcome);
+    let (outcome, permit) = grant_or_refuse(
+        grants.as_ref().map(|(blobs, fence)| (blobs, fence)),
+        &admitted,
+        outcome,
+    );
 
     let frame = wire::encode_header(
         body.declared_len(),
@@ -886,11 +890,24 @@ where
 
             match accepted {
                 Ok(Stream::Bi((send, recv))) => {
+                    // Fenced here and not inside the spawned task, which may not
+                    // run until after a revoke has. A call arriving on a
+                    // connection that has been closed since it was admitted
+                    // (the first step of removing a peer) is dropped unread.
+                    let grants = match self.blobs.clone() {
+                        None => None,
+                        Some(blobs) => {
+                            match blobs.fence(&admitted, || connection.close_reason().is_none()) {
+                                Ok(fence) => Some((blobs, fence)),
+                                Err(_) => continue,
+                            }
+                        }
+                    };
                     calls.spawn(serve_one(
                         self.next.clone(),
                         self.required_authorization.clone(),
                         self.keys.clone(),
-                        self.blobs.clone(),
+                        grants,
                         admitted,
                         send,
                         recv,
