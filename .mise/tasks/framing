@@ -33,13 +33,10 @@
 # with a named allowlist. This one now catches the import route only where
 # nothing in the file defines the trait's other side.
 #
-# `Claim::append` and `Claim::truncate_before` are raw-byte (or raw-position)
-# methods of the same trait, so the first check guards them too: they are callable
-# only where the trait is in scope. A record appended outside `Versioned` would
-# carry no delta version and no count, which `Recovered::replayed` would refuse as
-# a `BadRecord` at the next open. The second check below is about `.store(` only
-# and needs no sibling for them: `keylink/src/persist.rs` calls `Versioned` and
-# nothing else.
+# `Claim::append`, `Claim::recover` and `Claim::truncate_before` are the log half of
+# the same trait. The import check above does NOT guard them for a file that
+# implements the port, because an implementor is exempt from it; the third check
+# at the bottom of this task is what does.
 #
 # The second is the ordinary grep. It used to look for `.store(&` and
 # `.store(b"`, which is what a raw write looked like at the time; thirteen
@@ -189,6 +186,98 @@ if [[ -n "$stored_raw" ]]; then
     echo "A snapshot is written by Versioned::store, which takes a Snapshot<D>" >&2
     echo "and stamps D::VERSION. If this line really does belong, add its file" >&2
     echo "to the allowlist in this task and say why." >&2
+fi
+
+# ── the log half of the port, which the two checks above do not see ────────────
+#
+# **The import check exempts every file that IMPLEMENTS `Claim`, and the `.store(`
+# check looks for `.store(` only.** So a consumer file that implements the port
+# and then calls `.append(seq, bytes)` or `.truncate_before(seq)` on a claim passes
+# both: an unframed record, or a destructive cut, with no gate to say so. That was
+# found at merge review, in a comment of this task that claimed the import check
+# was enough.
+#
+# This is the call-site check for those. It matches the call by its arguments
+# (`Seq::..` or a variable named `seq`, `from`) rather than by name alone, so an
+# unrelated `Vec::append` or `.recover(` of something else is not caught, and it
+# runs multi-line because rustfmt puts a long call's arguments on the next line.
+# Watched failing twice: a raw `.append(` in a new file under `keylink/tests` is
+# reported with its line, and a pattern edited to match nothing fails the self-check
+# below instead of passing.
+# The files that may call are the ones that ARE the framing, or test it:
+#
+#   versioned.rs        the one framed writer of records
+#   file.rs             the adapter; its tests drive the raw port on purpose
+#   representability.rs the compile-time probes
+#   tests/versioned.rs  the frame and the log, from outside
+journal_call='\.(append|truncate_before|recover)\(\s*(Seq::|seq\b|from\b)'
+
+# `journal_calls <path> [rg flags...]`: the pattern is passed with `-e` so that the
+# path, which comes first here, is not read as the pattern.
+journal_calls() {
+    local target="$1"
+    shift
+    scan -U --line-number --glob '*.rs' "$@" -e "$journal_call" "$target" \
+        | uncommented
+}
+
+# **The detector is tried on a known-bad file every run**, because a guard that has
+# not been watched failing is not a guard, and this one is a regular expression
+# over text. An implementor file with a raw append and a raw cut must be caught,
+# and a file that only DEFINES the methods must not be.
+selfcheck="$(mktemp -d)"
+trap 'rm -rf "$selfcheck"' EXIT
+cat >"$selfcheck/bad.rs" <<'RS'
+struct Mine;
+impl Claim for Mine {
+    async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> { Ok(()) }
+}
+async fn unframed(claim: &mut Mine) {
+    claim.append(Seq::new(1), b"x").await.ok();
+    claim
+        .truncate_before(
+            Seq::new(1),
+        )
+        .await
+        .ok();
+}
+RS
+cat >"$selfcheck/clean.rs" <<'RS'
+struct Mine;
+impl Claim for Mine {
+    async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> { Ok(()) }
+    async fn recover(&mut self, from: Seq) -> Result<Tail> { Ok(Tail::default()) }
+}
+RS
+caught="$(journal_calls "$selfcheck/bad.rs" | wc -l | tr -d ' ')"
+missed="$(journal_calls "$selfcheck/clean.rs" | wc -l | tr -d ' ')"
+if [[ "$caught" -lt 2 || "$missed" -ne 0 ]]; then
+    fail=1
+    echo "── the journal-call check's own self-test failed: it caught $caught of 2 raw calls" >&2
+    echo "   in a file built to contain them, and flagged $missed lines in a file that only" >&2
+    echo "   defines the methods. The pattern or the scan is broken." >&2
+fi
+
+raw_journal="$(
+    journal_calls . \
+        --glob '!keylink-persist/src/versioned.rs' \
+        --glob '!keylink-persist/src/file.rs' \
+        --glob '!keylink-persist/src/representability.rs' \
+        --glob '!keylink-persist/tests/versioned.rs' \
+        || true
+)"
+
+if [[ -n "$raw_journal" ]]; then
+    fail=1
+    echo "── the raw log is called outside the files that may call it:" >&2
+    echo "$raw_journal" >&2
+    echo >&2
+    echo "A record is written by Versioned::stage(..).commit(), which frames it with a" >&2
+    echo "delta version and a count, and a log is cut by Versioned::store. Calling" >&2
+    echo "Claim::append or Claim::truncate_before yourself writes a record" >&2
+    echo "Recovered::replayed will refuse, or drops records a snapshot may not contain." >&2
+    echo "If this line really does belong, add its file to the allowlist in this task" >&2
+    echo "and say why." >&2
 fi
 
 if [[ "$fail" -ne 0 ]]; then
