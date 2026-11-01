@@ -125,7 +125,7 @@ mod current {
         recv Fetch(sku: String, kib: u32) -> Datasheet;
         rpc Count() -> u64;
         previous 2 {
-            hash crate::frozen::inventory::VERSION.hash();
+            hash crate::frozen::inventory::VERSION.hash(); keyed_hash crate::frozen::inventory::KEYED_VERSION.hash();
             rpc Ping() -> String;
             changed rpc List() -> Vec<crate::frozen::Item>;
             changed rpc GetItem(sku: String) -> Option<crate::frozen::Item>;

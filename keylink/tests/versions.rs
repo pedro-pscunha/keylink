@@ -40,7 +40,7 @@ mod v3 {
         tell Note(line: String) -> ();
         rpc Purge() -> u64;
         previous 2 {
-            hash v2::ledger::VERSION.hash();
+            hash v2::ledger::VERSION.hash(); keyed_hash v2::ledger::KEYED_VERSION.hash();
             changed rpc Get(id: u64) -> Option<v2::Entry>;
             changed rpc Add(entry: v2::Entry) -> u64;
             tell Note(line: String) -> ();
@@ -476,8 +476,8 @@ mod chain {
         service Chain;
         version 3;
         rpc Echo(n: u64) -> u64;
-        previous 2 { hash two::chain::VERSION.hash(); rpc Echo(n: u64) -> u64; }
-        previous 1 { hash one::chain::VERSION.hash(); rpc Echo(n: u64) -> u64; }
+        previous 2 { hash two::chain::VERSION.hash(); keyed_hash two::chain::KEYED_VERSION.hash(); rpc Echo(n: u64) -> u64; }
+        previous 1 { hash one::chain::VERSION.hash(); keyed_hash one::chain::KEYED_VERSION.hash(); rpc Echo(n: u64) -> u64; }
     }
     // No changed methods. Any application conversion being reached is a defect.
     macro_rules! plain {
@@ -626,7 +626,7 @@ mod blob_versions {
     keylink::service! {
         service Content; version 2;
         blob Get(mode: u8) -> u8;
-        previous 1 { hash old::content::VERSION.hash(); changed blob Get(mode: u8) -> u8; }
+        previous 1 { hash old::content::VERSION.hash(); keyed_hash old::content::KEYED_VERSION.hash(); changed blob Get(mode: u8) -> u8; }
     }
     impl content::version_1::Convert for content::version_1::Step {
         fn upgrade_request(
@@ -764,7 +764,7 @@ mod attributed {
         #[cfg_attr(all(), cfg(any()))]
         rpc Nested(value: AnotherAbsentType) -> u8;
         previous 1 {
-            hash old::attributed::VERSION.hash();
+            hash old::attributed::VERSION.hash(); keyed_hash old::attributed::KEYED_VERSION.hash();
             #[serde(rename = "wire-name")]
             rpc Echo(value: u32) -> u32;
             #[cfg(any())]

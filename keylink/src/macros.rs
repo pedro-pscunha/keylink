@@ -285,7 +285,7 @@
 /// ## Contract windows
 ///
 /// Put `version N;` immediately after `service Name;` (omitted means 1), and put
-/// `previous N { hash PIN; ... }` blocks after every declaration and feed, newest
+/// `previous N { hash PIN; keyed_hash KEYED_PIN; ... }` blocks after every declaration and feed, newest
 /// first. A block repeats that version's wire declarations in their original
 /// order, with `changed` before the kinds whose conversions the application writes.
 /// Attributes are preserved just as on current declarations: serde metadata
@@ -316,7 +316,7 @@
 ///     service PinExample;
 ///     version 3;
 ///     rpc Ping() -> u64;
-///     previous 2 { hash frozen::pin_example::VERSION.hash() ^ 1; rpc Ping() -> u64; }
+///     previous 2 { hash frozen::pin_example::VERSION.hash() ^ 1; keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
 /// }
 /// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
 /// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
@@ -335,7 +335,7 @@
 ///     service PinExample;
 ///     version 3;
 ///     rpc Ping() -> u64;
-///     previous 4 { hash frozen::pin_example::VERSION.hash(); rpc Ping() -> u64; }
+///     previous 4 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
 /// }
 /// # impl pin_example::version_4::Convert for pin_example::version_4::Step {
 /// # fn upgrade_request(_: pin_example::version_4::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
@@ -346,13 +346,36 @@
 /// # fn main() {}
 /// ```
 ///
-/// Both guards were watched red with `scripts/break-once.sh`: replacing the
+/// The singleton pin can match while the keyed pin refuses a different shape:
+///
+/// ```compile_fail
+/// # mod frozen { keylink::service! { service PinExample; version 2; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 2 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash() ^ 1; rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
+/// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_2::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_2::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_2::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// The label and singleton guards were watched red with `scripts/break-once.sh`: replacing the
 /// hash assertion's condition with `true` made the first fence compile, and
 /// replacing the descending-label assertion's condition with `true` made the
 /// second compile. Each isolated run reported 0 passed, 1 failed, with
 /// "Test compiled successfully, but it's marked `compile_fail`." Both edits
 /// were restored. The hidden `main` keeps the frozen module at crate scope;
 /// without it a fence can fail on name resolution instead of on its guard.
+///
+/// The independent keyed pin was also watched red: replacing its assertion's
+/// condition with `true` made the third fence compile (0 passed, 1 failed).
+/// The singleton pin matched throughout. Restored the keyed assertion.
 ///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
@@ -10196,9 +10219,9 @@ macro_rules! __keylink_contract {
 macro_rules! __keylink_previous {
     (@chain [$svc:ident] [$upper:literal] [$($newer:tt)*]) => {};
     (@chain [$svc:ident] [$upper:literal] [$($newer:tt)*]
-        previous $label:literal { hash $pin:expr; $($body:tt)* } $($rest:tt)*) => {
+        previous $label:literal { hash $pin:expr; keyed_hash $keyed_pin:expr; $($body:tt)* } $($rest:tt)*) => {
         $crate::__keylink_previous! {
-            @parse [$svc] [$upper] [$($newer)*] [$label] [$pin]
+            @parse [$svc] [$upper] [$($newer)*] [$label] [$pin, $keyed_pin]
             @attrs [] @cfg [] @all [] @plain [] @rest [$($body)*]
         }
         $crate::pastey::paste! {
@@ -10248,7 +10271,7 @@ macro_rules! __keylink_previous {
             @plain [$($plain)* { [$($cfg)*] $rpc ($($arg),*) }] @rest [$($rest)*]
         }
     };
-    (@parse [$svc:ident] [$upper:literal] [$($newer:tt)*] [$label:literal] [$pin:expr]
+    (@parse [$svc:ident] [$upper:literal] [$($newer:tt)*] [$label:literal] [$pin:expr, $keyed_pin:expr]
         @attrs [] @cfg [] @all [$($all:tt)+] @plain [$({ [$(#[$pcfg:meta])*] $plain:ident ($($arg:ident),*) })*] @rest []) => {
         $crate::pastey::paste! {
             /// A frozen contract and its conversion step to the next newer shape.
@@ -10259,6 +10282,7 @@ macro_rules! __keylink_previous {
                 $crate::__keylink_contract! { $svc, $label; $($all)+ }
                 const _: () = assert!($label < $upper, concat!("previous ", stringify!($label), " must be lower than ", stringify!($upper), " in ", stringify!($svc)));
                 const _: () = assert!(VERSION.hash() == $pin, concat!("previous ", stringify!($label), " of ", stringify!($svc), " does not hash to its pin: the frozen declaration differs from the one that was current, or keylink's own wire types moved since. Print version_", stringify!($label), "::VERSION to read what this one hashes to."));
+                const _: () = assert!(KEYED_VERSION.hash() == $keyed_pin, concat!("previous keyed ", stringify!($label), " of ", stringify!($svc), " does not hash to its keyed pin: print version_", stringify!($label), "::KEYED_VERSION to inspect the frozen addressed contract."));
                 /// The adjacent conversion step; implement `Convert` for it.
                 pub struct Step;
                 /// Conversions for changed, added and removed methods.
@@ -10311,7 +10335,7 @@ macro_rules! __keylink_previous {
             }
         }
     };
-    ($($other:tt)*) => { compile_error!("previous blocks require hash PIN; followed by wire declarations, optionally prefixed with changed, and must follow all current declarations"); };
+    ($($other:tt)*) => { compile_error!("previous blocks require hash PIN; keyed_hash KEYED_PIN; followed by wire declarations, optionally prefixed with changed, and must follow all current declarations"); };
 }
 
 /// One expansion of [`service!`], inside the library's own test build.
