@@ -58,6 +58,10 @@ struct Till {
     reserves: Counter,
     slows: Counter,
     sheets: Counter,
+    /// `None` unless a test holds a `slow` turn open: it waits for a permit here
+    /// before it sleeps, so the test keeps the handler running for exactly as long
+    /// as the order it is reading needs, and not for a duration a stall can spend.
+    release: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl till::Handler for Till {
@@ -67,6 +71,13 @@ impl till::Handler for Till {
 
     async fn slow(&self, _cx: &Context, ms: u64) -> u64 {
         let run = self.slows.next();
+        if let Some(release) = &self.release {
+            release
+                .acquire()
+                .await
+                .expect("the test never closes the semaphore")
+                .forget();
+        }
         tokio::time::sleep(Duration::from_millis(ms)).await;
         run
     }
@@ -165,6 +176,102 @@ fn nz(n: usize) -> NonZeroUsize {
 
 fn key(text: &str) -> IdempotencyKey {
     IdempotencyKey::new(text).expect("a valid key")
+}
+
+/// Wait until the ledger holds a running claim under `name`.
+///
+/// What the tests that start a slow call and then send a second one under the same
+/// key need to know, asked of the ledger and not guessed from a sleep: a second
+/// call that reaches the server first takes the claim itself, and the test is then
+/// about something else. Bounded, so a claim that never lands is a red test.
+async fn until_running(client: &till::Client, name: &str) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while client.key_state(key(name)).await.expect("asks") != keylink::KeyState::Running {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first call's claim reached the ledger within 120 s");
+}
+
+/// `till` with every `slow` turn parked on the returned semaphore until the test
+/// adds permits, under the ledger's room for attachers.
+///
+/// `records` is the policy under test; one attacher may wait per peer, which is
+/// what [`one_attacher_waiting`] reads.
+async fn start_held(records: Option<Records>) -> (Fixture, Arc<tokio::sync::Semaphore>) {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut service = till::service(
+        Till {
+            release: Some(release.clone()),
+            ..Till::default()
+        },
+        Allowlist::anyone(),
+    )
+    .limits(Limits::default().waiting_per_peer(NonZeroUsize::MIN));
+    if let Some(records) = records {
+        service = service.records(records);
+    }
+    let running = KeylinkServer::builder(&server)
+        .service(service.build())
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the server");
+    (
+        Fixture {
+            client,
+            _server: running,
+            _nodes: vec![server, client_node],
+        },
+        release,
+    )
+}
+
+/// Send two attachers for `name` at once and hand back the one that is waiting,
+/// once it provably is.
+///
+/// The ledger lets one attacher wait per peer ([`start_held`]), so of two attachers
+/// that reach it while the first call is held, one parks and the other is refused
+/// `TooManyRunning` at once. That refusal is the observation: it cannot happen
+/// unless the other attacher is already waiting. Nothing else tells a test that a
+/// call has parked behind the ledger; a sleep only guesses, and an attacher that
+/// arrives after the first call settles is served the record and proves nothing.
+async fn one_attacher_waiting(
+    client: &till::Client,
+    name: &str,
+) -> tokio::task::JoinHandle<Result<u64, Error>> {
+    let attacher = || {
+        let client = client.clone();
+        let key = key(name);
+        tokio::spawn(async move {
+            client
+                .with_idempotency(keylink::Idempotency::attaching_for(
+                    key,
+                    Duration::from_secs(120),
+                ))
+                .slow(0)
+                .await
+        })
+    };
+    let mut first = attacher();
+    let mut second = attacher();
+    let (refused, waiting) = tokio::select! {
+        done = &mut first => (done, second),
+        done = &mut second => (done, first),
+    };
+    let refused = refused
+        .expect("no panic")
+        .expect_err("the attacher that finishes before the first call settles was refused");
+    assert!(
+        matches!(refusal(&refused), IdempotencyRefusal::TooManyRunning { .. }),
+        "the first attacher to answer must be turned away by the room for one waiter, \
+         which is what proves the other is parked"
+    );
+    waiting
 }
 
 /// An oversized key, built the only way a peer can build one.
@@ -1787,27 +1894,33 @@ async fn a_key_state_query_cannot_read_another_peers_key() {
 /// A second caller under a live key takes the running call's answer instead of
 /// being turned away. The two replies are the same run number, and a third,
 /// keyless call reports that the handler was entered exactly twice.
+///
+/// The first call is parked on a semaphore and released only once an attacher is
+/// provably waiting (`one_attacher_waiting`). Made red by `scripts/break-once.sh`
+/// on `keylink/src/rpc.rs`, replacing `if n0_future::time::timeout(budget,
+/// notified).await.is_err() {` with `if true {` — an attach that does not wait.
+/// Watched: `the first attacher to answer must be turned away by the room for one
+/// waiter, which is what proves the other is parked`; the recordless test below
+/// goes red on the same edit.
 #[tokio::test]
 async fn a_second_caller_attaches_to_a_live_key() {
-    let fixture = start().await;
+    let (fixture, release) = start_held(None).await;
     let client = fixture.client;
 
     let slow = {
         let scoped = client.with_idempotency(key("k"));
-        tokio::spawn(async move { scoped.slow(400).await })
+        tokio::spawn(async move { scoped.slow(0).await })
     };
-    // Long enough that the claim is taken and the handler is inside its sleep.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_running(&client, "k").await;
+    // The first call is parked in its handler until the permit below, so the
+    // attacher has no way to meet a settled key: it either waits or is refused.
+    let attacher = one_attacher_waiting(&client, "k").await;
+    release.add_permits(16);
 
-    let attached = client
-        .with_idempotency(keylink::Idempotency::attaching_for(
-            key("k"),
-            Duration::from_secs(5),
-        ))
-        .slow(0)
+    let attached = attacher
         .await
+        .expect("no panic")
         .expect("the attaching caller is answered by the call already running");
-
     let first = slow
         .await
         .expect("no panic")
@@ -1854,25 +1967,21 @@ async fn a_second_caller_attaches_to_a_live_key() {
 /// assertion here is what would notice the two paths being confused.
 #[tokio::test]
 async fn an_attacher_on_a_recordless_service_waits_and_is_told_it_ran() {
-    let fixture = start_recordless().await;
+    let (fixture, release) = start_held(Some(Records::None)).await;
     let client = fixture.client;
 
     let slow = {
         let scoped = client.with_idempotency(key("k"));
-        tokio::spawn(async move { scoped.slow(400).await })
+        tokio::spawn(async move { scoped.slow(0).await })
     };
-    // Long enough that the claim is taken and the handler is inside its sleep.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_running(&client, "k").await;
+    let attacher = one_attacher_waiting(&client, "k").await;
+    release.add_permits(16);
 
-    let refused = client
-        .with_idempotency(keylink::Idempotency::attaching_for(
-            key("k"),
-            Duration::from_secs(5),
-        ))
-        .slow(0)
+    let refused = attacher
         .await
+        .expect("no panic")
         .expect_err("the attacher waits for the settle and is then refused");
-
     slow.await
         .expect("no panic")
         .expect("the first call answers");
@@ -1894,15 +2003,17 @@ async fn an_attacher_on_a_recordless_service_waits_and_is_told_it_ran() {
 /// under this key is in dispatch now.
 #[tokio::test]
 async fn an_attach_that_outlives_its_budget_returns() {
-    let fixture = start().await;
+    let (fixture, release) = start_held(None).await;
     let client = fixture.client;
 
     let slow = {
         let scoped = client.with_idempotency(key("k"));
-        tokio::spawn(async move { scoped.slow(3_000).await })
+        tokio::spawn(async move { scoped.slow(0).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_running(&client, "k").await;
 
+    // The first call is parked in its handler until the permit below, so the
+    // budget can only run out while it is still running.
     let error = client
         .with_idempotency(keylink::Idempotency::attaching_for(
             key("k"),
@@ -1913,7 +2024,10 @@ async fn an_attach_that_outlives_its_budget_returns() {
         .expect_err("the budget runs out while the first call is still running");
 
     assert_eq!(refusal(&error), IdempotencyRefusal::InFlight);
-    slow.abort();
+    release.add_permits(16);
+    slow.await
+        .expect("no panic")
+        .expect("the first call answers once released");
 }
 
 /// A settled key is answered at once. Attaching is about waiting for a call in
@@ -2138,7 +2252,7 @@ mod stored {
         // 110 the reopen ran first and read `Busy`. So `Busy` is waited out, on
         // a bound that names what it waited for; any other refusal fails at once.
         let mut records = None;
-        for _ in 0..3000 {
+        for _ in 0..12_000 {
             match keylink::DurableRecords::open(&files, &ledger_id()).await {
                 Err(keylink::RecordError::Store(keylink_persist::Error::Busy { .. })) => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2149,7 +2263,7 @@ mod stored {
                 }
             }
         }
-        let records = records.expect("the previous fixture released the ledger within 30 s");
+        let records = records.expect("the previous fixture released the ledger within 120 s");
 
         let reserves = Counter::default();
         let till = Till {
@@ -2354,7 +2468,7 @@ mod stored {
             // waits for the claim itself instead of for a duration that happens to
             // be long enough on this machine.
             let mut claimed = false;
-            for _ in 0..200 {
+            for _ in 0..12_000 {
                 if fixture
                     .client
                     .key_state(key("in-flight"))

@@ -357,7 +357,7 @@ async fn a_local_keyed_ref_rejects_a_reentrant_call() {
         .expect("the id is free");
 
     let actor = journal::at_local(&system, actor_id.clone());
-    let result = tokio::time::timeout(Duration::from_secs(1), actor.apply(7, 0))
+    let result = tokio::time::timeout(Duration::from_secs(120), actor.apply(7, 0))
         .await
         .expect("the re-entrant call must resolve without waiting for the actor");
     assert_eq!(result.expect("the outer turn answers"), 7);
@@ -448,12 +448,12 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
             .apply(2, 0)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if status_of(&system, &actor_id).queued == 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -1106,13 +1106,25 @@ async fn an_idle_actor_is_evicted_without_anyone_asking() {
         .expect("the id is free");
     assert_eq!(fixture.system.len(), 1);
 
-    // No `evict_idle` call: the system's own sweeper has to do this.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // No `evict_idle` call: the system's own sweeper has to do this. Waited for
+    // rather than slept for: a fixed sleep is a bet that the sweeper's task is
+    // scheduled inside it, and under load it was not.
+    until_empty(&fixture.system).await;
+}
 
-    assert!(
-        fixture.system.is_empty(),
-        "an actor nobody addressed must be evicted by the sweeper alone"
-    );
+/// Wait until the sweeper has evicted every actor in `system`.
+///
+/// Bounded, so a sweeper that never evicts is a red test and not a hung one; the
+/// bound is far past anything load can spend (a whole-process stall of 35 s was
+/// measured on a loaded machine) and names what it waited for.
+async fn until_empty(system: &journal::Registry) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !system.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sweeper evicted every idle actor within 120 s");
 }
 
 /// Eviction is `shutdown`, not `abort`: the actor is not cut off mid-turn, and
@@ -1127,31 +1139,63 @@ async fn an_idle_actor_is_evicted_without_anyone_asking() {
 /// it. The turn finished on an actor that no longer existed as far as the system
 /// was concerned, and if it had never finished, nothing would ever have noticed.
 ///
-/// With a budget the two numbers are independent and both are deliberate. `after`
-/// stays 30 ms: the actor is stale almost at once, which is what puts the
-/// eviction inside the turn. `shutdown_budget` is five seconds, comfortably more
-/// than the 250 ms the turn holds, and **that** is what buys the answer. The name
-/// says `inside_its_shutdown_budget` because that is the condition; the converse
-/// — a turn that outlives the budget being destroyed — is
-/// `an_eviction_whose_budget_expires_destroys_the_actor` below, and the two
-/// together are the whole of what an eviction budget means.
+/// With a budget the two numbers are independent and both are deliberate.
+/// `after` is short: the actor is stale almost at once, which is what puts the
+/// eviction inside the turn. `shutdown_budget` is two minutes, parked-turn long, and
+/// **that** is what buys the answer. The name says `inside_its_shutdown_budget` because that
+/// is the condition; the converse — a turn that outlives the budget being
+/// destroyed — is `an_eviction_whose_budget_expires_destroys_the_actor` below,
+/// and the two together are the whole of what an eviction budget means.
+///
+/// Made red by the same `Duration::ZERO` edit to `drain` as the shutdown test
+/// below, which the sweeper also goes through. Watched: the final `unwrap` on the
+/// call's answer, on an error where the turn's 5 was expected.
+///
+/// # What decides that the turn is in flight, and what does not
+///
+/// It was a 250 ms turn against a 30 ms `after`, with the actor mounted before
+/// the call: the clock started at the mount, so a loaded machine that took the
+/// call longer than `after` to arrive saw the sweeper evict an actor that had
+/// never been addressed, and the call answered `NoSuchActor`. Nothing in that
+/// shape could tell "evicted during the turn" from "evicted before the turn".
+///
+/// Now the actor is spawned by the call itself, so its clock starts when the
+/// message is routed. The turn is parked on a semaphore from the moment it
+/// enters, and is let go only after the sweeper has taken the actor out of the
+/// system. The order is therefore a fact the test observed, not a duration it
+/// hopes for: entered, evicted, answered.
 #[tokio::test]
 async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_flight() {
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
     let fixture = start(
         journal::Registry::builder(Eviction::Idle {
-            after: Duration::from_millis(30),
-            shutdown_budget: Duration::from_secs(5),
+            after: Duration::from_millis(200),
+            shutdown_budget: Duration::from_secs(120),
+        })
+        .spawn_with({
+            let release = release.clone();
+            move |_| {
+                Some(journal::spawn(Journal {
+                    entered: Some(entered_tx.clone()),
+                    release: Some(release.clone()),
+                    ..Journal::default()
+                }))
+            }
         })
         .build(),
     )
     .await;
-    fixture
-        .system
-        .mount(id("slow"), journal::spawn(Journal::default()))
-        .expect("the id is free");
 
-    // In flight for far longer than `after`, and far inside the budget.
-    let answered = fixture.client.at(id("slow")).apply(5, 250).await;
+    let calling = async { fixture.client.at(id("slow")).apply(5, 0).await };
+    let driving = async {
+        entered.recv().await.expect("the turn enters the actor");
+        // The turn is parked, and nothing but this test can end it, so the
+        // actor leaving the system now is an eviction in the middle of a turn.
+        until_empty(&fixture.system).await;
+        release.add_permits(1);
+    };
+    let (answered, ()) = tokio::join!(calling, driving);
 
     assert_eq!(
         answered.unwrap(),
@@ -1162,11 +1206,15 @@ async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_fligh
 
 /// Eviction never touches the ALPN, so a peer connected before it can still
 /// reach an actor spawned after it.
+///
+/// The idle window is long enough that the second call, which spawns its actor
+/// and routes to it at once, cannot be outwaited by a loaded machine between
+/// those two steps. The first actor is waited for, not slept for.
 #[tokio::test]
 async fn the_connection_outlives_the_actors_on_it() {
     let fixture = start(
         journal::Registry::builder(Eviction::Idle {
-            after: Duration::from_millis(40),
+            after: Duration::from_millis(200),
             shutdown_budget: Duration::from_secs(5),
         })
         .spawn_with(|_| Some(journal::spawn(Journal::default())))
@@ -1175,8 +1223,7 @@ async fn the_connection_outlives_the_actors_on_it() {
     .await;
 
     assert_eq!(fixture.client.at(id("first")).apply(1, 0).await.unwrap(), 1);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(fixture.system.is_empty(), "the first actor was evicted");
+    until_empty(&fixture.system).await;
 
     assert_eq!(
         fixture.client.at(id("second")).apply(2, 0).await.unwrap(),
@@ -1195,36 +1242,37 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// one message in flight does not queue anything. The default local mailbox depth
 /// is 1, so the second
 /// `apply` is queued behind the first and is the queued turn; the budget covers
-/// both holds together, which is the depth-versus-budget relationship 4a's doc
+/// both turns together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
 ///
-/// # One signal and one sleep, and what each is for
+/// Made red by `scripts/break-once.sh` on `keylink/src/actor/registry.rs`,
+/// replacing `drain`'s `n0_future::time::timeout(budget, &mut task)` with the same
+/// call at `Duration::ZERO` — a shutdown that destroys the turn at once, which is
+/// what an `abort` would do. Watched: `a shutdown that drained inside its budget
+/// is Stopped, got Some(Vanished)`.
 ///
-/// This is one of the wall-clock tests in this file — a paused clock cannot
-/// sequence two real QUIC calls against each other — so what must hold is an
-/// ORDER, not a duration. Two orderings, and only one of them has to be slept
-/// for.
+/// # Three facts observed, and no clock
 ///
-/// The first is *the actor is busy before anything else happens*, and the
-/// handler says so: `Journal::entered` fires as the turn is entered, so the
-/// queued call and the shutdown are sequenced against a fact rather than against
-/// a guess. It was a 120 ms sleep from `t = 0`, which is a bet that a QUIC call
-/// and a dispatch fit in 120 ms — the bet that goes red under load, and the one
-/// flake class here that did not need to exist.
+/// What must hold is an ORDER, and each step of it is a fact the test waits for
+/// rather than a duration it guesses:
 ///
-/// The second is *the queued call reaches the mailbox before the shutdown removes
-/// the entry*, or it is answered `NoSuchActor` and this test fails for a reason
-/// that is not about draining. Its arrival there is observable from nowhere: no
-/// turn starts, because the actor is busy. So that one stays a sleep — 40 ms for
-/// a loopback stream on an already-open connection, three orders of magnitude of
-/// headroom. The hold only has to outlast it, so it is 200 ms rather than 400 ms.
-/// Do not shrink the 40; shrink the hold if anything.
+/// 1. *the actor is busy before anything else happens*: `Journal::entered` fires
+///    as the turn is entered, and the turn then parks on `release`;
+/// 2. *the queued call is in the mailbox before the shutdown starts*: read from
+///    the registry's own `serving`, which counts the mailbox;
+/// 3. *the shutdown has taken the actor out of the system before either turn is
+///    let go*: `is_empty`, so both turns provably finish inside a drain and not
+///    before it.
+///
+/// Steps 2 and 3 were a 40 ms sleep and a 200 ms hold. Under load the queued call
+/// took longer than the sleep, and the shutdown removed the entry first, so it
+/// answered `NoSuchActor` and this test failed for a reason that is not about
+/// draining.
 #[tokio::test]
 async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queued() {
-    const HOLD_MS: u64 = 200;
-
     let applied = Arc::new(Mutex::new(Vec::new()));
     let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
     let fixture = start(mounted()).await;
     fixture
         .system
@@ -1233,7 +1281,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
             journal::spawn(Journal {
                 applied: applied.clone(),
                 entered: Some(entered_tx),
-                release: None,
+                release: Some(release.clone()),
                 inside: None,
                 nested: None,
                 forward: None,
@@ -1244,7 +1292,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
 
     let running = {
         let client = &fixture.client;
-        async move { client.at(id("doc")).apply(1, HOLD_MS).await }
+        async move { client.at(id("doc")).apply(1, 0).await }
     };
     let sequenced = async {
         assert_eq!(
@@ -1255,13 +1303,20 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
         let behind = fixture.client.at(id("doc"));
         let queued = behind.apply(2, 0);
         let stopping = async {
-            // The one unobservable event in this test: the queued call reaching a
-            // mailbox whose actor is busy. Far inside the hold above.
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            fixture
-                .system
-                .stop(&id("doc"), Duration::from_secs(5))
-                .await
+            tokio::time::timeout(Duration::from_secs(120), async {
+                while fixture.system.serving(&id("doc")).map(|row| row.queued) != Some(1) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the second call reached the mailbox behind the turn in flight");
+            let doc = id("doc");
+            let stopped = fixture.system.stop(&doc, Duration::from_secs(120));
+            let letting_go = async {
+                until_empty(&fixture.system).await;
+                release.add_permits(2);
+            };
+            tokio::join!(stopped, letting_go).0
         };
         tokio::join!(queued, stopping)
     };
@@ -1286,11 +1341,16 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
 }
 
 /// `abort` cancels: the task's future is dropped at its await point, the state
-/// goes with it, and the mutation never happened. Made red by making `abort` an
-/// alias of a `shutdown` whose budget covers the turn.
+/// goes with it, and the mutation never happened.
+///
+/// Made red by `scripts/break-once.sh` on `keylink/src/actor/registry.rs`,
+/// deleting `Registry::abort`'s `entry.task.abort();` line, so it awaits a task
+/// nothing cancels. Watched: `abort destroyed the parked turn instead of waiting
+/// for it: Elapsed(())`, after the 120 s the call is bounded at.
 #[tokio::test]
 async fn abort_destroys_the_message_in_flight() {
     let applied = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
     let fixture = start(mounted()).await;
     fixture
         .system
@@ -1298,8 +1358,11 @@ async fn abort_destroys_the_message_in_flight() {
             id("doc"),
             journal::spawn(Journal {
                 applied: applied.clone(),
-                entered: None,
-                release: None,
+                entered: Some(entered_tx),
+                // Never given a permit: the turn is parked inside the handler
+                // until `abort` destroys it, so no hold can run out between
+                // `entered` and the abort.
+                release: Some(Arc::new(Semaphore::new(0))),
                 inside: None,
                 nested: None,
                 forward: None,
@@ -1310,11 +1373,15 @@ async fn abort_destroys_the_message_in_flight() {
 
     let client_call = {
         let client = &fixture.client;
-        async move { client.at(id("doc")).apply(1, 200).await }
+        async move { client.at(id("doc")).apply(1, 0).await }
     };
     let aborting = async {
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        fixture.system.abort(&id("doc")).await
+        entered.recv().await.expect("the turn is inside the actor");
+        // Bounded, because an `abort` that does not abort waits for a turn that
+        // never ends; two minutes is how long that takes to show as a red test.
+        tokio::time::timeout(Duration::from_secs(120), fixture.system.abort(&id("doc")))
+            .await
+            .expect("abort destroyed the parked turn instead of waiting for it")
     };
 
     let (answered, was_mounted) = tokio::join!(client_call, aborting);

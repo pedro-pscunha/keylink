@@ -388,6 +388,15 @@ The task uses `curl`; a build without execution does not verify HTTP behavior.
   test runner, and a load spike is not a bug in your code. Put the
   clock-dependent half in a unit test with `tokio::time::pause`, and leave the
   integration test an assertion that load can only strengthen.
+- Order two real calls by something you can observe, never by a sleep. "Sleep 80 ms
+  so the first call is inside its turn" is a bet that a QUIC round trip fits in
+  80 ms. Wait for the actor to say so (`status().busy`, `status().queued`, an
+  `entered` channel, `key_state`), hold the turn on a semaphore until the order you
+  need has been observed, and bound every such wait at a value no stall can cross.
+- A window the test's own steps must beat is the same bet: a restart's
+  `recovered_after`, an idle-eviction `after`, a `Timeout` shorter than the dispatch
+  in front of it. Give it a value load cannot spend, and where the window decides
+  the order, let the test decide the order itself.
 
 ## RFCs
 

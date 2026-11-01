@@ -360,7 +360,8 @@ impl AsyncRead for FailsWhenReleased {
 /// with `is_some`, so the reset fires for the one case that does not need it and
 /// never for the case that does. The exact test terminated with
 /// `Stored { bytes: 4, checksum: 14793735007222968981 }` — the handler counting a
-/// failed upload as a whole one.
+/// failed upload as a whole one. Replayed against the loop that skips repeated
+/// `Chunk` events: the same `Stored { bytes: 4, checksum: 14793735007222968981 }`.
 #[tokio::test]
 async fn an_unknown_length_source_error_resets_the_receivers_body() {
     let (report, mut progress) = tokio::sync::mpsc::unbounded_channel();
@@ -387,9 +388,15 @@ async fn an_unknown_length_source_error_resets_the_receivers_body() {
             "the handler reads the first chunk before the source fails"
         );
         release.send(()).expect("the source is still waiting");
-        match progress.recv().await {
-            Some(Progress::Done(received)) => received,
-            other => panic!("the handler reports one body outcome, got {other:?}"),
+        // The first read can return the body in more than one chunk, whatever
+        // the transport does with four bytes under load; every `Chunk` before
+        // the outcome is the same fact again.
+        loop {
+            match progress.recv().await {
+                Some(Progress::Chunk) => {}
+                Some(Progress::Done(received)) => break received,
+                None => panic!("the handler reports one body outcome, got none"),
+            }
         }
     };
     let calling = fixture
