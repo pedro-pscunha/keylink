@@ -75,9 +75,14 @@ identity_one="$(mktemp -t keylink-browser-identity-one)"
 identity_two="$(mktemp -t keylink-browser-identity-two)"
 trap 'rm -f "$log" "$identity_one" "$identity_two"' EXIT
 
-AR_wasm32_unknown_unknown="$ar" \
-    cargo test --target wasm32-unknown-unknown -p keylink \
-        --no-default-features --features web --test browser 2>&1 | tee "$log"
+# One suite selection, shared by the full run and the focused fresh instances.
+# The aggregate inventory checks this declaration rather than accepting two
+# copies of a runner that can drift apart.
+browser=(
+    cargo test --target wasm32-unknown-unknown -p keylink
+    --no-default-features --features web --test browser
+)
+AR_wasm32_unknown_unknown="$ar" "${browser[@]}" 2>&1 | tee "$log"
 
 # **The one thing a green exit code here does not prove.**
 #
@@ -107,10 +112,8 @@ fi
 # a clock collision. Watched red with the original time-and-counter mint: both
 # browsers printed identical cursors and the comparison refused them.
 for identity_log in "$identity_one" "$identity_two"; do
-    AR_wasm32_unknown_unknown="$ar" \
-        cargo test --target wasm32-unknown-unknown -p keylink \
-            --no-default-features --features web --test browser \
-            event_log_identity_comes_from_browser_randomness -- --exact --nocapture \
+    AR_wasm32_unknown_unknown="$ar" "${browser[@]}" \
+        event_log_identity_comes_from_browser_randomness -- --exact --nocapture \
             2>&1 | tee "$identity_log"
     grep -qF 'headless tests in Chrome' "$identity_log"
 done
