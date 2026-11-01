@@ -239,3 +239,39 @@ async fn a_connection_admitted_during_a_revocation_is_still_closed() {
     );
     assert_eq!(trust.live(), 0);
 }
+
+#[test]
+fn removing_a_root_never_resurrects_an_accepted_revocation() {
+    let (root, _, chain, _) = fixture();
+    let revoker = SecretKey::from_bytes(&[8; 32]);
+    let trust = Trust::new(Roots::only([root.public(), revoker.public()]).unwrap());
+    trust.insert(chain.clone()).unwrap();
+    let _ = trust.apply(Change::Revoke(Revocation::issue(
+        &revoker,
+        chain.links()[0].id(),
+    )));
+    assert_eq!(
+        trust
+            .verify(&chain, Timestamp::from_unix_secs(1))
+            .unwrap_err(),
+        ChainError::Revoked { at: 0 }
+    );
+    let _ = trust.apply(Change::Roots(Roots::only([root.public()]).unwrap()));
+    assert_eq!(
+        trust
+            .verify(&chain, Timestamp::from_unix_secs(1))
+            .unwrap_err(),
+        ChainError::Revoked { at: 0 }
+    );
+    // Root-authorized revocations are accepted even before their certificate arrives.
+    let early = Trust::new(Roots::only([root.public(), revoker.public()]).unwrap());
+    let _ = early.apply(Change::Revoke(Revocation::issue(
+        &revoker,
+        chain.links()[0].id(),
+    )));
+    let _ = early.apply(Change::Roots(Roots::only([root.public()]).unwrap()));
+    assert_eq!(
+        early.insert(chain).unwrap_err(),
+        ChainError::Revoked { at: 0 }
+    );
+}

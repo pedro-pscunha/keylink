@@ -193,13 +193,13 @@ impl<T: Serialize + DeserializeOwned> Signed<T> {
         roots: &Roots,
         now: Timestamp,
     ) -> Result<Opened<T>, SignedError> {
-        self.open_with(purpose, roots, &Revoked::new(), now)
+        self.open_with(purpose, roots, &mut Revoked::new(), now)
     }
     pub(super) fn open_with(
         &self,
         purpose: &Purpose,
         roots: &Roots,
-        revoked: &Revoked,
+        revoked: &mut Revoked,
         now: Timestamp,
     ) -> Result<Opened<T>, SignedError> {
         self.signer

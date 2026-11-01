@@ -10,7 +10,56 @@ use super::{
     MAX_CHAIN_LINKS,
 };
 
-pub(super) type Revoked = BTreeMap<CertId, BTreeSet<PublicKey>>;
+#[derive(Debug, Clone, Default)]
+pub(super) struct Revoked {
+    pub(super) pending: BTreeMap<CertId, BTreeSet<PublicKey>>,
+    accepted: BTreeSet<CertId>,
+}
+impl Revoked {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+    pub(super) fn add(&mut self, revocation: &super::Revocation, roots: &Roots) {
+        let id = revocation.certificate();
+        if self.accepted.contains(&id) {
+            return;
+        }
+        if roots.contains(&revocation.revoker()) {
+            self.accepted.insert(id);
+            self.pending.remove(&id);
+        } else {
+            self.pending
+                .entry(id)
+                .or_default()
+                .insert(revocation.revoker());
+        }
+    }
+    pub(super) fn trust_roots(&mut self, roots: &Roots) {
+        self.pending.retain(|id, revokers| {
+            if revokers.iter().any(|key| roots.contains(key)) {
+                self.accepted.insert(*id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    fn revokes(&mut self, id: CertId, roots: &Roots, upstream: &BTreeSet<PublicKey>) -> bool {
+        if self.accepted.contains(&id) {
+            return true;
+        }
+        if self.pending.get(&id).is_some_and(|revokers| {
+            revokers
+                .iter()
+                .any(|key| roots.contains(key) || upstream.contains(key))
+        }) {
+            self.accepted.insert(id);
+            self.pending.remove(&id);
+            return true;
+        }
+        false
+    }
+}
 pub(super) const MAX_CHAIN_BYTES: usize = 1 + MAX_CHAIN_LINKS * (MAX_CERTIFICATE + 74);
 
 /// The non-empty set of keys whose chains are believed. There is no "any root".
@@ -67,7 +116,7 @@ impl Chain {
     /// Verify offline, with no revocation knowledge, at an explicit time.
     pub fn verify(&self, roots: &Roots, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(self)?;
-        standing(self, roots, &Revoked::new(), now)?;
+        standing(self, roots, &mut Revoked::new(), now)?;
         Ok(credential)
     }
     /// Canonical postcard wire bytes.
@@ -213,7 +262,7 @@ pub(super) fn structure(chain: &Chain) -> Result<Credential, ChainError> {
 pub(super) fn standing(
     chain: &Chain,
     roots: &Roots,
-    revoked: &Revoked,
+    revoked: &mut Revoked,
     now: Timestamp,
 ) -> Result<(), ChainError> {
     let first = chain.links().first().ok_or(ChainError::Empty)?;
@@ -230,11 +279,7 @@ pub(super) fn standing(
         if now >= link.caveats().validity.not_after() {
             return Err(ChainError::Expired { at });
         }
-        if revoked.get(&link.id()).is_some_and(|revokers| {
-            revokers
-                .iter()
-                .any(|key| roots.contains(key) || upstream.contains(key))
-        }) {
+        if revoked.revokes(link.id(), roots, &upstream) {
             return Err(ChainError::Revoked { at });
         }
     }

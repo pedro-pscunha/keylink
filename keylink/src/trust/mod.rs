@@ -92,8 +92,12 @@ struct Store {
     revoked: Revoked,
 }
 impl Store {
+    fn standing(&mut self, chain: &Chain, now: Timestamp) -> Result<(), ChainError> {
+        standing(chain, &self.roots, &mut self.revoked, now)
+    }
+
     fn credential(
-        &self,
+        &mut self,
         peer: PublicKey,
         now: Timestamp,
         permits: impl Fn(&Credential) -> bool,
@@ -105,7 +109,9 @@ impl Store {
         self.chains
             .get(&peer)?
             .iter()
-            .find(|c| standing(c.chain(), &self.roots, &self.revoked, now).is_ok() && permits(c))
+            .find(|c| {
+                standing(c.chain(), &self.roots, &mut self.revoked, now).is_ok() && permits(c)
+            })
             .cloned()
     }
 }
@@ -143,7 +149,7 @@ impl Trust {
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
-        standing(&chain, &store.roots, &store.revoked, Timestamp::now())?;
+        store.standing(&chain, Timestamp::now())?;
         let chains = store.chains.entry(credential.holder()).or_default();
         if chains.iter().any(|c| {
             c.chain()
@@ -169,8 +175,8 @@ impl Trust {
     /// Verify a chain against this view's roots and revocations at `now`.
     pub fn verify(&self, chain: &Chain, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(chain)?;
-        let store = self.store();
-        standing(chain, &store.roots, &store.revoked, now)?;
+        let mut store = self.store();
+        store.standing(chain, now)?;
         Ok(credential)
     }
     /// Open a forwarded value against this view's roots and revocations.
@@ -184,11 +190,14 @@ impl Trust {
         now: Timestamp,
     ) -> Result<Opened<T>, SignedError> {
         // User-provided serde runs outside the store lock.
-        let (roots, revoked) = {
-            let store = self.store();
+        let (roots, mut revoked) = {
+            let mut store = self.store();
+            // Certificate signatures already verified independently of T. Resolve
+            // pending authority in the shared view before copying it for serde.
+            let _ = store.standing(signed.chain(), now);
             (store.roots.clone(), store.revoked.clone())
         };
-        signed.open_with(purpose, &roots, &revoked, now)
+        signed.open_with(purpose, &roots, &mut revoked, now)
     }
     /// Advisory count of remembered live connections.
     pub fn live(&self) -> usize {
@@ -255,13 +264,22 @@ impl Revocable for Trust {
             let mut store = self.store();
             match change {
                 Change::Revoke(revocation) => {
-                    store
-                        .revoked
-                        .entry(revocation.certificate())
-                        .or_default()
-                        .insert(revocation.revoker());
+                    let roots = store.roots.clone();
+                    store.revoked.add(&revocation, &roots);
+                    let chains: Vec<_> = store
+                        .chains
+                        .values()
+                        .flatten()
+                        .map(|c| c.chain().clone())
+                        .collect();
+                    for chain in chains {
+                        let _ = store.standing(&chain, Timestamp::now());
+                    }
                 }
-                Change::Roots(roots) => store.roots = roots,
+                Change::Roots(roots) => {
+                    store.revoked.trust_roots(&roots);
+                    store.roots = roots;
+                }
                 Change::Expire => {
                     let now = Timestamp::now();
                     store.chains.retain(|_, chains| {
