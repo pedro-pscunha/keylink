@@ -6,7 +6,7 @@
 //! # The stand-in for generated dispatch
 //!
 //! RFC-01 §3.2 puts the grant inside the code the `service!` macro writes for a
-//! `blob` method, so a handler that returns [`Content`] has already granted it.
+//! `blob` method, so a handler that returns a [`Grant`] has already granted it.
 //! That macro kind is a later commit. Until it lands, [`Granting`] below is the
 //! same shape by hand: a real `ProtocolHandler`, a real accept, and a grant
 //! taken from the connection iroh proved — which is the only argument
@@ -30,7 +30,7 @@ use iroh_blobs::protocol::{
 };
 use iroh_blobs::store::mem::MemStore;
 use keylink::{
-    Allowlist, BlobHandle, BlobId, Blobs, Caller, Content, Context, Error, Node, ProvenPeer,
+    Allowlist, BlobHandle, BlobId, Blobs, Caller, Content, Context, Error, Grant, Node, ProvenPeer,
 };
 use n0_future::StreamExt;
 
@@ -1684,7 +1684,7 @@ impl catalog::Handler for Warehouse {
         "pong".to_owned()
     }
 
-    async fn datasheet(&self, _cx: &Context, _sku: String) -> (Manual, Content) {
+    async fn datasheet(&self, _cx: &Context, _sku: String) -> (Manual, Grant) {
         (Manual { pages: 42 }, self.published.into())
     }
 }
@@ -1697,13 +1697,13 @@ impl catalog::Actor for Warehouse {
         "pong".to_owned()
     }
 
-    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (Manual, Content) {
+    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (Manual, Grant) {
         (Manual { pages: 42 }, self.published.into())
     }
 }
 
 impl depot::Handler for Warehouse {
-    async fn parcel(&self, _cx: &Context, _sku: String) -> (Manual, Content) {
+    async fn parcel(&self, _cx: &Context, _sku: String) -> (Manual, Grant) {
         (Manual { pages: 1 }, self.published.into())
     }
 }
@@ -2225,7 +2225,7 @@ async fn a_local_keyed_blob_method_returns_its_address() {
         .await
         .expect("the local keyed actor answers");
     assert_eq!(manual.pages, 42);
-    assert_eq!(returned, Content::Blob(published));
+    assert_eq!(returned.content(), Content::Blob(published));
 }
 
 /// The startup refusal that could not fire before, and now can.
@@ -2305,13 +2305,13 @@ struct Strongroom {
 }
 
 impl vault::Handler for Strongroom {
-    async fn receipt(&self, _cx: &Context, _order: String) -> (Manual, Content) {
+    async fn receipt(&self, _cx: &Context, _order: String) -> (Manual, Grant) {
         self.entered
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (Manual { pages: 7 }, self.receipt.into())
     }
 
-    async fn decoy(&self, _cx: &Context) -> (Manual, Content) {
+    async fn decoy(&self, _cx: &Context) -> (Manual, Grant) {
         (Manual { pages: 0 }, self.decoy.into())
     }
 }
@@ -2502,11 +2502,11 @@ struct Stacks {
 }
 
 impl shelf::Handler for Stacks {
-    async fn snapshot(&self, _cx: &Context) -> (u32, Content) {
+    async fn snapshot(&self, _cx: &Context) -> (u32, Grant) {
         (self.ids.len() as u32, self.seq.into())
     }
 
-    async fn single(&self, _cx: &Context, nth: u64) -> (u32, Content) {
+    async fn single(&self, _cx: &Context, nth: u64) -> (u32, Grant) {
         (nth as u32, self.ids[nth as usize].into())
     }
 }
@@ -2587,7 +2587,7 @@ async fn a_closure_of_5000_members_is_fetched_with_one_grant() {
     let stack = stack(5000).await;
     let (count, handle) = stack.client.snapshot().await.expect("the one call");
     assert_eq!(count, 5000);
-    assert_eq!(handle.content(), Content::Closure(stack.seq));
+    assert_eq!(handle.content(), Content::Closure(stack.seq.id()));
 
     let local = Blobs::memory();
     let moved = handle
@@ -2629,7 +2629,7 @@ async fn a_hash_outside_the_closure_is_refused_like_a_missing_one() {
         address_of(tag.hash)
     };
     cluster
-        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
         .await;
 
     let store = MemStore::new();
@@ -2667,7 +2667,7 @@ async fn a_member_is_reached_through_its_root_and_not_by_its_own_hash() {
     let ids = add_members(&cluster.blobs, 10).await;
     let seq = cluster.blobs.add_seq(ids.clone()).await.expect("stores");
     cluster
-        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
         .await;
 
     let store = MemStore::new();
@@ -2814,7 +2814,7 @@ async fn a_nested_sequence_is_not_covered_by_its_parents_closure() {
     let inner = cluster.blobs.add_seq([secret]).await.expect("stores");
     let outer = cluster.blobs.add_seq([inner.id()]).await.expect("stores");
     cluster
-        .grant_content(&cluster.peer, &[Content::Closure(outer)])
+        .grant_content(&cluster.peer, &[Content::Closure(outer.id())])
         .await;
 
     let store = MemStore::new();
@@ -2912,7 +2912,7 @@ struct Held {
 }
 
 impl turnstile::Handler for Held {
-    async fn held(&self, _cx: &Context) -> (u32, Content) {
+    async fn held(&self, _cx: &Context) -> (u32, Grant) {
         self.entered.notify_one();
         self.release.notified().await;
         (1, self.blob.into())
@@ -3012,7 +3012,7 @@ async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
     let ids = add_members(&cluster.blobs, 4).await;
     let seq = cluster.blobs.add_seq(ids).await.expect("stores");
     cluster
-        .grant_content(&cluster.peer, &[Content::Closure(seq)])
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
         .await;
 
     for offset in [1u64 << 60, u64::MAX - 1] {

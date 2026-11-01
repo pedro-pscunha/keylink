@@ -29,9 +29,7 @@
 use std::error::Error as StdError;
 use std::time::Instant;
 
-use keylink::{
-    Allowlist, BlobId, Blobs, Content, Context, EndpointId, Error, Missing, Node, Server,
-};
+use keylink::{Allowlist, BlobId, Blobs, Context, EndpointId, Error, Grant, Missing, Node, Server};
 use tokio::io::AsyncReadExt;
 
 keylink::service! {
@@ -68,7 +66,7 @@ struct Holder {
 }
 
 impl shelf::Handler for Holder {
-    async fn snapshot(&self, _cx: &Context) -> (u32, Content) {
+    async fn snapshot(&self, _cx: &Context) -> (u32, Grant) {
         (self.count, self.seq.into())
     }
 

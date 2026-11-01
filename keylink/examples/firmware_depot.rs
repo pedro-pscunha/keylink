@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Content, Context, Node, Server,
+    Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Grant, Node, Server,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ struct Depot {
 }
 
 impl depot::Handler for Depot {
-    async fn image(&self, _cx: &Context, channel: String) -> (Release, Content) {
+    async fn image(&self, _cx: &Context, channel: String) -> (Release, Grant) {
         let (version, id) = match channel.as_str() {
             "beta" => (91, self.beta),
             _ => (90, self.stable),

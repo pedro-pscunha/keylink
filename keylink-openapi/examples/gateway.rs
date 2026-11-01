@@ -83,7 +83,7 @@ impl inventory::Handler for Warehouse {
         )
     }
 
-    async fn datasheet(&self, _cx: &Context, _sku: String) -> (u64, keylink::Content) {
+    async fn datasheet(&self, _cx: &Context, _sku: String) -> (u64, keylink::Grant) {
         (self.sheet.1, self.sheet.0.into())
     }
 
@@ -111,7 +111,7 @@ impl bays::Actor for Bay {
         )
     }
 
-    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (u64, keylink::Content) {
+    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (u64, keylink::Grant) {
         (self.sheet.1, self.sheet.0.into())
     }
 }

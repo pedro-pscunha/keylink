@@ -64,7 +64,7 @@
 use std::error::Error as StdError;
 
 use keylink::{
-    Allowlist, BlobId, BlobReader, Blobs, Body, Content, Context, Node, Retention, Server,
+    Allowlist, BlobId, BlobReader, Blobs, Body, Context, Grant, Node, Retention, Server,
 };
 
 keylink::service! {
@@ -83,7 +83,7 @@ struct Archive {
 }
 
 impl archive::Handler for Archive {
-    async fn reel(&self, _cx: &Context, _name: String) -> (u64, Content) {
+    async fn reel(&self, _cx: &Context, _name: String) -> (u64, Grant) {
         (self.reel.1, self.reel.0.into())
     }
 

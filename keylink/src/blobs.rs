@@ -29,7 +29,7 @@
 //! per service while blobs is per node, so several services give one node
 //! several answers to "who may connect".
 //!
-//! Instead: returning [`Content`] to a peer records a grant for that exact
+//! Instead: returning a [`Grant`] to a peer records a grant for that exact
 //! `(peer, root)` pair, and a blobs request is admitted only against a grant.
 //! Every entry was therefore created by an RPC that already passed that
 //! service's allowlist and its layers, so the ledger composes across services
@@ -45,6 +45,11 @@
 //! the holder's own copy of the root lists and a request names offsets, never
 //! hashes. A member asked for by its own hash is refused unless it was granted
 //! on its own.
+//!
+//! A `SeqId` has no constructor but [`Blobs::add_seq`] and cannot be deserialized,
+//! and a handler returns a [`Grant`] rather than the deserializable [`Content`],
+//! so a peer cannot name a closure: the only ones a handler can grant are
+//! sequences this node built.
 //!
 //! A closure is one level deep. A listed sequence that is itself a sequence is
 //! served as bytes, and its members are not covered: build one flat sequence
@@ -209,19 +214,26 @@ impl std::fmt::Debug for BlobId {
     }
 }
 
-/// The address of a hash sequence this store built, or one a peer handed over.
+/// The address of a hash sequence this store built.
 ///
 /// A hash sequence is its members' addresses laid end to end and stored as one
-/// blob, the way iroh-blobs stores a collection. Granting one as
-/// [`Content::Closure`] grants every blob it lists.
+/// blob, the way iroh-blobs stores a collection. Handing one back as a
+/// [`Grant`] grants every blob it lists.
 ///
-/// **Level 2, honestly labelled**, exactly like [`BlobId`]: the field is private
-/// and the only constructors are [`Blobs::add_seq`] and `Deserialize`. That is
-/// provenance, not an invariant. It stops `Content::Closure(uploaded_blob)` from
-/// compiling, which is the accidental way to grant a closure over bytes a peer
-/// chose, and it does not stop a handler that builds a sequence from hashes a
-/// peer supplied. See [`Blobs::add_seq`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema)]
+/// # It cannot arrive off the wire
+///
+/// The only constructor is [`Blobs::add_seq`]. There is no `Deserialize` and no
+/// `Schema`, so a handler cannot take one as an argument, and a peer cannot name
+/// one. That is the boundary this type exists for: a grant over a sequence is
+/// reachable only from a sequence this node built, from members its code chose.
+/// What a peer sends is a plain [`BlobId`], and it stays a `Blob`. It does not
+/// stop a handler that builds a sequence from hashes a peer supplied, because
+/// each listed member is still an authorization nobody reviewed. See
+/// [`Blobs::add_seq`].
+///
+/// The first version of this type could be deserialized, and a handler taking
+/// one as an argument could grant a closure over bytes a peer had just uploaded.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SeqId(BlobId);
 
 impl SeqId {
@@ -245,7 +257,12 @@ impl std::fmt::Debug for SeqId {
     }
 }
 
-/// What a `blob` method hands out, and so what the caller may fetch.
+/// What a reply tells the caller it may fetch.
+///
+/// This is the **wire** value: the caller reads it off a reply
+/// ([`BlobHandle::content`]) and may build one to spend
+/// ([`BlobHandle::new`]). Holding one grants nothing, which is why it can be
+/// deserialized. What a handler returns to grant something is a [`Grant`].
 ///
 /// # Exhaustive, on purpose
 ///
@@ -256,9 +273,9 @@ impl std::fmt::Debug for SeqId {
 pub enum Content {
     /// One blob: its bytes, and nothing they name.
     Blob(BlobId),
-    /// A hash sequence and every blob it lists, one level deep. Nested
-    /// sequences are not followed.
-    Closure(SeqId),
+    /// The root of a hash sequence, and every blob it lists, one level deep.
+    /// Nested sequences are not followed.
+    Closure(BlobId),
 }
 
 impl Content {
@@ -267,8 +284,7 @@ impl Content {
     #[must_use]
     pub fn root(&self) -> BlobId {
         match self {
-            Self::Blob(id) => *id,
-            Self::Closure(seq) => seq.id(),
+            Self::Blob(id) | Self::Closure(id) => *id,
         }
     }
 }
@@ -281,7 +297,39 @@ impl From<BlobId> for Content {
 
 impl From<SeqId> for Content {
     fn from(seq: SeqId) -> Self {
-        Self::Closure(seq)
+        Self::Closure(seq.id())
+    }
+}
+
+/// What a `blob` handler returns to grant something to the caller.
+///
+/// A [`BlobId`] grants that one blob, and a [`SeqId`] grants the sequence and
+/// every blob it lists. Both convert with `.into()`, and nothing else does.
+///
+/// **Not [`Content`], on purpose.** `Content` is deserializable, so a handler
+/// could take one as an argument and return it, which would let a peer choose a
+/// closure. A `Grant` has no serde and no constructor from `Content`, so the
+/// only closures a handler can grant are ones [`Blobs::add_seq`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grant(Content);
+
+impl Grant {
+    /// What the caller will be told it may fetch.
+    #[must_use]
+    pub fn content(&self) -> Content {
+        self.0
+    }
+}
+
+impl From<BlobId> for Grant {
+    fn from(id: BlobId) -> Self {
+        Self(Content::Blob(id))
+    }
+}
+
+impl From<SeqId> for Grant {
+    fn from(seq: SeqId) -> Self {
+        Self(Content::Closure(seq.id()))
     }
 }
 

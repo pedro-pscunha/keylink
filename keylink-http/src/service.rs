@@ -263,7 +263,7 @@ mod tests {
             (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
         }
 
-        async fn asset(&self, _cx: &Context) -> (u64, keylink::Content) {
+        async fn asset(&self, _cx: &Context) -> (u64, keylink::Grant) {
             (7, self.id.into())
         }
 
@@ -378,7 +378,7 @@ mod tests {
             (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
         }
 
-        async fn asset(&mut self, _cx: keylink::Caller<'_>) -> (u64, keylink::Content) {
+        async fn asset(&mut self, _cx: keylink::Caller<'_>) -> (u64, keylink::Grant) {
             (7, self.id.into())
         }
     }

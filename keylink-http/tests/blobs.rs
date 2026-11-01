@@ -9,7 +9,7 @@
 use axum::{middleware, response::Response, Router};
 use http::Request;
 use iroh::{endpoint::presets, Endpoint};
-use keylink::{Allowlist, BlobId, Blobs, Content, Context, Node};
+use keylink::{Allowlist, BlobId, Blobs, Context, Grant, Node};
 use keylink_http::{
     Access, AccessError, Addressing, Call, Challenge, Gateway, HttpSurface, Principal,
     StreamingLimits,
@@ -40,12 +40,12 @@ struct Handler {
 }
 
 impl vault::Handler for Handler {
-    async fn fetch(&self, _cx: &Context, name: String) -> (u64, Content) {
+    async fn fetch(&self, _cx: &Context, name: String) -> (u64, Grant) {
         let (id, size) = self.known.get(&name).copied().expect("a known name");
         (size, id.into())
     }
 
-    async fn absent(&self, cx: &Context, name: String) -> (u64, Content) {
+    async fn absent(&self, cx: &Context, name: String) -> (u64, Grant) {
         self.fetch(cx, name).await
     }
 }

@@ -1446,3 +1446,11 @@ another peer was busy.
   not to the method's name. One kind returns `Content`.
 - **Expiring idle grants.** It drops capabilities silently, it needs a sweep, and with
   explicit revocation and a budget that fails loudly it buys nothing.
+
+### 13.5 Corrections found at the merge gate
+
+Appended. The text above stays as it was written; these are the places where it was wrong.
+
+**13.5.1 `SeqId` did not stop a peer choosing a closure.** §13.3 says `SeqId` "stops the accidental form (a closure over uploaded bytes)". It did not. `SeqId` derived `Deserialize`, so a handler that took a `SeqId` as an argument and returned it granted a closure over whatever bytes the peer had uploaded, with no call to `Blobs::add_seq`. The same was true of `Content`, which is deserializable because the caller reads it off every reply.
+
+The shape that replaced it: `SeqId` has no serde and no `Schema`, and its only constructor is `Blobs::add_seq`. `Content` is the wire value and is `Content::Blob(BlobId)` or `Content::Closure(BlobId)`, where naming a closure grants nothing. A handler returns a `Grant`, which converts from a `BlobId` or a `SeqId` and from nothing else, so the only closures a handler can grant are sequences this node built. The conversions that would reopen it are probed at compile time in `representability.rs`. What it still does not stop is a handler building a sequence from hashes a peer supplied; that is the first risk in §13.3 and is unchanged.

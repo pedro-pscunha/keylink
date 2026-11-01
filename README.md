@@ -145,14 +145,14 @@ A body that ends early is an error, never a short file.
 
 ### Content addressing
 
-A `blob` method returns `Content`; iroh-blobs moves the bytes, with verified
+A `blob` method returns a `Grant`; iroh-blobs moves the bytes, with verified
 resume and deduplication. keylink owns the mount, because the mount iroh-blobs'
 own documentation teaches serves every hash to every peer and accepts writes.
-Returning content to a peer records a grant for that exact `(peer, root)` pair,
+Returning a grant to a peer records it for that exact `(peer, root)` pair,
 and a blobs request is admitted only against a grant — so every entry was
 created by an RPC that already passed its service's allowlist and layers.
 
-`Content` is one blob (`id.into()`) or a closure (`seq.into()`). A closure is a
+A `Grant` is one blob (`id.into()`) or a closure (`seq.into()`). A closure is a
 hash sequence built with `Blobs::add_seq`, and it is **one** grant that covers
 the sequence and every blob it lists, however many that is. The peer reaches a
 member through the root, by position; a member asked for by its own hash is
@@ -463,7 +463,7 @@ the signature.
 It carries `rpc` and none of the other four kinds, because `rpc` is the only kind
 all four surfaces declare: an `ActorRef` and an `IdempotentClient` have no `tell`,
 a `Handle` has no `send` or `recv`, `ActorRef` has no validly servable `send`,
-and `blob` answers a `Content` locally
+and `blob` answers a `Grant` locally
 against a `BlobHandle` — a content address plus the node that holds it —
 remotely. One behaviour diverges across the bound, and it is documented rather
 than papered over: a handler panic **unwinds into the calling task** against a

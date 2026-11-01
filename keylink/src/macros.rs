@@ -30,7 +30,7 @@
 /// | `rpc`  | `async fn f(&self, a: A) -> R`           | `f(a) -> R`                           |
 /// | `send` | `async fn f(&self, a: A, b: BodyReader) -> R` | `f(a, body: Body) -> R`          |
 /// | `recv` | `async fn f(&self, a: A) -> (R, Body)`   | `f(a) -> (R, BodyReader)`             |
-/// | `blob` | `async fn f(&self, a: A) -> (R, Content)` | `f(a) -> (R, BlobHandle)`            |
+/// | `blob` | `async fn f(&self, a: A) -> (R, Grant)`   | `f(a) -> (R, BlobHandle)`            |
 ///
 /// ## Picking between `recv` and `blob`
 ///
@@ -42,7 +42,7 @@
 ///
 /// A service with a `blob` method must be given a store —
 /// `service(..).with_blobs(&blobs)` — or [`ServerBuilder::spawn`](crate::ServerBuilder::spawn)
-/// refuses it at startup. Returning the [`Content`](crate::Content) is what
+/// refuses it at startup. Returning the [`Grant`](crate::Grant) is what
 /// grants it to the caller: a [`BlobId`](crate::BlobId) grants that one blob, and
 /// a [`SeqId`](crate::SeqId) grants the sequence and every blob it lists. No
 /// other peer can fetch it, and nothing else in the store becomes reachable.
@@ -7618,7 +7618,7 @@ macro_rules! __keylink_service {
             ///   generated service declaring one is rejected by the actor-serving
             ///   doors because upload reads would hold the serial turn.
             /// - **`blob`** — all four have one and they do not agree on the
-            ///   answer. A `Handle` gives a [`Content`](keylink::Content); a served
+            ///   answer. A `Handle` gives a [`Grant`](keylink::Grant); a served
             ///   surface gives a [`BlobHandle`](keylink::BlobHandle), which is a
             ///   content address **plus the node that holds it**, and in this
             ///   process the holder is you.
@@ -8757,7 +8757,7 @@ macro_rules! __keylink_handler_method {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning the address of content this node already holds.")]
         ///
-        /// Returning the [`Content`](keylink::Content) IS the grant: the
+        /// Returning the [`Grant`](keylink::Grant) IS the grant: the
         /// generated dispatch records it against the peer that asked, so the
         /// handler names no ledger and there is no call to forget. A
         /// [`BlobId`](keylink::BlobId) (`id.into()`) grants that one blob, and a
@@ -8766,7 +8766,7 @@ macro_rules! __keylink_handler_method {
         /// answers [`GrantsExhausted`](keylink::RemoteError::GrantsExhausted)
         /// instead when the grant ledger is at its byte budget.
         fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*)
-            -> impl ::core::future::Future<Output = ($ret, $crate::Content)> + Send;
+            -> impl ::core::future::Future<Output = ($ret, $crate::Grant)> + Send;
     };
 }
 
@@ -8846,8 +8846,8 @@ macro_rules! __keylink_invoke_fn {
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
-            let (value, id) = handler.$method(cx $(, $arg )*).await;
-            ($resp::$variant((value, id)), $crate::Body::empty())
+            let (value, grant) = handler.$method(cx $(, $arg )*).await;
+            ($resp::$variant((value, grant.content())), $crate::Body::empty())
         }
     };
 }
@@ -8922,7 +8922,7 @@ macro_rules! __keylink_mail_answer {
         ($ret, $crate::Body)
     };
     (blob, $ret:ty) => {
-        ($ret, $crate::Content)
+        ($ret, $crate::Grant)
     };
 }
 
@@ -9125,8 +9125,8 @@ macro_rules! __keylink_served_arm {
             move |__from: $crate::Origin, __on: &mut $actor| {
                 ::std::boxed::Box::pin(async move {
                     ::core::mem::drop($body);
-                    let (__value, __id) = __on.$method(__from.caller() $(, $arg )*).await;
-                    ($resp::$variant((__value, __id)), $crate::Body::empty())
+                    let (__value, __grant) = __on.$method(__from.caller() $(, $arg )*).await;
+                    ($resp::$variant((__value, __grant.content())), $crate::Body::empty())
                 })
             },
         )
@@ -9309,7 +9309,7 @@ macro_rules! __keylink_actor_method {
         /// and the bytes move later on the blobs connection. So
         /// [`abort`](keylink::Registry::abort) has nothing here to truncate.
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
-            -> impl ::core::future::Future<Output = ($ret, $crate::Content)> + Send;
+            -> impl ::core::future::Future<Output = ($ret, $crate::Grant)> + Send;
     };
 }
 
@@ -9460,7 +9460,7 @@ macro_rules! __keylink_keyed_local_method {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` blob rpc on this actor in this process.")]
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<($ret, $crate::Content), $crate::LocalError> {
+            -> ::core::result::Result<($ret, $crate::Grant), $crate::LocalError> {
             self.system
                 .__local_ask(&self.actor, move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9608,7 +9608,7 @@ macro_rules! __keylink_local_method {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, returning the address of the content it named.")]
         ///
-        /// A [`Content`](keylink::Content), not a
+        /// A [`Grant`](keylink::Grant), not a
         /// [`BlobHandle`](keylink::BlobHandle): a handle is an address plus the
         /// node that holds it, and in this process the holder is you. No grant
         /// is recorded either, because a grant is permission for a *peer* and
@@ -9620,7 +9620,7 @@ macro_rules! __keylink_local_method {
         /// answers, for the same reasons: this goes through the same `ask`, and
         /// the blob is written by the turn rather than after it.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<($ret, $crate::Content), $crate::Unanswered> {
+            -> ::core::result::Result<($ret, $crate::Grant), $crate::Unanswered> {
             self.inner
                 .ask(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9738,7 +9738,7 @@ macro_rules! __keylink_permit_method {
         /// through the same door, and the blob is written by the turn rather than
         /// after it.
         pub async fn $name(self $(, $arg: $ty )*)
-            -> ::core::result::Result<($ret, $crate::Content), $crate::Unanswered> {
+            -> ::core::result::Result<($ret, $crate::Grant), $crate::Unanswered> {
             self.inner
                 .ask(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9872,7 +9872,7 @@ macro_rules! __keylink_client_method {
 /// the `tell` arms of [`__keylink_actor_client_method`] and
 /// [`__keylink_idempotent_client_method`], the `send` and `recv` comment in
 /// [`__keylink_local_method`], and — for `blob`, which every surface HAS — the
-/// [`Content`](crate::Content) a local call answers where a served one answers a
+/// [`Grant`](crate::Grant) a local call answers where a served one answers a
 /// [`BlobHandle`](crate::BlobHandle). The generated trait's own rustdoc names
 /// all four for a reader who cannot find a method on it.
 #[doc(hidden)]
@@ -10177,7 +10177,7 @@ mod expansion {
                 &mut self,
                 _cx: crate::Caller<'_>,
                 _sku: String,
-            ) -> (u64, crate::Content) {
+            ) -> (u64, crate::Grant) {
                 unreachable!("never called; this module only has to compile")
             }
             // No `Caller` and no return, which is the whole shape of a feed
