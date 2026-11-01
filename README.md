@@ -166,14 +166,18 @@ read, and never hashes a peer supplied.
 the members the store lacks, 4096 members per request. `Blobs::missing` (and
 `handle.missing(&store)`) answer what that is, from the fetcher's own store.
 
-A closure lists at most `MAX_CLOSURE_MEMBERS` (262,144) members, and both ends
-hold the line. The fetcher checks the root's size, which the holder proves with
-the last chunk, before it downloads or plans anything, and refuses a longer one
-or one that is not a whole number of addresses with `BlobFault::TooManyMembers`
-or `NotASequence`. The holder refuses a request that starts a run of offsets
-past it, because a request can name an offset near `u64::MAX` in a few bytes;
-that bounds where a run begins and not where it ends, so an open-ended request
-for a whole closure passes.
+A closure has no limit on how many members it lists. The fetcher plans each
+window of 4096 members from that slice of the root alone, so what it holds in
+memory is a window's, and a window's request has at most 4096 entries, far under
+iroh-blobs' message limit (a compile-time check). The root is checked for a whole
+number of addresses before it is downloaded, from the size the holder proves with
+the last chunk (`BlobFault::NotASequence`). The holder refuses a request whose
+furthest run starts past the members the root lists, read from the root's size
+(one metadata read), because a request can name an offset near `u64::MAX` in a
+few bytes and iroh-blobs walks offsets one at a time. A run that starts at a
+member and goes on is fine, so an open-ended request for a whole closure passes.
+`Missing` has no serde, so no rpc carries a list of what a store lacks to a peer
+unless a handler converts it by hand.
 
 A grant lasts until it is revoked. `Blobs::revoke(peer, root)` and
 `Blobs::revoke_everywhere(root)` refuse the next request; a request already
@@ -184,15 +188,15 @@ call whose handler was already running when it landed
 fetcher. Remove a peer from admission first, then call `revoke_peer`:
 removing it from an allowlist does not touch its blob grants.
 
-The ledger is bounded in bytes, not in grants: `GRANT_BUDGET` is 64 MiB by
-default and `Blobs::set_grant_budget` changes it. A grant past the budget is
-answered `RemoteError::GrantsExhausted`, and nothing is evicted to make room.
-The budget bounds entries times a per-entry cost (`GRANT_COST`, `PEER_COST`)
-derived from type sizes. Each table is charged for the most entries it has held
-since it was last rebuilt, and is rebuilt (which lowers the charge) when it falls
-to under half that, so a revoke refunds only what is really given back. It does
-not bound the allocator's own overhead or the smallest tables. Grants die with
-the process.
+The ledger holds at most `GRANT_LIMIT` grants (524,288) across every peer, and
+`Blobs::set_grant_limit` changes it. A grant past the limit is answered
+`RemoteError::GrantsExhausted { limit }`, and nothing is evicted to make room. A
+peer has an entry only while it holds a grant, so one count bounds both tables,
+and a table is rebuilt when its length falls under half the most it has held, so
+what a revoke leaves allocated stays bounded. The limit is about 64 MiB at the
+measured cost, `grant_allocation` counting the heap: 64.2 bytes per grant filling
+to 100,000, and at worst 128.5 under trade-one-for-one churn, on aarch64 macOS.
+Grants die with the process.
 
 The [`closure_share`](keylink/examples/closure_share.rs) example runs it end to
 end, in one process or between two machines.

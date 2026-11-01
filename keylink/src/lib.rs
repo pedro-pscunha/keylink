@@ -257,7 +257,7 @@ pub use admission::{Admission, Admittance, DynamicAdmission, Refusal, Revocable,
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{
     BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Grant, Granting, Missing,
-    Retention, SeqId, GRANT_BUDGET, GRANT_COST, MAX_CLOSURE_MEMBERS, PEER_COST,
+    Retention, SeqId, GRANT_LIMIT,
 };
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};

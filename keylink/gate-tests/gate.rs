@@ -4,9 +4,10 @@
 //! endpoint cleanup to process teardown, so that repeats the same two-second drain
 //! for every file. Keeping the modules in one libtest process pays it once.
 //!
-//! Five suites stay separate: `actor_memory` and `mailbox_latency` use process-wide
-//! measurements, `drift` runs nested Cargo builds, `keyed_topic_allocation` owns a
-//! process-global allocator, and `reliable` needs process-level scheduling isolation.
+//! Six suites stay separate: `actor_memory` and `mailbox_latency` use process-wide
+//! measurements, `drift` runs nested Cargo builds, `keyed_topic_allocation` and
+//! `grant_allocation` own a process-global allocator, and `reliable` needs
+//! process-level scheduling isolation.
 //! `browser` is a wasm-only target. `every_test_file_is_in_the_gate` makes this
 //! list and both isolated runner selections fail closed when a file is added.
 
@@ -58,6 +59,7 @@ fn every_test_file_is_in_the_gate() {
     const NATIVE_SEPARATE: &[&str] = &[
         "actor_memory",
         "drift",
+        "grant_allocation",
         "keyed_topic_allocation",
         "mailbox_latency",
         "reliable",

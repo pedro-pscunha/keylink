@@ -124,19 +124,19 @@ fn challenge() -> Challenge {
 }
 
 async fn start_with(limits: StreamingLimits) -> Running {
-    start_with_grant_budget(limits, None).await
+    start_with_grant_limit(limits, None).await
 }
 
-/// The same, over a store whose grant ledger holds `budget` bytes.
-async fn start_with_grant_budget(
+/// The same, over a store whose grant ledger holds `limit` grants.
+async fn start_with_grant_limit(
     limits: StreamingLimits,
-    budget: Option<std::num::NonZeroUsize>,
+    limit: Option<std::num::NonZeroUsize>,
 ) -> Running {
     let server_node = local_node().await;
     let client_node = local_node().await;
     let blobs = Blobs::memory();
-    if let Some(budget) = budget {
-        blobs.set_grant_budget(budget);
+    if let Some(limit) = limit {
+        blobs.set_grant_limit(limit);
     }
     let content = payload(SPANNING);
 
@@ -641,7 +641,7 @@ async fn blob_lookup_returns_exact_value_location_and_no_fetch() {
 /// gateway reports it as one (`503 upstream_unavailable`, as for the other
 /// capacity refusals) and not as a broken upstream (`502`).
 ///
-/// The budget holds exactly one grant for the gateway's one peer. The first
+/// The limit is one grant, and the gateway has one peer. The first
 /// lookup takes it; the second is a different blob and does not fit.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK60`) by replacing
@@ -650,9 +650,8 @@ async fn blob_lookup_returns_exact_value_location_and_no_fetch() {
 /// catch-all and the second lookup is a `502`.
 #[tokio::test]
 async fn a_full_grant_ledger_is_a_503_and_not_a_502() {
-    let one_grant =
-        std::num::NonZeroUsize::new(keylink::PEER_COST + keylink::GRANT_COST).expect("non-zero");
-    let running = start_with_grant_budget(limits(), Some(one_grant)).await;
+    let one_grant = std::num::NonZeroUsize::new(1).expect("non-zero");
+    let running = start_with_grant_limit(limits(), Some(one_grant)).await;
 
     let first = running.lookup("datasheet").await;
     assert_eq!(

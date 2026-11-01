@@ -2864,14 +2864,13 @@ async fn a_nested_sequence_is_not_covered_by_its_parents_closure() {
     );
 }
 
-/// The budget refuses loudly and evicts nothing.
+/// The limit refuses loudly and evicts nothing.
 #[tokio::test]
-async fn a_grant_past_the_budget_answers_grants_exhausted_and_evicts_nothing() {
+async fn a_grant_past_the_limit_answers_grants_exhausted_and_evicts_nothing() {
     let stack = stack(4).await;
-    let budget = keylink::PEER_COST + 2 * keylink::GRANT_COST;
     stack
         .blobs
-        .set_grant_budget(std::num::NonZeroUsize::new(budget).expect("non-zero"));
+        .set_grant_limit(std::num::NonZeroUsize::new(2).expect("non-zero"));
 
     let (_, first) = stack.client.single(0).await.expect("fits");
     let (_, second) = stack.client.single(1).await.expect("fits");
@@ -2883,7 +2882,7 @@ async fn a_grant_past_the_budget_answers_grants_exhausted_and_evicts_nothing() {
     assert!(
         matches!(
             error,
-            Error::Remote(keylink::RemoteError::GrantsExhausted { budget: met }) if met == budget as u64
+            Error::Remote(keylink::RemoteError::GrantsExhausted { limit: 2 })
         ),
         "expected GrantsExhausted, got {error:?}"
     );
@@ -2997,6 +2996,10 @@ async fn a_peer_revoke_lands_on_a_call_whose_handler_is_still_running() {
 /// one at a time before it looks at the sequence, so a closure grant that
 /// admitted it would hold a thread of the holder for good.
 ///
+/// The holder reads the root's own size, once, and refuses a request whose
+/// furthest run starts past the members the root lists: here a root of four
+/// members, so offset 4 (member 3) is served and offset 5 is not.
+///
 /// Sent as raw bytes, because iroh-blobs' own client walks the same offsets
 /// before it sends, and so does the request builder. The holder must answer
 /// with a refusal and not with silence.
@@ -3006,11 +3009,11 @@ async fn a_peer_revoke_lands_on_a_call_whose_handler_is_still_running() {
 /// single-threaded runtime, and on a multi-threaded one it still keeps the
 /// runtime from shutting down after the timeout has panicked. Watched that way
 /// with `scripts/break-once.sh` (row `HK56`), replacing
-/// `if starts_run_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {`
-/// with `if false {` in `keylink/src/blobs.rs`: the run was still going after
-/// two minutes and was ended by its process id. The unit test
-/// `a_closure_request_for_a_far_offset_is_refused_without_walking_to_it` is
-/// the one that goes red cleanly. The wait below asserts nothing about time.
+/// `size.is_multiple_of(32) && furthest <= size / 32`
+/// with `true` in `keylink/src/blobs.rs`: the run was still going after two
+/// minutes and was ended by its process id. The unit test
+/// `a_root_lists_an_offset_only_if_it_has_that_many_members` is the one that
+/// goes red cleanly. The wait below asserts nothing about time.
 #[tokio::test]
 async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
     let cluster = cluster().await;
@@ -3020,7 +3023,12 @@ async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
         .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
         .await;
 
-    for offset in [1u64 << 60, u64::MAX - 1] {
+    for (offset, served) in [
+        (4u64, true),
+        (5, false),
+        (1 << 60, false),
+        (u64::MAX - 1, false),
+    ] {
         let wire = postcard::to_stdvec(&vec![(offset, vec![0u64]), (1u64, Vec::<u64>::new())])
             .expect("encodes the runs");
         let ranges: ChunkRangesSeq = postcard::from_bytes(&wire).expect("a valid sparse request");
@@ -3036,80 +3044,12 @@ async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
         let answer = tokio::time::timeout(Duration::from_secs(60), recv.read_to_end(1 << 20))
             .await
             .expect("the holder answered instead of walking to the offset");
-        assert!(
-            answer.is_err(),
-            "offset {offset} must be refused, got {answer:?}"
+        assert_eq!(
+            answer.is_ok(),
+            served,
+            "offset {offset}: served is {served}, got {answer:?}"
         );
     }
-}
-
-// ═══════════════════════════════════════ a holder cannot make the fetcher plan without end
-
-/// Review finding 6. The member list is the holder's to make as long as it likes
-/// and the fetcher's memory pays for planning around it. A valid root one
-/// member past the limit is refused before it is downloaded or planned, by
-/// `missing` and by `fetch_into`, and nothing lands in the store.
-///
-/// Watched red with `scripts/break-once.sh` (row `HK58`) by replacing
-/// `count_members(self.id(), size)?;`
-/// with `let _ = size;` in `keylink/src/blobs.rs`: the root is then downloaded
-/// before it is judged, and the last assertion fails with `answers:
-/// BlobUnverified { .. TooManyMembers { members: 262145, limit: 262144 } }`,
-/// which is the store refusing to plan around a root it should never have held.
-/// (The first version of this test went red on that line for real:
-/// `BlobHandle::missing` still fetched the root unchecked.)
-#[tokio::test]
-async fn a_root_listing_more_members_than_the_limit_is_refused_before_it_is_downloaded() {
-    let cluster = cluster().await;
-    // Members the holder does not even hold: the list alone is the attack, and
-    // it is a valid sequence, so every byte of it verifies.
-    let listed = (0..=keylink::MAX_CLOSURE_MEMBERS as u32).map(|nth| {
-        let mut bytes = [0u8; 32];
-        bytes[..4].copy_from_slice(&nth.to_le_bytes());
-        address_of(iroh_blobs::Hash::from(bytes))
-    });
-    let seq = cluster
-        .blobs
-        .add_seq(listed)
-        .await
-        .expect("stores the list");
-    cluster
-        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
-        .await;
-    let handle = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), seq);
-    let local = Blobs::memory();
-
-    for (what, error) in [
-        (
-            "missing",
-            handle.missing(&local).await.expect_err("too long"),
-        ),
-        (
-            "fetch_into",
-            handle
-                .fetch_into(&local)
-                .await
-                .map(drop)
-                .expect_err("too long"),
-        ),
-    ] {
-        assert!(
-            matches!(
-                error,
-                Error::BlobUnverified {
-                    fault: keylink::BlobFault::TooManyMembers { members, limit },
-                    ..
-                } if members == keylink::MAX_CLOSURE_MEMBERS as u64 + 1
-                    && limit == keylink::MAX_CLOSURE_MEMBERS as u64
-            ),
-            "{what}: expected TooManyMembers, got {error:?}"
-        );
-    }
-    assert_eq!(
-        local.missing(handle.content()).await.expect("answers"),
-        keylink::Missing::All,
-        "the root was never downloaded"
-    );
 }
 
 /// Review finding 7. `fetch_into` used to succeed for a root that is not a
@@ -3304,4 +3244,80 @@ async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds()
         local.missing(handle.content()).await.expect("answers"),
         keylink::Missing::Nothing
     );
+}
+
+// ═══════════════════════════════════════ a closure with no member cap
+
+/// The biggest closure the suite fetches: 300,000 tiny distinct members, of
+/// which the fetcher already holds every other one, so every window has a gap
+/// after every member it lacks. A closure has no length limit; what bounds the
+/// fetch is that each window of 4096 members is planned from its own slice of
+/// the list and its request has at most 4096 entries.
+///
+/// The fetcher is asked, from its own store, what it lacks (150,000 members,
+/// scattered), fetches exactly those, and ends with `Missing::Nothing`.
+///
+/// Watched red before it went green, in a scratch copy of the tree before
+/// closures were fetched a window at a time, which asked for the whole closure
+/// in one request: `fetch_into` failed with `BlobRefused` (the holder refused a
+/// request whose runs start past the limit it then had on closure size). With
+/// that limit lifted and the windows planned from their own slice it passes.
+#[tokio::test]
+async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
+    const MEMBERS: u32 = 300_000;
+    let cluster = cluster().await;
+
+    let mut ids = Vec::with_capacity(MEMBERS as usize);
+    for nth in 0..MEMBERS {
+        ids.push(
+            cluster
+                .blobs
+                .add_bytes(nth.to_le_bytes().to_vec())
+                .await
+                .expect("stores"),
+        );
+    }
+    let seq = cluster
+        .blobs
+        .add_seq(ids.clone())
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+    let handle = BlobHandle::new(
+        &cluster.peer,
+        cluster.server.endpoint().addr(),
+        Content::Closure(seq.id()),
+    );
+
+    // The fetcher holds every even member, so it lacks every odd one.
+    let local = Blobs::memory();
+    for nth in (0..MEMBERS).step_by(2) {
+        local
+            .add_bytes(nth.to_le_bytes().to_vec())
+            .await
+            .expect("stores");
+    }
+    let lacking: Vec<BlobId> = ids.iter().copied().skip(1).step_by(2).collect();
+    assert_eq!(
+        handle
+            .missing(&local)
+            .await
+            .expect("fetches the list, answers"),
+        keylink::Missing::Members(lacking),
+        "every odd member, in order"
+    );
+
+    let moved = handle.fetch_into(&local).await.expect("fetches the rest");
+    assert_eq!(
+        moved,
+        u64::from(MEMBERS / 2) * 4,
+        "the odd members, 4 bytes each"
+    );
+    assert_eq!(
+        handle.missing(&local).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
 }

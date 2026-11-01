@@ -446,7 +446,7 @@ mod tests {
                 GatewayError::UpstreamUnavailable,
             ),
             (
-                Error::Remote(RemoteError::GrantsExhausted { budget: 7 }),
+                Error::Remote(RemoteError::GrantsExhausted { limit: 7 }),
                 GatewayError::UpstreamUnavailable,
             ),
             (
