@@ -17,6 +17,7 @@ use keylink::{
 };
 use std::borrow::Cow;
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 keylink::service! {
     service Archive;
@@ -36,6 +37,7 @@ keylink::service! {
     rpc Revoke(record: Vec<u8>) -> bool;
 }
 struct Setup {
+    serial: AtomicU64,
     root: SecretKey,
     trust: Trust,
 }
@@ -63,7 +65,9 @@ impl setup::Handler for Setup {
         // Fixed demo middle key, never an application identity or persisted secret.
         let user = SecretKey::from_bytes(&[42; 32]);
         let result = (|| -> Result<_, Box<dyn StdError>> {
-            let first = Certificate::issue(&self.root, delegation(user.public(), "repo", 1)?)?;
+            let mut parent = delegation(user.public(), "repo", 1)?;
+            parent.serial = self.serial.fetch_add(1, Ordering::Relaxed);
+            let first = Certificate::issue(&self.root, parent)?;
             let revocation = Revocation::issue(&self.root, first.id());
             let chain =
                 Chain::new(vec![first]).delegate(&user, delegation(cx.peer(), "repo/a", 0)?)?;
@@ -103,7 +107,17 @@ fn serve(node: &Node) -> Result<Server, Box<dyn StdError>> {
     Ok(Server::builder(node)
         .service(archive)
         .service(trust.presentation().build())
-        .service(setup::service(Setup { root, trust }, Allowlist::anyone()).build())
+        .service(
+            setup::service(
+                Setup {
+                    root,
+                    trust,
+                    serial: AtomicU64::new(0),
+                },
+                Allowlist::anyone(),
+            )
+            .build(),
+        )
         .spawn()?)
 }
 async fn connect(node: &Node, to: EndpointAddr) -> Result<(), Box<dyn StdError>> {
@@ -157,5 +171,19 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             connect(&node, id.parse::<keylink::EndpointId>()?.into()).await
         }
         _ => Err("usage: trust_chain [serve | connect <EndpointId>]".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn enrollment_works_after_a_previous_client_revokes() -> Result<(), Box<dyn StdError>> {
+        let node = Node::bind_local().await?;
+        let first = Node::bind_local().await?;
+        let second = Node::bind_local().await?;
+        let _running = serve(&node)?;
+        connect(&first, node.endpoint().addr()).await?;
+        connect(&second, node.endpoint().addr()).await
     }
 }
