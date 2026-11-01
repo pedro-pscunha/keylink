@@ -925,7 +925,7 @@ async fn a_revoked_actors_bytes_are_reachable_from_no_path() {
 /// Watched red with `scripts/break-once.sh` (row `HK44`) by replacing
 /// `            Err(AccessError::Forbidden) => Err(Box::new(GatewayError::Forbidden.response(None))),`
 /// (re-quoted when the refusal was boxed; the break ran against the unboxed
-/// spelling of the same arm) with an `Ok(Admitted { method, principal })`, which lets a denied caller
+/// spelling of the same arm) with an `Ok(Admitted { principal })`, which lets a denied caller
 /// through to the call. Terminated on
 /// `a denied caller left no id in the factory's record`, `left` carrying
 /// `["lazy", "forbidden-lazy"]` against a `right` of `["lazy"]`.

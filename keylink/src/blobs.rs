@@ -8,11 +8,13 @@
 //!
 //! `BlobsProtocol::new(&store, None)` — the mount six of iroh-blobs' eight call
 //! sites teach, its own module documentation included — serves every hash to
-//! every peer **and accepts writes**. `EventMask::DEFAULT` sets
-//! `get: RequestMode::None`, and `EventSender::request` reads `mask.get` for
-//! every request type, so the whole admission callback is switched off.
-//! Mounting that beside an allowlisted keylink service puts an unauthenticated
-//! store on an otherwise closed node.
+//! every peer. `EventMask::DEFAULT` sets `get: RequestMode::None`, so the
+//! admission callback is switched off for reads. Up to 0.103.0 it also
+//! **accepted writes**: `EventSender::request` read `mask.get` for every request
+//! type, so the default's `push: Disabled` was never read. 0.103.1 fixed that,
+//! and the read half is still the whole problem: mounting the default beside an
+//! allowlisted keylink service puts a store anyone can read on an otherwise
+//! closed node.
 //!
 //! So a user never mounts it. `iroh_blobs::ALPN` is in
 //! [`RESERVED_ALPNS`](crate::Service::foreign), keylink builds the mount from
@@ -475,8 +477,9 @@ impl Blobs {
     /// # Why a store needs this at all
     ///
     /// iroh-blobs' metadata actor keeps one redb write transaction open across
-    /// a **batch** of commands and commits when the batch ends, which is after
-    /// one second of idle or when a top-level command forces it. So an awaited
+    /// a **batch** of commands and commits when the batch ends: when its
+    /// configurable maximum write duration runs out, or when a top-level command
+    /// forces it. So an awaited
     /// [`add_bytes`](Self::add_bytes) or
     /// [`fetch_into`](BlobHandle::fetch_into) has been *accepted* rather than
     /// *committed*, and a process that exits promptly loses it. Measured on a

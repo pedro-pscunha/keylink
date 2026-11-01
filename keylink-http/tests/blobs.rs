@@ -915,7 +915,7 @@ async fn blob_ticket_absence_is_identical_across_guess_principal_method_and_evic
 /// `Err(AccessError::Forbidden) => Err(Box::new(GatewayError::Forbidden.response(None))),`
 /// in `keylink-http/src/gateway.rs` (re-quoted when the refusal was boxed; the
 /// break ran against the unboxed spelling of the same arm) with
-/// `Err(AccessError::Forbidden) => Ok(Admitted { method, principal }),`, after
+/// `Err(AccessError::Forbidden) => Ok(Admitted { principal }),`, after
 /// which the denied caller reaches the ticket lookup and the resource it holds
 /// answers `200` while the invented one still answers `404`.
 #[tokio::test]

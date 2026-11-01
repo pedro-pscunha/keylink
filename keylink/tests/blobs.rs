@@ -510,10 +510,12 @@ async fn a_granted_hash_seq_root_is_still_served_as_a_blob() {
 
 // ────────────────────────────────────── every other request type is refused
 
-/// `EventMask::DEFAULT` sets `push: RequestMode::Disabled`, and that field is
-/// dead: `EventSender::request` reads `mask.get` for every request type. So a
-/// default mount accepts writes from a stranger — the write hole RFC-01 §4.2
-/// measured. Under keylink's policy the write does not land.
+/// `EventMask::DEFAULT` sets `push: RequestMode::Disabled`, and up to
+/// iroh-blobs 0.103.0 that field was dead: `EventSender::request` read
+/// `mask.get` for every request type, so a default mount accepted writes from a
+/// stranger — the write hole RFC-01 §4.2 measured. 0.103.1 made each request
+/// kind read its own field. Under keylink's policy the write does not land,
+/// whichever version decides it.
 ///
 /// **The push's own return value is not evidence, and the test does not use
 /// it.** `execute_push_sink` (`api/remote.rs:617`) returns

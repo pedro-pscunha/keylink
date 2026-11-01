@@ -739,7 +739,7 @@ impl<A: Access> Surface<'_, A> {
                 GatewayError::Unauthenticated.response(Some(self.challenge.header())),
             )),
             // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
-            // { method, principal })` lets a denied caller reach the ticket
+            // { principal })` lets a denied caller reach the ticket
             // lookup, after which a resource it holds and one that never existed
             // stop answering alike.
             Err(AccessError::Forbidden) => Err(Box::new(GatewayError::Forbidden.response(None))),
