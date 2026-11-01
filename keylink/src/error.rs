@@ -79,6 +79,14 @@ impl Transmitted {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TellError {
+    /// The negotiated version cannot carry this tell.
+    #[error("the peer speaks {version}, which cannot carry this tell: {source}")]
+    Unsupported {
+        /// The negotiated version.
+        version: crate::Version,
+        /// Why the conversion refused the value.
+        source: crate::Unsupported,
+    },
     /// The established connection could not open another stream.
     #[error(transparent)]
     Connection(#[from] ConnectionError),
@@ -312,16 +320,30 @@ pub enum Error {
     #[error("remote error: {0}")]
     Remote(#[from] crate::RemoteError),
 
-    /// The peer speaks a different schema.
-    ///
-    /// Our ALPN carries a hash of the contract, so a peer built against
-    /// different types cannot complete the handshake. Surfacing this as a plain
-    /// transport error would send whoever reads it looking at the network,
-    /// which is the wrong layer entirely: nothing is wrong with the network.
-    #[error("schema mismatch: the peer was built against a different contract (ours is {ours})")]
-    SchemaMismatch {
-        /// The ALPN we offered, whose trailing hash identifies our schema.
-        ours: String,
+    /// No contract version both sides speak; names both windows.
+    #[error("{0}")]
+    SchemaMismatch(Box<crate::Mismatch>),
+
+    /// Request conversion failed locally. No stream was opened and nothing was sent.
+    #[error(
+        "the peer speaks {version}, which cannot carry this request; nothing was sent: {source}"
+    )]
+    UnsupportedRequest {
+        /// The negotiated version.
+        version: crate::Version,
+        /// Why the request conversion refused the value.
+        source: crate::Unsupported,
+    },
+    /// A reply arrived but cannot be converted. The call was sent and may have executed.
+    /// Do not retry on the assumption that nothing ran; use an idempotency key.
+    #[error(
+        "the peer speaks {version}; the call was sent but its reply cannot be converted: {source}"
+    )]
+    UnsupportedResponse {
+        /// The negotiated version.
+        version: crate::Version,
+        /// Why the reply conversion refused the value.
+        source: crate::Unsupported,
     },
 
     /// A blocking call was made from inside an async runtime.
@@ -519,6 +541,9 @@ impl From<crate::wire::HeaderError> for Error {
 impl From<TellError> for Error {
     fn from(error: TellError) -> Self {
         match error {
+            TellError::Unsupported { version, source } => {
+                Self::UnsupportedRequest { version, source }
+            }
             TellError::Connection(source) => Self::from(source),
             TellError::Codec(source) => Self::Codec(source),
             TellError::FrameTooLarge { len, cap } => Self::FrameTooLarge { len, cap },

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use keylink::{
     ActorId, Addressed, Allowlist, Backpressure, Body, BodyReader, Context, Ended, Error, Eviction,
     IdempotencyKey, IdempotencyRefusal, LocalError, Middleware, MountError, Next, Node, Outcome,
-    QueueTimeout, RemoteError, RpcClient, Server, Serving, Timeout, Withheld,
+    QueueTimeout, RemoteError, Server, Serving, Timeout, Withheld,
 };
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
@@ -767,16 +767,10 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
 ///
 /// **What refuses is the ALPN string, not the type parameter**, and the
 /// distinction is worth being exact about because the first draft of this test
-/// got it wrong. `RpcClient::connect` takes the ALPN as an untyped
-/// `&'static [u8]`, so `RpcClient::<Addressed<vault::Request>, _>::connect(..,
-/// journal::registry_alpn())` connects perfectly happily — the types are not part of
-/// the handshake, the bytes they hash into are. What makes the pairing safe is
-/// that `vault::RegistryClient` is the only thing that calls `vault::registry_alpn()`,
-/// and both are generated from one declaration.
-///
-/// Made red by giving both services the same keyed protocol name and hashing a
-/// contract that names neither `Addressed` nor `WireRequest` — which is exactly
-/// what `tests/protocol.rs::the_keyed_alpn_hashes_the_keyed_wire_type` refuses.
+/// got it wrong. Pairing is now typed: `RpcClient::connect` takes this
+/// service's addressed lineage rather than an untyped ALPN. This test still
+/// proves that a real peer on the other service cannot negotiate a contract.
+
 #[tokio::test]
 async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
     let journal_only = local_node().await;
@@ -815,7 +809,7 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
         .map(|_| ())
         .expect_err("a vault peer must not complete a handshake with journal's system");
     assert!(
-        matches!(refused, Error::SchemaMismatch { .. }),
+        matches!(refused, Error::SchemaMismatch(_)),
         "the refusal must name the schema, not the network: got {refused:?}"
     );
 
@@ -2360,9 +2354,9 @@ impl ward::Actor for Ward {
 /// message of this contract, which a typed client cannot do by construction.
 struct Keyed {
     client: ward::RegistryClient,
-    /// A hand-rolled peer on `ward`'s keyed ALPN, whose request type is a bare
-    /// `u32`. Nothing generated can produce an undecodable payload.
-    raw: RpcClient<u32, ward::Response>,
+    /// A raw connection on `ward`'s keyed ALPN; the test writes its malformed
+    /// envelope by hand because a typed lineage cannot produce one.
+    raw: iroh::endpoint::Connection,
     _system: ward::Registry,
     _server: Server,
     _nodes: [Node; 2],
@@ -2379,13 +2373,11 @@ async fn start_keyed() -> Keyed {
     let client = ward::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the typed client dials the actor system");
-    let raw = RpcClient::connect(
-        &client_node,
-        server.endpoint().addr(),
-        ward::registry_alpn(),
-    )
-    .await
-    .expect("a hand-rolled peer dials the same ALPN");
+    let raw = client_node
+        .endpoint()
+        .connect(server.endpoint().addr(), ward::registry_alpn())
+        .await
+        .expect("a hand-rolled peer dials the same ALPN");
     system
         .mount(id("ward"), ward::spawn(Ward::default()))
         .expect("the id is free");
@@ -2670,13 +2662,29 @@ async fn a_garbage_payload_never_reaches_the_actor_and_claims_no_key() {
     let fixture = start_keyed().await;
     let key = IdempotencyKey::new("garbage").expect("a valid key");
 
-    fixture
-        .raw
-        .with_idempotency(key.clone())
-        .call(250u32, Body::empty())
+    #[derive(serde::Serialize)]
+    struct Garbage {
+        body_len: Option<u64>,
+        idempotency: Option<keylink::Idempotency>,
+        message: keylink::WireRequest<u32>,
+    }
+    let payload = postcard::to_allocvec(&Garbage {
+        body_len: Some(0),
+        idempotency: Some(key.clone().into()),
+        message: keylink::WireRequest::Call(250),
+    })
+    .unwrap();
+    let (mut send, mut recv) = fixture.raw.open_bi().await.unwrap();
+    send.write_all(&(payload.len() as u32).to_le_bytes())
         .await
-        .map(|_| ())
-        .expect_err("a bare u32 is not an Addressed<ward::Request>");
+        .unwrap();
+    send.write_all(&payload).await.unwrap();
+    send.finish().unwrap();
+    let mut byte = [0];
+    assert!(
+        !matches!(recv.read(&mut byte).await, Ok(Some(_))),
+        "a malformed request receives no reply"
+    );
 
     assert_eq!(
         touches(&fixture).await,

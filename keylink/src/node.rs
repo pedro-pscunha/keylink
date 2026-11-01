@@ -139,14 +139,9 @@ impl Node {
 ///
 /// The trailing 16 hex digits of [`derive_alpn`] are this value.
 ///
-/// `pub(crate)`, and it was `pub` for exactly one reason: an actor system
-/// comparing a hash a caller declared against the one an actor was mounted with
-/// needed the number rather than the ALPN, and parsing hex back out of an ALPN
-/// would have been worse. That caller is gone — a keyed system is per-service
-/// and a mismatched actor type is unrepresentable rather than compared — so
-/// nothing outside this crate needs a bare hash any more. [`derive_alpn`] is
-/// what a caller wants, and it is still `pub`.
-pub(crate) fn schema_hash<C: Schema>(protocol: &str) -> u64 {
+/// Named by generated current and frozen contract constants.
+#[doc(hidden)]
+pub const fn __schema_hash<C: Schema>(protocol: &str) -> u64 {
     u64::from_le_bytes(hash_ty_path::<C>(protocol))
 }
 
@@ -160,8 +155,11 @@ pub(crate) fn schema_hash<C: Schema>(protocol: &str) -> u64 {
 ///
 /// The hash walks the whole transitive type graph, so a field added three
 /// structs deep still moves it. Nobody has to remember to bump a version.
+///
+/// Generated services include their version label before this hash; this helper
+/// remains the shape-derived ALPN for probes and foreign protocol measurements.
 pub fn derive_alpn<C: Schema>(protocol: &str) -> Vec<u8> {
-    let hash = schema_hash::<C>(protocol);
+    let hash = __schema_hash::<C>(protocol);
     format!("{protocol}/{hash:016x}").into_bytes()
 }
 
@@ -206,7 +204,7 @@ mod tests {
         let alpn = derive_alpn::<V1>("crate/Svc");
         let text = std::str::from_utf8(&alpn).expect("alpn is ascii");
         let (_, suffix) = text.rsplit_once('/').expect("has a hash suffix");
-        assert_eq!(suffix, format!("{:016x}", schema_hash::<V1>("crate/Svc")));
+        assert_eq!(suffix, format!("{:016x}", __schema_hash::<V1>("crate/Svc")));
     }
 
     #[test]

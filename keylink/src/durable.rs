@@ -10,10 +10,12 @@
 //! One entry per claimed key, keyed on the pair the ledger keys on — the peer
 //! iroh proved, and the key that peer chose. A value starts with a one-byte
 //! request-binding/version tag, a 32-byte request-and-authority commitment, and
-//! a one-byte state: 34 fixed bytes. A recordable settled reply appends its frame.
-//! The commitment binds received message bytes (not retry controls) and the
-//! selected principal and holder. Legacy unbound values are refused during
-//! recovery, never migrated or replayed with an invented binding.
+//! a one-byte state: 34 fixed bytes. A done reply then stores its contract label
+//! (u32 LE), shape hash (u64 LE), and header frame. The commitment binds received
+//! message bytes (not retry controls), the negotiated label, and the selected
+//! principal and holder. Legacy unbound values are refused during recovery,
+//! never migrated with an invented binding. Bound replies whose contract is
+//! unknown or whose frame is malformed become Forgotten with their binding kept.
 //!
 //! **The in-flight half is not stored and cannot be.** A claimed key belongs to
 //! a caller holding a live QUIC stream, and no disk carries one of those across
@@ -83,7 +85,8 @@ const TAG_CLAIMED: u8 = 0;
 /// Versioned request/authority-bound records, never confused with the former unbound states.
 const TAG_BOUND: u8 = 5;
 /// A settled key holding a replayable reply.
-const TAG_DONE: u8 = 1;
+const TAG_LEGACY_DONE: u8 = 1;
+const TAG_DONE: u8 = 5;
 /// Entered, and no reply came out.
 const TAG_INTERRUPTED: u8 = 2;
 /// It ran, and this ledger never holds its reply.
@@ -221,12 +224,14 @@ fn decode_key(stored: &EntryKey) -> Result<(EndpointId, IdempotencyKey), RecordF
 /// [`Slot::Running`] stores as [`TAG_CLAIMED`], which is the whole of how an
 /// interrupted call is recovered: the claim is written before the handler runs,
 /// so a process that dies mid-call leaves exactly this.
-pub(crate) fn encode_slot(slot: &Slot, fingerprint: [u8; 32]) -> Vec<u8> {
+pub(crate) fn encode_slot(slot: &Slot, fingerprint: [u8; 32], version: crate::Version) -> Vec<u8> {
     let state = match slot {
         Slot::Running(_) => vec![TAG_CLAIMED],
         Slot::Done(frame) => {
-            let mut bytes = Vec::with_capacity(1 + frame.len());
+            let mut bytes = Vec::with_capacity(13 + frame.len());
             bytes.push(TAG_DONE);
+            bytes.extend_from_slice(&version.label().to_le_bytes());
+            bytes.extend_from_slice(&version.hash().to_le_bytes());
             bytes.extend_from_slice(frame);
             bytes
         }
@@ -244,8 +249,28 @@ fn bound_bytes(state: &[u8], fingerprint: [u8; 32]) -> Vec<u8> {
     value
 }
 
+/// A stored reply has not crossed the service's recovery conversion yet.
+enum StoredSlot {
+    Plain(Slot),
+    Done {
+        version: crate::Version,
+        frame: Bytes,
+    },
+}
+
+impl StoredSlot {
+    fn recover(self, upgrade: &crate::version::UpgradeRecord) -> Slot {
+        match self {
+            Self::Plain(slot) => slot,
+            Self::Done { version, frame } => {
+                upgrade(version, &frame).map_or(Slot::Forgotten, Slot::Done)
+            }
+        }
+    }
+}
+
 /// What a stored record becomes when the process comes back.
-fn decode_slot(stored: &[u8]) -> Result<([u8; 32], Slot), RecordFault> {
+fn decode_slot(stored: &[u8]) -> Result<([u8; 32], StoredSlot), RecordFault> {
     let Some((version, rest)) = stored.split_first() else {
         return Err(RecordFault::Empty);
     };
@@ -260,17 +285,34 @@ fn decode_slot(stored: &[u8]) -> Result<([u8; 32], Slot), RecordFault> {
         .map_err(|_| RecordFault::MissingFingerprint)?;
     Ok((fingerprint, decode_state(state)?))
 }
-fn decode_state(stored: &[u8]) -> Result<Slot, RecordFault> {
+fn decode_state(stored: &[u8]) -> Result<StoredSlot, RecordFault> {
     let Some((tag, rest)) = stored.split_first() else {
         return Err(RecordFault::Empty);
     };
     match *tag {
         // The claim outlived the call that took it, which is the definition of
         // this state and not a guess about it.
-        TAG_CLAIMED | TAG_INTERRUPTED => Ok(Slot::Interrupted),
-        TAG_DONE => Ok(Slot::Done(Bytes::copy_from_slice(rest))),
-        TAG_UNRECORDABLE => Ok(Slot::Unrecordable),
-        TAG_FORGOTTEN => Ok(Slot::Forgotten),
+        TAG_CLAIMED | TAG_INTERRUPTED => Ok(StoredSlot::Plain(Slot::Interrupted)),
+        TAG_LEGACY_DONE => Ok(StoredSlot::Plain(Slot::Forgotten)),
+        TAG_DONE => match rest.split_first_chunk::<12>() {
+            Some((identity, frame)) => {
+                let (label, hash) = identity.split_at(4);
+                let mut label_bytes = [0; 4];
+                label_bytes.copy_from_slice(label);
+                let mut hash_bytes = [0; 8];
+                hash_bytes.copy_from_slice(hash);
+                Ok(StoredSlot::Done {
+                    version: crate::Version::__new(
+                        u32::from_le_bytes(label_bytes),
+                        u64::from_le_bytes(hash_bytes),
+                    ),
+                    frame: Bytes::copy_from_slice(frame),
+                })
+            }
+            None => Ok(StoredSlot::Plain(Slot::Forgotten)),
+        },
+        TAG_UNRECORDABLE => Ok(StoredSlot::Plain(Slot::Unrecordable)),
+        TAG_FORGOTTEN => Ok(StoredSlot::Plain(Slot::Forgotten)),
         tag => Err(RecordFault::UnknownState { tag }),
     }
 }
@@ -328,6 +370,7 @@ pub struct DurableRecords {
 }
 
 pub(crate) type Recovered = (EndpointId, IdempotencyKey, [u8; 32], Slot);
+type StoredRecord = (EndpointId, IdempotencyKey, [u8; 32], StoredSlot);
 
 /// The claimed store, and what it held when this process opened it.
 struct Store {
@@ -337,7 +380,7 @@ struct Store {
     ///
     /// A `std::sync::Mutex` and not the async one beside it: this is taken from
     /// `Ledger::new`, which is not a future, and holding it spans no await.
-    recovered: std::sync::Mutex<Vec<Recovered>>,
+    recovered: std::sync::Mutex<Vec<StoredRecord>>,
     /// Entries written since the log was last rewritten. Read against the live
     /// count, which only the ledger knows.
     since_compaction: AtomicU64,
@@ -393,13 +436,18 @@ impl DurableRecords {
     /// The ledger built from these records takes them; a second reader gets
     /// nothing, which is the honest answer — there is one ledger per store, and
     /// this value is how the first one is told what it already knows.
-    pub(crate) fn take_recovered(&self) -> Vec<Recovered> {
+    pub(crate) fn take_recovered(&self, upgrade: &crate::version::UpgradeRecord) -> Vec<Recovered> {
         let mut held = self
             .store
             .recovered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut held)
+        std::mem::take(&mut *held)
+            .into_iter()
+            .map(|(peer, key, fingerprint, stored)| {
+                (peer, key, fingerprint, stored.recover(upgrade))
+            })
+            .collect()
     }
 
     /// Record that a key has been taken, before its call is entered.
@@ -453,9 +501,10 @@ impl DurableRecords {
         key: &IdempotencyKey,
         slot: &Slot,
         fingerprint: [u8; 32],
+        version: crate::Version,
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
-        let value = encode_slot(slot, fingerprint);
+        let value = encode_slot(slot, fingerprint, version);
         let wrote = self.store.held.lock().await.put(&address, &value).await;
         self.counted(wrote)?;
         Ok(())
@@ -567,6 +616,75 @@ pub(crate) enum Reconcile {
 }
 
 #[cfg(test)]
+mod versioned_records {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    #[test]
+    fn records_keep_both_identity_fields_and_legacy_replies_are_forgotten() {
+        let version = crate::Version::__new(17, crate::__schema_hash::<u64>("stored"));
+        let bytes = encode_slot(&Slot::Done(Bytes::from_static(b"reply")), [0; 32], version);
+        match decode_slot(&bytes).expect("valid slot").1 {
+            StoredSlot::Done {
+                version: read,
+                frame,
+            } => {
+                assert_eq!(read, version);
+                assert_eq!(frame, b"reply"[..]);
+            }
+            StoredSlot::Plain(_) => panic!("must retain identity"),
+        }
+        assert!(matches!(
+            decode_state(&[TAG_LEGACY_DONE, 0, 0]),
+            Ok(StoredSlot::Plain(Slot::Forgotten))
+        ));
+    }
+    /// Watched red by restoring unchecked current-frame reuse before decoding.
+    /// A full identity followed by zero frame bytes recovered as Done instead
+    /// of Forgotten (0 passed, 1 failed). Restored framing and payload validation.
+    #[test]
+    fn malformed_current_records_are_forgotten_before_replay() {
+        let version = crate::Version::__new(1, crate::__schema_hash::<u8>("stored/frame"));
+        let lineage = Box::leak(Box::new(crate::Lineage::new::<crate::Here<u8, u8>>(
+            "stored/frame",
+            version,
+        )));
+        let codec = lineage.records();
+        let restore = |frame: Bytes| {
+            let encoded = encode_slot(&Slot::Done(frame), [0; 32], version);
+            decode_slot(&encoded)
+                .expect("valid full version identity")
+                .1
+                .recover(codec.upgrade.as_ref())
+        };
+        for len in 0..4 {
+            assert!(
+                matches!(restore(vec![0; len].into()), Slot::Forgotten),
+                "a valid identity followed by {len} frame bytes must be Forgotten"
+            );
+        }
+        let valid = crate::wire::encode_header(
+            Some(0),
+            None,
+            &crate::WireResponse::Call(crate::Outcome::Ok(7_u8)),
+        )
+        .expect("encodes");
+        assert!(matches!(restore(valid.clone()), Slot::Done(frame) if frame == valid));
+        let mut wrong_length = valid.to_vec();
+        wrong_length[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(restore(wrong_length.into()), Slot::Forgotten));
+        assert!(matches!(
+            restore(Bytes::from_static(&[1, 0, 0, 0, 255])),
+            Slot::Forgotten
+        ));
+        let mut trailing = valid.to_vec();
+        trailing.push(0);
+        let len = u32::try_from(trailing.len() - 4).expect("short frame");
+        trailing[..4].copy_from_slice(&len.to_le_bytes());
+        assert!(matches!(restore(trailing.into()), Slot::Forgotten));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
@@ -581,8 +699,12 @@ mod tests {
             Slot::Unrecordable,
             Slot::Forgotten,
         ] {
-            let bytes = encode_slot(&slot, [9; 32]);
-            let (fingerprint, decoded) = decode_slot(&bytes).unwrap();
+            let bytes = encode_slot(&slot, [9; 32], crate::Version::__new(1, 0));
+            let (fingerprint, stored) = decode_slot(&bytes).unwrap();
+            let decoded = match stored {
+                StoredSlot::Plain(slot) => slot,
+                StoredSlot::Done { frame, .. } => Slot::Done(frame),
+            };
             assert_eq!(fingerprint, [9; 32]);
             assert_eq!(
                 std::mem::discriminant(&decoded),

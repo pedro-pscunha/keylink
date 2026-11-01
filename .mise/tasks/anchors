@@ -581,6 +581,8 @@ ANCHORS = [
      "        if !self.admitting(peer.id()) {"),
     ("TR5", "keylink/tests/trust.rs", "keylink/src/rpc.rs",
      "    let Ok(credential) = preflight(&required, peer.id(), &message).await else {"),
+    ("CV1", "keylink/tests/versions.rs", "keylink/src/rpc.rs",
+     "                iroh::endpoint::ConnectOptions::new().with_additional_alpns(additional),"),
     ("R15", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
      "Self::Only(named) => named.contains(&method),"),
     ("R16", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
@@ -1174,8 +1176,10 @@ ANCHORS = [
     #
     # L1 is cross-file, so the record's own quote lives in another file and cannot
     # contribute to the count. Unindented, like every other cross-file row here.
-    ("L1", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
-     "keys: Keys::new(self.keyable, self.records, self.limits),"),
+    # L1's constructor moved out of a field when version mounts began sharing
+    # one ledger. Its historical record is spent; CV2 is the re-watched guard.
+    ("CV2", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "            self.limits,"),
     # L2 is SAME-file, and indented for exactly the reason the failure text gives:
     # the code line carries four spaces and the record quotes it with none, so the
     # indented literal counts 1. A `.tombstones(..)` fragment was the first choice
@@ -2542,6 +2546,12 @@ DESCRIBED = [
 #
 # id -> (replacement, watched substring, test filter, extra runner arguments)
 REDNESS = {
+    "CV2": ("            Limits::default(),",
+            "a one-byte frame ceiling must refuse the repeat: 1",
+            "a_frame_ceiling_set_on_the_builder_reaches_the_ledger", ["-p", "keylink", "--test", "idempotency", "--", "--exact"]),
+    "CV1": ("                iroh::endpoint::ConnectOptions::new().with_additional_alpns({ let mut missing: Vec<Vec<u8>> = additional; missing.clear(); missing }),",
+            "called `Result::unwrap()` on an `Err` value: SchemaMismatch",
+            "a_newer_client_speaks_the_older_version_to_an_older_server", ["-p", "keylink", "--test", "versions", "--", "--exact"]),
     "L3": ("        self.frame_bytes = bytes;",
            "held 1024 bytes over a 64 byte budget",
            "the_recorded_bytes_stay_inside_their_bound", ["-p", "keylink", "--lib"]),
@@ -4086,7 +4096,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 401
+RECORD_BLOCKS = 403
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

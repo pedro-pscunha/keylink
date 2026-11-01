@@ -76,6 +76,8 @@ around one. Do not let one shape a design.** A contract hash that moves costs
 nothing here, and it will keep costing nothing until keylink has a stable
 version. When that day comes, this section is what gets deleted, deliberately.
 
+A `previous` block in this repository pins the frozen module's `VERSION` and `KEYED_VERSION`, never literals.
+
 What that repeals:
 
 - **No commit is ordered so that pin moves land together.** Take the change in

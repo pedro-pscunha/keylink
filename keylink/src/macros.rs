@@ -282,13 +282,192 @@
 /// padding either — without it the fence would pass on the missing impl rather than
 /// on the refusal, which is the shape of a guard that proves nothing.
 ///
+/// ## Contract windows
+///
+/// Put `version N;` immediately after `service Name;` (omitted means 1), and put
+/// `previous N { hash PIN; keyed_hash KEYED_PIN; ... }` blocks after every declaration and feed, newest
+/// first. A block repeats that version's wire declarations in their original
+/// order, with `changed` before the kinds whose conversions the application writes.
+/// Attributes are preserved just as on current declarations: serde metadata
+/// can change the wire hash, and cfg/cfg_attr gates the contract and conversion
+/// arms together. `#[defer]` is consumed because it changes no wire shape.
+/// Feeds remain local and do not belong in a frozen wire block.
+/// Unmarked type changes fail in the generated plain conversion arms.
+///
+/// Each block generates `version_N::{Request, Response, Step, Convert, VERSION}`.
+/// Implement all four `Convert` methods for `Step`; generated arms carry plain
+/// methods and `__Status`, and application conversions carry changed, new and
+/// removed methods. The handler, authorization and ledger see only current types.
+/// `window()` lists the build's versions; the `Wire::version` method names the
+/// connection's negotiated version. Downgrades may lose fields: this is the
+/// application's policy, not optional-field compatibility in postcard. Blob
+/// metadata may convert, but the Content kind and root must stay unchanged; an address change
+/// is `UnsupportedResponse`, or `Forgotten` during stored-reply recovery.
+///
+/// Prefer `crate::` paths in a block, not `super::`: frozen declarations resolve
+/// one module deeper. Qualify names that collide with generated `Request`,
+/// `Response`, `Step`, `Convert`, `VERSION` or `version_N` items. Keylink's own
+/// wire types are hashed into every version, so a window covers application skew
+/// only within the same keylink wire revision.
+///
+/// A frozen declaration must still hash to its pin:
+///
+/// ```compile_fail
+/// # mod frozen { keylink::service! { service PinExample; version 2; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 2 { hash frozen::pin_example::VERSION.hash() ^ 1; keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
+/// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_2::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_2::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_2::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// Each older label must be lower than the one above it:
+///
+/// ```compile_fail
+/// # mod frozen { keylink::service! { service PinExample; version 4; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 4 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_4::Convert for pin_example::version_4::Step {
+/// # fn upgrade_request(_: pin_example::version_4::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_4::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_4::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_4::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// The singleton pin can match while the keyed pin refuses a different shape:
+///
+/// ```compile_fail
+/// # mod frozen { keylink::service! { service PinExample; version 2; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 2 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash() ^ 1; rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
+/// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_2::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_2::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_2::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// A caller's assertion macro cannot disable the pin or label guards:
+///
+/// ```compile_fail
+/// # #[allow(unused_macros)]
+/// # macro_rules! assert { ($($ignored:tt)*) => { () }; }
+/// # mod frozen { keylink::service! { service PinExample; version 2; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 2 { hash frozen::pin_example::VERSION.hash() ^ 1; keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
+/// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_2::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_2::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_2::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// # #[allow(unused_macros)]
+/// # macro_rules! assert { ($($ignored:tt)*) => { () }; }
+/// # mod frozen { keylink::service! { service PinExample; version 4; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 4 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_4::Convert for pin_example::version_4::Step {
+/// # fn upgrade_request(_: pin_example::version_4::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_4::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_4::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_4::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// The label and singleton guards were watched red with `scripts/break-once.sh`: replacing the
+/// hash assertion's condition with `true` made the first fence compile, and
+/// replacing the descending-label assertion's condition with `true` made the
+/// second compile. Each isolated run reported 0 passed, 1 failed, with
+/// "Test compiled successfully, but it's marked `compile_fail`." Both edits
+/// were restored. The hidden `main` keeps the frozen module at crate scope;
+/// without it a fence can fail on name resolution instead of on its guard.
+///
+/// The independent keyed pin was also watched red: replacing its assertion's
+/// condition with `true` made the third fence compile (0 passed, 1 failed).
+/// The singleton pin matched throughout. Restored the keyed assertion.
+///
+/// Both assertion-shadowing fixtures were watched red independently: removing
+/// the core qualification from the corresponding guard let the caller's
+/// const-compatible no-op compile the invalid contract (0 passed, 1 failed each).
+/// Restored both qualified assertions.
+///
+/// A window holds at most 64 versions, current included. Construction refuses
+/// the 65th entry, rather than publishing a probe its own reader would reject:
+///
+/// ```compile_fail
+/// # #![recursion_limit = "2048"]
+/// # mod frozen { keylink::service! { service Wide; version 1; rpc Ping() -> u8; } }
+/// # macro_rules! window {
+/// # ($($old:literal),*) => {
+/// keylink::service! {
+///     service Wide; version 65;
+///     rpc Ping() -> u8;
+/// # $(previous $old { hash frozen::wide::VERSION.hash(); keyed_hash frozen::wide::KEYED_VERSION.hash(); rpc Ping() -> u8; })*
+/// }
+/// # keylink::pastey::paste! { $(
+/// # impl wide::[<version_ $old>]::Convert for wide::[<version_ $old>]::Step {
+/// # fn upgrade_request(_: wide::[<version_ $old>]::Request) -> Result<<wide::[<version_ $old>]::Step as keylink::Hop>::NewerRequest, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: <wide::[<version_ $old>]::Step as keylink::Hop>::NewerRequest) -> Result<wide::[<version_ $old>]::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: wide::[<version_ $old>]::Response) -> Result<<wide::[<version_ $old>]::Step as keylink::Hop>::NewerResponse, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: <wide::[<version_ $old>]::Step as keylink::Hop>::NewerResponse) -> Result<wide::[<version_ $old>]::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # )* }
+/// # };
+/// # }
+/// # window!(64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1);
+/// # fn main() {}
+/// ```
+///
+/// The oversized-window fence was watched red by allowing 65 in the shared
+/// count guard: the complete fixture compiled (0 passed, 1 failed). All frozen
+/// conversions were present, so the failure cannot come from missing impls.
+/// Restored the 64-version construction limit.
+///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
 #[macro_export]
 macro_rules! service {
+    ( service $svc:ident; version $version:literal; $( $rest:tt )+ ) => {
+        $crate::__keylink_service_munch! {
+            @svc [ $svc $version ] @done [ ] @feeds [ ] @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )+ ]
+        }
+    };
     ( service $svc:ident; $( $rest:tt )+ ) => {
         $crate::__keylink_service_munch! {
-            @svc [ $svc ]
+            @svc [ $svc 1 ]
             @done [ ]
             @feeds [ ]
             @attrs [ ]
@@ -470,6 +649,24 @@ macro_rules! __keylink_cfg_attr {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_service_munch {
+    // Shared cfg_attr parsing resumes the frozen declaration parser here.
+    (@svc [@previous $svc:tt $upper:tt $newer:tt $label:tt $pin:tt]
+        @done [$($all:tt)*] @feeds [$($plain:tt)*] @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @defer [] @rest [$($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)*] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+
+    (
+        @svc [ $svc:ident $version:literal ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ ] @cfg [ ] @defer [ ]
+        @rest [ $( previous $older:literal { $( $old:tt )* } )+ ]
+    ) => {
+        $crate::__keylink_service! {
+            $svc;
+            @version [ $version ] @previous [ $( previous $older { $( $old )* } )+ ]
+            @wire [ $( $done )+ ] @feeds [ $( $feeds )* ]
+        }
+    };
+
     // `#[defer]` changes semantics and is consumed. Configuration attributes are
     // recorded separately below so they can gate generated non-item syntax.
     (
@@ -4975,17 +5172,18 @@ macro_rules! __keylink_service_munch {
     // An actually empty body cannot reach this arm because `service!` requires
     // at least one token after `service Name;`.
     (
-        @svc [ $svc:ident ] @done [ ] @feeds [ ]
+        @svc [ $svc:ident $version:literal ] @done [ ] @feeds [ ]
         @attrs [ ] @cfg [ ] @defer [ ] @rest [ ]
     ) => {};
 
     // Done, with at least one wire declaration and no attribute left dangling.
     (
-        @svc [ $svc:ident ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
+        @svc [ $svc:ident $version:literal ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
         @attrs [ ] @cfg [ ] @defer [ ] @rest [ ]
     ) => {
         $crate::__keylink_service! {
             $svc;
+            @version [ $version ] @previous [ ]
             @wire [ $( $done )+ ]
             @feeds [ $( $feeds )* ]
         }
@@ -4995,7 +5193,7 @@ macro_rules! __keylink_service_munch {
     // disabled feed is removed before this diagnostic, so a cfg-disabled feeds-only
     // service does not fail merely because its declaration was present in source.
     (
-        @svc [ $svc:ident ] @done [ ]
+        @svc [ $svc:ident $version:literal ] @done [ ]
         @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( #[$fcfg:meta] )* ]
                      [ $( $fdefer:tt )? ] feed $feed:ident
                      ( $farg:ident : $fty:ty ) } )+ ]
@@ -5458,6 +5656,7 @@ macro_rules! __keylink_external {
 macro_rules! __keylink_service {
     (
         $svc:ident;
+        @version [ $version:literal ] @previous [ $( previous $older:literal { $( $old:tt )* } )* ]
         @wire [ $( { [ $( #[$meta:meta] )* ] [ $( #[$cfg:meta] )* ]
              [ $( $defer:tt )? ] $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ]
         @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( #[$fcfg:meta] )* ]
@@ -5492,32 +5691,26 @@ macro_rules! __keylink_service {
             $( $( #[$fcfg] )* $crate::__keylink_defer_check!([$( $fdefer )?], feed, $feed); )*
             $( $crate::__keylink_keyword_name_check_item!([$( #[$fcfg] )*], $feed, feed, $feed); )*
 
-            #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
-            pub enum Request {
-                $( $( #[$meta] )* $rpc { $( $arg: $ty ),* }, )+
-                /// What the actor answering this service is doing right now.
-                ///
-                /// Declared by no service and generated onto every contract, so
-                /// it moves this service's ALPN once and then never again. The
-                /// structural spelling is deliberate: `__Status` is internal
-                /// to the wire, while callers reach the operation through the
-                /// [`Status`](keylink::Status) trait. A name a user could also
-                /// write would be a name a user could collide with.
-                ///
-                /// **Never delivered.** Both served closures answer it above
-                /// their delivery call, from the flag beside the mailbox, and
-                /// enqueue nothing. A message asking would queue behind the
-                /// turn that wedged the actor.
-                __Status {},
+            $crate::__keylink_contract! { $svc, $version;
+                $( { [ $( #[$meta] )* ] [ $( #[$cfg] )* ] [ $( $defer )? ] $kind $rpc ( $( $arg : $ty ),* ) -> $ret } )+
             }
+            const _: () = $crate::__check_window_len(1usize $(+ { let _ = $older; 1usize })*);
+            #[doc(hidden)] pub type __Toward = $crate::Here<Request, Response>;
+            $crate::__keylink_previous! { @chain [$svc] [$version] [super] $( previous $older { $( $old )* } )* }
 
-            #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
-            pub enum Response {
-                $( $( #[$cfg] )* $rpc($crate::__keylink_response_ty!([<$kind>], $ret)), )+
-                /// The answer to [`Request::__Status`]. See
-                /// [`Serving`](keylink::Serving) for what its two fields do and
-                /// do not claim.
-                __Status($crate::Serving),
+            /// Every contract this build speaks, newest first.
+            pub fn window() -> &'static $crate::Window { lineage().window() }
+            #[doc(hidden)]
+            pub fn lineage() -> &'static $crate::Lineage<Request, Response> {
+                static CELL: ::std::sync::OnceLock<$crate::Lineage<Request, Response>> = ::std::sync::OnceLock::new();
+                CELL.get_or_init(|| $crate::Lineage::new::<__Toward>(PROTOCOL, VERSION)
+                    $( .previous::<[<version_ $older>]::__Toward>([<version_ $older>]::VERSION) )*)
+            }
+            #[doc(hidden)]
+            pub fn keyed_lineage() -> &'static $crate::Lineage<$crate::Addressed<Request>, Response> {
+                static CELL: ::std::sync::OnceLock<$crate::Lineage<$crate::Addressed<Request>, Response>> = ::std::sync::OnceLock::new();
+                CELL.get_or_init(|| $crate::Lineage::new::<$crate::Keyed<__Toward>>(KEYED_PROTOCOL, KEYED_VERSION)
+                    $( .previous::<$crate::Keyed<[<version_ $older>]::__Toward>>([<version_ $older>]::KEYED_VERSION) )*)
             }
 
             impl Response {
@@ -5574,31 +5767,8 @@ macro_rules! __keylink_service {
                 }
             }
 
-            /// Hashed to produce the ALPN, so the gate covers BOTH directions
-            /// *and* keylink's own framing.
-            ///
-            /// Both fields MUST name the `Wire*` types, the same ones the wire
-            /// names. Spelling the bare `Request` or `Response` here is what let
-            /// the contract and the wire drift apart once already.
-            #[derive(::postcard_schema::Schema)]
-            struct Contract {
-                request: $crate::Envelope<$crate::WireRequest<Request>>,
-                response: $crate::Envelope<$crate::WireResponse<Response>>,
-                /// keylink's own wire surface, so a peer built against a
-                /// keylink that cannot accept a `tell` is refused instead of
-                /// losing every one silently. See `WireKinds`.
-                kinds: $crate::WireKinds,
-            }
-
-            /// `<crate>/<Service>/<16-hex schema hash>`.
-            ///
-            /// Derived, never hand-maintained: change any type reachable from
-            /// `Request` or `Response` and this moves on its own.
-            pub fn alpn() -> &'static [u8] {
-                static CELL: ::std::sync::OnceLock<::std::vec::Vec<u8>> =
-                    ::std::sync::OnceLock::new();
-                CELL.get_or_init(|| $crate::derive_alpn::<Contract>(PROTOCOL)).as_slice()
-            }
+            /// `<crate>/<Service>/<label>/<16-hex schema hash>`.
+            pub fn alpn() -> &'static [u8] { lineage().alpn() }
 
             /// Implement this to serve the protocol. One method per rpc.
             pub trait Handler: Send + Sync + 'static {
@@ -5629,17 +5799,6 @@ macro_rules! __keylink_service {
             /// store and the [`AdmittedPeer`](keylink::AdmittedPeer) the grant
             /// must be recorded against. The handler has neither and needs
             /// neither: returning the id is the whole of its part.
-            impl $crate::Granting for Response {
-                fn granted(&self) -> ::core::option::Option<$crate::Content> {
-                    match self {
-                        $( $( #[$cfg] )* Self::$rpc(__value) =>
-                            $crate::__keylink_granted_id!([<$kind>], __value), )+
-                        // A status read names no content, so there is no grant
-                        // for `serve_one` to record against the peer.
-                        Self::__Status(_) => ::core::option::Option::None,
-                    }
-                }
-            }
 
             /// Whether any method here serves content, folded at compile time.
             ///
@@ -5732,26 +5891,6 @@ macro_rules! __keylink_service {
                 );
             }
 
-            impl $crate::Rpc for Request {
-                const SERVICE: &'static str = stringify!($svc);
-                const METHODS: &'static [&'static str] = &[
-                    $( $( #[$cfg] )* stringify!($rpc), )+
-                    "__Status",
-                ];
-
-                fn method(&self) -> &'static str {
-                    match self {
-                        $( $( #[$cfg] )* Request::$rpc { .. } => stringify!($rpc), )+
-                        // The name a layer refuses `__status` by. The generated
-                        // method is answered inside the dispatch, and the chain
-                        // runs above it, so this is what a per-method
-                        // `Middleware` matches on to close the door for a peer
-                        // it does not want reading turn state.
-                        Request::__Status { .. } => "__Status",
-                    }
-                }
-            }
-
             /// Build this service so it can be registered on a
             /// [`Server`](keylink::Server), alongside other services or foreign
             /// iroh protocols, on one node.
@@ -5821,7 +5960,7 @@ macro_rules! __keylink_service {
                             (__outcome, __body)
                         })
                     });
-                $crate::ServiceBuilder::new(alpn(), allow, dispatch)
+                $crate::ServiceBuilder::new(lineage(), allow, dispatch)
                     .__keylink_declares_blobs(DECLARES_BLOBS)
             }
 
@@ -5878,37 +6017,8 @@ macro_rules! __keylink_service {
             const KEYED_PROTOCOL: &str =
                 concat!(env!("CARGO_PKG_NAME"), "/", stringify!($svc), "/keyed");
 
-            /// Hashed to produce the keyed ALPN, exactly as [`Contract`] is for
-            /// the singleton one.
-            ///
-            /// Both fields MUST name the `Wire*` types, the same ones the wire
-            /// names — and the request arm MUST name `Addressed`, which is what
-            /// the keyed wire actually carries. The hand-written actor contract
-            /// this replaces declared a bare `ActorRequest` while `serve_one`
-            /// read a `WireRequest` off the frame, so its ALPN was derived from a
-            /// type that was not what it put on the wire. That is the exact
-            /// drift `tests/protocol.rs` refuses for the generated path, and the
-            /// hand-written one evaded it by not being generated.
-            #[derive(::postcard_schema::Schema)]
-            struct KeyedContract {
-                request: $crate::Envelope<$crate::WireRequest<$crate::Addressed<Request>>>,
-                response: $crate::Envelope<$crate::WireResponse<Response>>,
-                /// keylink's own wire surface, for the reason [`Contract`] has
-                /// this field.
-                kinds: $crate::WireKinds,
-            }
-
-            /// `<crate>/<Service>/keyed/<16-hex schema hash>`.
-            ///
-            /// Derived, never hand-maintained, and distinct from [`alpn`]: a
-            /// node can serve this service as a singleton and as an actor system
-            /// at the same time, and one router owns one ALPN.
-            pub fn registry_alpn() -> &'static [u8] {
-                static CELL: ::std::sync::OnceLock<::std::vec::Vec<u8>> =
-                    ::std::sync::OnceLock::new();
-                CELL.get_or_init(|| $crate::derive_alpn::<KeyedContract>(KEYED_PROTOCOL))
-                    .as_slice()
-            }
+            /// `<crate>/<Service>/keyed/<label>/<16-hex schema hash>`.
+            pub fn registry_alpn() -> &'static [u8] { keyed_lineage().alpn() }
 
             /// What one of this service's mailboxes carries: one variant per
             /// declared method, plus the one a request from a peer lands in.
@@ -6410,7 +6520,7 @@ macro_rules! __keylink_service {
                                 }
                             })
                         });
-                    $crate::ServiceBuilder::new(registry_alpn(), allow, dispatch)
+                    $crate::ServiceBuilder::new(keyed_lineage(), allow, dispatch)
                         .__keylink_declares_blobs(DECLARES_BLOBS)
                 }
             }
@@ -7069,7 +7179,7 @@ macro_rules! __keylink_service {
                                 .await
                             })
                         });
-                    $crate::ServiceBuilder::new(alpn(), allow, dispatch)
+                    $crate::ServiceBuilder::new(lineage(), allow, dispatch)
                         .__keylink_declares_blobs(DECLARES_BLOBS)
                 }
 
@@ -7296,7 +7406,7 @@ macro_rules! __keylink_service {
                     peer: impl Into<$crate::EndpointAddr>,
                 ) -> $crate::Result<Self> {
                     Ok(Self {
-                        inner: $crate::RpcClient::connect(node, peer, registry_alpn()).await?,
+                        inner: $crate::RpcClient::connect(node, peer, keyed_lineage()).await?,
                         idempotency: ::core::option::Option::None,
                     })
                 }
@@ -7345,6 +7455,7 @@ macro_rules! __keylink_service {
             }
 
             impl $crate::Wire for RegistryClient {
+                fn version(&self) -> $crate::Version { self.inner.version() }
                 async fn key_state(
                     &self,
                     key: $crate::IdempotencyKey,
@@ -7455,7 +7566,7 @@ macro_rules! __keylink_service {
                     peer: impl Into<$crate::EndpointAddr>,
                 ) -> $crate::Result<Self> {
                     Ok(Self {
-                        inner: $crate::RpcClient::connect(node, peer, alpn()).await?,
+                        inner: $crate::RpcClient::connect(node, peer, lineage()).await?,
                     })
                 }
 
@@ -7488,6 +7599,7 @@ macro_rules! __keylink_service {
             }
 
             impl $crate::Wire for Client {
+                fn version(&self) -> $crate::Version { self.inner.version() }
                 async fn key_state(
                     &self,
                     key: $crate::IdempotencyKey,
@@ -7554,6 +7666,7 @@ macro_rules! __keylink_service {
             }
 
             impl $crate::Wire for IdempotentClient {
+                fn version(&self) -> $crate::Version { self.inner.version() }
                 async fn key_state(
                     &self,
                     key: $crate::IdempotencyKey,
@@ -7813,6 +7926,7 @@ macro_rules! __keylink_service {
                 }
 
                 impl $crate::BlockingWire for Client {
+                    fn version(&self) -> $crate::Version { $crate::Wire::version(&self.inner) }
                     fn key_state(
                         &self,
                         key: $crate::IdempotencyKey,
@@ -7851,6 +7965,7 @@ macro_rules! __keylink_service {
                 }
 
                 impl $crate::BlockingWire for IdempotentClient {
+                    fn version(&self) -> $crate::Version { $crate::Wire::version(&self.inner) }
                     fn key_state(
                         &self,
                         key: $crate::IdempotencyKey,
@@ -10064,6 +10179,247 @@ macro_rules! __keylink_calls_impl {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], $surface:ident, blob, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
+/// The only generator of current and frozen wire contracts.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_contract {
+    ($svc:ident, $label:literal; $( { [ $( #[$meta:meta] )* ] [ $( #[$cfg:meta] )* ]
+        [ $( $defer:tt )? ] $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ) => {
+        $crate::pastey::paste! {
+            #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
+            pub enum Request {
+                $( $( #[$meta] )* $rpc { $( $arg: $ty ),* }, )+
+                /// What the actor answering this service is doing right now.
+                ///
+                /// Declared by no service and generated onto every contract, so
+                /// it moves this service's ALPN once and then never again. The
+                /// structural spelling is deliberate: `__Status` is internal
+                /// to the wire, while callers reach the operation through the
+                /// [`Status`](keylink::Status) trait. A name a user could also
+                /// write would be a name a user could collide with.
+                ///
+                /// **Never delivered.** Both served closures answer it above
+                /// their delivery call, from the flag beside the mailbox, and
+                /// enqueue nothing. A message asking would queue behind the
+                /// turn that wedged the actor.
+                __Status {},
+            }
+
+            #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
+            pub enum Response {
+                $( $( #[$cfg] )* $rpc($crate::__keylink_response_ty!([<$kind>], $ret)), )+
+                /// The answer to [`Request::__Status`]. See
+                /// [`Serving`](keylink::Serving) for what its two fields do and
+                /// do not claim.
+                __Status($crate::Serving),
+            }
+
+            impl $crate::Rpc for Request {
+                const SERVICE: &'static str = stringify!($svc);
+                const METHODS: &'static [&'static str] = &[
+                    $( $( #[$cfg] )* stringify!($rpc), )+
+                    "__Status",
+                ];
+
+                fn method(&self) -> &'static str {
+                    match self {
+                        $( $( #[$cfg] )* Request::$rpc { .. } => stringify!($rpc), )+
+                        // The name a layer refuses `__status` by. The generated
+                        // method is answered inside the dispatch, and the chain
+                        // runs above it, so this is what a per-method
+                        // `Middleware` matches on to close the door for a peer
+                        // it does not want reading turn state.
+                        Request::__Status { .. } => "__Status",
+                    }
+                }
+            }
+
+            /// Hashed to produce the ALPN, so the gate covers BOTH directions
+            /// *and* keylink's own framing.
+            ///
+            /// Both fields MUST name the `Wire*` types, the same ones the wire
+            /// names. Spelling the bare `Request` or `Response` here is what let
+            /// the contract and the wire drift apart once already.
+            #[derive(::postcard_schema::Schema)]
+            struct Contract {
+                request: $crate::Envelope<$crate::WireRequest<Request>>,
+                response: $crate::Envelope<$crate::WireResponse<Response>>,
+                /// keylink's own wire surface, so a peer built against a
+                /// keylink that cannot accept a `tell` is refused instead of
+                /// losing every one silently. See `WireKinds`.
+                kinds: $crate::WireKinds,
+            }
+
+            /// Hashed to produce the keyed ALPN, exactly as [`Contract`] is for
+            /// the singleton one.
+            ///
+            /// Both fields MUST name the `Wire*` types, the same ones the wire
+            /// names — and the request arm MUST name `Addressed`, which is what
+            /// the keyed wire actually carries. The hand-written actor contract
+            /// this replaces declared a bare `ActorRequest` while `serve_one`
+            /// read a `WireRequest` off the frame, so its ALPN was derived from a
+            /// type that was not what it put on the wire. That is the exact
+            /// drift `tests/protocol.rs` refuses for the generated path, and the
+            /// hand-written one evaded it by not being generated.
+            #[derive(::postcard_schema::Schema)]
+            struct KeyedContract {
+                request: $crate::Envelope<$crate::WireRequest<$crate::Addressed<Request>>>,
+                response: $crate::Envelope<$crate::WireResponse<Response>>,
+                /// keylink's own wire surface, for the reason [`Contract`] has
+                /// this field.
+                kinds: $crate::WireKinds,
+            }
+
+
+            impl $crate::Granting for Response {
+                fn granted(&self) -> ::core::option::Option<$crate::Content> {
+                    match self {
+                        $( $( #[$cfg] )* Self::$rpc(__value) =>
+                            $crate::__keylink_granted_id!([<$kind>], __value), )+
+                        // A status read names no content, so there is no grant
+                        // for `serve_one` to record against the peer.
+                        Self::__Status(_) => ::core::option::Option::None,
+                    }
+                }
+            }
+
+            /// This build's declared contract label and derived shape hash.
+            pub const VERSION: $crate::Version = $crate::Version::__new($label, $crate::__schema_hash::<Contract>(PROTOCOL));
+            /// The addressed contract's label and derived shape hash.
+            pub const KEYED_VERSION: $crate::Version = $crate::Version::__new($label, $crate::__schema_hash::<KeyedContract>(KEYED_PROTOCOL));
+        }
+    };
+}
+
+/// Parse and generate frozen contracts and their adjacent conversion steps.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_previous {
+    (@chain [$svc:ident] [$upper:literal] [$($newer:tt)*]) => {};
+    (@chain [$svc:ident] [$upper:literal] [$($newer:tt)*]
+        previous $label:literal { hash $pin:expr; keyed_hash $keyed_pin:expr; $($body:tt)* } $($rest:tt)*) => {
+        $crate::__keylink_previous! {
+            @parse [$svc] [$upper] [$($newer)*] [$label] [$pin, $keyed_pin]
+            @attrs [] @cfg [] @all [] @plain [] @rest [$($body)*]
+        }
+        $crate::pastey::paste! {
+            $crate::__keylink_previous! { @chain [$svc] [$label] [super::[<version_ $label>]] $($rest)* }
+        }
+    };
+
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[defer] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)*] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[cfg($($condition:tt)*)] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)* #[cfg($($condition)*)]] @cfg [$($cfg)* #[cfg($($condition)*)]] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[cfg_attr($condition:meta, $($payload:tt)*)] $($rest:tt)*]) => {
+        $crate::__keylink_cfg_attr! {
+            @svc [@previous $svc $upper $newer $label $pin] @done [$($all)*] @feeds [$($plain)*]
+            @attrs [$($attrs)* #[cfg_attr($condition, $($payload)*)]] @cfg [$($cfg)*] @defer []
+            @guard $condition @payload [$($payload)*] @after [] @rest [$($rest)*]
+        }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[$meta:meta] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)* #[$meta]] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [changed $kind:ident $rpc:ident ($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty; $($rest:tt)*]) => {
+        $crate::__keylink_previous! {
+            @parse $svc $upper $newer $label $pin @attrs [] @cfg []
+            @all [$($all)* { [$($attrs)*] [$($cfg)*] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
+            @plain [$($plain)*] @rest [$($rest)*]
+        }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [$kind:ident $rpc:ident ($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty; $($rest:tt)*]) => {
+        $crate::__keylink_previous! {
+            @parse $svc $upper $newer $label $pin @attrs [] @cfg []
+            @all [$($all)* { [$($attrs)*] [$($cfg)*] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
+            @plain [$($plain)* { [$($cfg)*] $rpc ($($arg),*) }] @rest [$($rest)*]
+        }
+    };
+    (@parse [$svc:ident] [$upper:literal] [$($newer:tt)*] [$label:literal] [$pin:expr, $keyed_pin:expr]
+        @attrs [] @cfg [] @all [$($all:tt)+] @plain [$({ [$(#[$pcfg:meta])*] $plain:ident ($($arg:ident),*) })*] @rest []) => {
+        $crate::pastey::paste! {
+            /// A frozen contract and its conversion step to the next newer shape.
+            pub mod [<version_ $label>] {
+                #![allow(unused_imports, dead_code, missing_docs)]
+                use super::*;
+                // Rust 1.91 cannot alias the parent module with `use super as`.
+                // Re-export named items while keeping call-site imports here.
+                mod __newer {
+                    pub(super) use super::$($newer)*::{Request, Response, __Toward};
+                }
+                $crate::__keylink_contract! { $svc, $label; $($all)+ }
+                const _: () = ::core::assert!($label < $upper, ::core::concat!("previous ", ::core::stringify!($label), " must be lower than ", ::core::stringify!($upper), " in ", ::core::stringify!($svc)));
+                const _: () = ::core::assert!(VERSION.hash() == $pin, ::core::concat!("previous ", ::core::stringify!($label), " of ", ::core::stringify!($svc), " does not hash to its pin: the frozen declaration differs from the one that was current, or keylink's own wire types moved since. Print version_", ::core::stringify!($label), "::VERSION to read what this one hashes to."));
+                const _: () = ::core::assert!(KEYED_VERSION.hash() == $keyed_pin, ::core::concat!("previous keyed ", ::core::stringify!($label), " of ", ::core::stringify!($svc), " does not hash to its keyed pin: print version_", ::core::stringify!($label), "::KEYED_VERSION to inspect the frozen addressed contract."));
+                /// The adjacent conversion step; implement `Convert` for it.
+                pub struct Step;
+                /// Conversions for changed, added and removed methods.
+                #[diagnostic::on_unimplemented(message = "implement this version step's Convert for every changed, added or removed method")]
+                pub trait Convert {
+                    fn upgrade_request(old: Request) -> ::core::result::Result<__newer::Request, $crate::Unsupported>;
+                    fn downgrade_request(new: __newer::Request) -> ::core::result::Result<Request, $crate::Unsupported>;
+                    fn upgrade_response(old: Response) -> ::core::result::Result<__newer::Response, $crate::Unsupported>;
+                    fn downgrade_response(new: __newer::Response) -> ::core::result::Result<Response, $crate::Unsupported>;
+                }
+                impl $crate::Hop for Step {
+                    type Request = Request;
+                    type Response = Response;
+                    type NewerRequest = __newer::Request;
+                    type NewerResponse = __newer::Response;
+                    fn upgrade_request(old: Request) -> ::core::result::Result<__newer::Request, $crate::Unsupported> {
+                        #[allow(unreachable_patterns)]
+                        match old {
+                            $( $(#[$pcfg])* Request::$plain { $($arg),* } => Ok(__newer::Request::$plain { $($arg),* }), )*
+                            Request::__Status {} => Ok(__newer::Request::__Status {}),
+                            other => <Self as Convert>::upgrade_request(other),
+                        }
+                    }
+                    fn downgrade_request(new: __newer::Request) -> ::core::result::Result<Request, $crate::Unsupported> {
+                        #[allow(unreachable_patterns)]
+                        match new {
+                            $( $(#[$pcfg])* __newer::Request::$plain { $($arg),* } => Ok(Request::$plain { $($arg),* }), )*
+                            __newer::Request::__Status {} => Ok(Request::__Status {}),
+                            other => <Self as Convert>::downgrade_request(other),
+                        }
+                    }
+                    fn upgrade_response(old: Response) -> ::core::result::Result<__newer::Response, $crate::Unsupported> {
+                        #[allow(unreachable_patterns)]
+                        match old {
+                            $( $(#[$pcfg])* Response::$plain(v) => Ok(__newer::Response::$plain(v)), )*
+                            Response::__Status(v) => Ok(__newer::Response::__Status(v)),
+                            other => <Self as Convert>::upgrade_response(other),
+                        }
+                    }
+                    fn downgrade_response(new: __newer::Response) -> ::core::result::Result<Response, $crate::Unsupported> {
+                        #[allow(unreachable_patterns)]
+                        match new {
+                            $( $(#[$pcfg])* __newer::Response::$plain(v) => Ok(Response::$plain(v)), )*
+                            __newer::Response::__Status(v) => Ok(Response::__Status(v)),
+                            other => <Self as Convert>::downgrade_response(other),
+                        }
+                    }
+                }
+                #[doc(hidden)] pub type __Toward = (Step, __newer::__Toward);
+            }
+        }
+    };
+    ($($other:tt)*) => { ::core::compile_error!("previous blocks require hash PIN; keyed_hash KEYED_PIN; followed by wire declarations, optionally prefixed with changed, and must follow all current declarations"); };
 }
 
 /// One expansion of [`service!`], inside the library's own test build.

@@ -211,6 +211,8 @@ If you bypass, say so in the pull request, and name which reason applied.
 
 ## The wire contract
 
+A generated service negotiates `<crate>/<Service>/<label>/<shape hash>`; an addressed service adds `/keyed` before the label. The hash is derived from the complete wire shape, not the label. `previous` blocks pin frozen shapes and supply adjacent conversions; see README's **Contract windows**. The per-service `/versions/<probe hash>` protocol reports an admitted peer's window when no version matches.
+
 Keylink has no stable version and has never run in production. A contract-hash
 move therefore costs nothing: do not group commits around one, avoid the correct
 type shape to preserve one, or report one as a compatibility cost.

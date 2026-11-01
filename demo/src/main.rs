@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Note what is NOT in this file: no IP address, no port, no framing, no
-//! serialization call, no ALPN string, no version number. The domain types and
+//! serialization call, no hand-written ALPN string. The domain types and
 //! the two `service!` blocks are the entire protocol definition. A file
 //! transfer is `Body::from_file(path)` on one side and `copy_to(&mut file)` on
 //! the other.
@@ -52,15 +52,6 @@ pub struct Money {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Schema)]
-pub struct Item {
-    pub sku: String,
-    pub name: String,
-    pub price: Money,
-    pub stock: u32,
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Schema)]
 pub enum ReserveOutcome {
     Reserved { remaining: u32 },
     Insufficient { requested: u32, available: u32 },
@@ -83,16 +74,149 @@ pub enum UploadOutcome {
 
 // ─────────────────────────────────────────────────────── the whole protocol
 
-keylink::service! {
-    service Inventory;
+/// Frozen version 2, always built so the pin names its actual derived hash.
+mod frozen {
+    use super::*;
+    #[derive(Debug, Clone, Serialize, Deserialize, Schema)]
+    pub struct Item {
+        pub sku: String,
+        pub name: String,
+        pub price: Money,
+        pub stock: u32,
+        pub tags: Vec<String>,
+    }
 
-    rpc  Ping() -> String;
-    rpc  List() -> Vec<Item>;
-    rpc  GetItem(sku: String) -> Option<Item>;
-    rpc  Reserve(sku: String, qty: u32) -> ReserveOutcome;
+    keylink::service! {
+        service Inventory;
+        version 2;
 
-    recv Fetch(sku: String, kib: u32) -> Datasheet;
+        rpc  Ping() -> String;
+        rpc  List() -> Vec<Item>;
+        rpc  GetItem(sku: String) -> Option<Item>;
+        rpc  Reserve(sku: String, qty: u32) -> ReserveOutcome;
+
+        recv Fetch(sku: String, kib: u32) -> Datasheet;
+    }
 }
+#[cfg(feature = "previous-contract")]
+use frozen as current;
+#[cfg(not(feature = "previous-contract"))]
+mod current {
+    use super::*;
+    #[derive(Debug, Clone, Serialize, Deserialize, Schema)]
+    pub struct Item {
+        pub sku: String,
+        pub name: String,
+        pub price: Money,
+        pub stock: u32,
+        pub tags: Vec<String>,
+        pub aisle: Option<u16>,
+    }
+
+    keylink::service! {
+        service Inventory;
+        version 3;
+
+        rpc  Ping() -> String;
+        rpc  List() -> Vec<Item>;
+        rpc  GetItem(sku: String) -> Option<Item>;
+        rpc  Reserve(sku: String, qty: u32) -> ReserveOutcome;
+
+        recv Fetch(sku: String, kib: u32) -> Datasheet;
+        rpc Count() -> u64;
+        previous 2 {
+            hash crate::frozen::inventory::VERSION.hash(); keyed_hash crate::frozen::inventory::KEYED_VERSION.hash();
+            rpc Ping() -> String;
+            changed rpc List() -> Vec<crate::frozen::Item>;
+            changed rpc GetItem(sku: String) -> Option<crate::frozen::Item>;
+            rpc Reserve(sku: String, qty: u32) -> ReserveOutcome;
+            recv Fetch(sku: String, kib: u32) -> Datasheet;
+        }
+    }
+
+    impl From<frozen::Item> for Item {
+        fn from(old: frozen::Item) -> Self {
+            Self {
+                sku: old.sku,
+                name: old.name,
+                price: old.price,
+                stock: old.stock,
+                tags: old.tags,
+                aisle: None,
+            }
+        }
+    }
+    impl From<Item> for frozen::Item {
+        fn from(new: Item) -> Self {
+            Self {
+                sku: new.sku,
+                name: new.name,
+                price: new.price,
+                stock: new.stock,
+                tags: new.tags,
+            }
+        }
+    }
+    impl inventory::version_2::Convert for inventory::version_2::Step {
+        fn upgrade_request(
+            old: inventory::version_2::Request,
+        ) -> std::result::Result<inventory::Request, keylink::Unsupported> {
+            use inventory::{version_2::Request as Old, Request as New};
+            match old {
+                Old::List {} => Ok(New::List {}),
+                Old::GetItem { sku } => Ok(New::GetItem { sku }),
+                _ => Err(keylink::Unsupported::new(
+                    "Inventory",
+                    "carried by generated arms",
+                )),
+            }
+        }
+        fn downgrade_request(
+            new: inventory::Request,
+        ) -> std::result::Result<inventory::version_2::Request, keylink::Unsupported> {
+            use inventory::{version_2::Request as Old, Request as New};
+            match new {
+                New::List {} => Ok(Old::List {}),
+                New::GetItem { sku } => Ok(Old::GetItem { sku }),
+                New::Count {} => Err(keylink::Unsupported::new(
+                    "Count",
+                    "version 2 has no Count method",
+                )),
+                _ => Err(keylink::Unsupported::new(
+                    "Inventory",
+                    "carried by generated arms",
+                )),
+            }
+        }
+        fn upgrade_response(
+            old: inventory::version_2::Response,
+        ) -> std::result::Result<inventory::Response, keylink::Unsupported> {
+            use inventory::{version_2::Response as Old, Response as New};
+            match old {
+                Old::List(items) => Ok(New::List(items.into_iter().map(Into::into).collect())),
+                Old::GetItem(item) => Ok(New::GetItem(item.map(Into::into))),
+                _ => Err(keylink::Unsupported::new(
+                    "Inventory",
+                    "carried by generated arms",
+                )),
+            }
+        }
+        fn downgrade_response(
+            new: inventory::Response,
+        ) -> std::result::Result<inventory::version_2::Response, keylink::Unsupported> {
+            use inventory::{version_2::Response as Old, Response as New};
+            match new {
+                New::List(items) => Ok(Old::List(items.into_iter().map(Into::into).collect())),
+                New::GetItem(item) => Ok(Old::GetItem(item.map(Into::into))),
+                _ => Err(keylink::Unsupported::new(
+                    "Inventory",
+                    "version 2 has no such reply",
+                )),
+            }
+        }
+    }
+}
+use current::{inventory, Item};
 
 // `Upload` used to be a sixth method on `Inventory`. It cannot be one now that
 // the warehouse is an actor: `Handle::service` refuses to compile for a service
@@ -210,6 +334,8 @@ impl Warehouse {
                     },
                     stock,
                     tags: tags.into_iter().map(String::from).collect(),
+                    #[cfg(not(feature = "previous-contract"))]
+                    aisle: Some(3),
                 },
             );
         }
@@ -218,6 +344,11 @@ impl Warehouse {
 }
 
 impl inventory::Actor for Warehouse {
+    #[cfg(not(feature = "previous-contract"))]
+    async fn count(&mut self, _cx: Caller<'_>) -> u64 {
+        self.items.len() as u64
+    }
+
     async fn ping(&mut self, _cx: Caller<'_>) -> String {
         format!("ok from {}", hostname())
     }
@@ -514,6 +645,12 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     println!("dialing as: {}", node.id());
 
     let client = inventory::Client::connect(&node, peer.clone()).await?;
+    println!(
+        "speaking {} ({})",
+        client.version().label(),
+        client.version()
+    );
+    println!("local window: {}", inventory::window());
 
     // ── everything below is ordinary async Rust. No transport in sight. ──
     println!("\nping        -> {}", client.ping().await?);
@@ -521,6 +658,7 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     let items = client.list().await?;
     println!("list        -> {} items", items.len());
     for item in &items {
+        println!("item        -> {item:?}");
         println!(
             "               {:<8} {:<28} {:>8} un  {:?}",
             item.sku, item.name, item.stock, item.price.currency
@@ -557,7 +695,21 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
         dock.close().await?;
     }
 
+    #[cfg(not(feature = "previous-contract"))]
+    match client.count().await {
+        Ok(count) => {
+            anyhow::ensure!(count == items.len() as u64, "Count disagreed with List");
+            println!("count       -> {count}");
+        }
+        Err(keylink::Error::UnsupportedRequest { version, source })
+            if version.label() == 2 && source.method() == "Count" =>
+        {
+            println!("count       -> Unsupported ({source})")
+        }
+        Err(error) => return Err(error.into()),
+    }
     client.close().await?;
+    println!("contract: OK");
     Ok(())
 }
 
