@@ -2024,7 +2024,7 @@ async fn an_attach_that_outlives_its_budget_returns() {
             key("k"),
             Duration::from_millis(150),
         ))
-        .slow(3_000)
+        .slow(0)
         .await
         .expect_err("the budget runs out while the first call is still running");
 

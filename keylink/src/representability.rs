@@ -101,8 +101,8 @@ use crate::compose::{BroadcastDepth, Lossy, LossySubscription, LossyTopic, Overf
 use crate::{
     ActorId, ActorStatus, Addressed, Admission, Admittance, AdmittedPeer, Allowlist, Authorization,
     Backpressure, BlobId, Caller, Content, DynamicAdmission, Ended, Eviction, FinishFut, Grant,
-    IdempotencyKey, Intensity, Keyable, LocalActor, MountError, Observer, Origin,
-    ProvenPeer, Records, Retention, SeqId, TurnFut, TurnInfo, TurnOutcome, Unanswered,
+    IdempotencyKey, Intensity, Keyable, LocalActor, MountError, Observer, Origin, ProvenPeer,
+    Records, Retention, SeqId, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
