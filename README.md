@@ -240,7 +240,7 @@ With no common contract, the dial returns `Error::SchemaMismatch(Box<Mismatch>)`
 
 ### Contract windows
 
-Declare `version 3;` immediately after `service Inventory;`; leaving it out means version 1. Add `previous 2 { hash frozen::inventory::VERSION.hash(); ... }` after every current declaration. Repeat the original wire declarations in their original order. A shipped application's pin is the literal hash read from that release's `VERSION`; examples in this repository name a frozen module's `VERSION` so changes to keylink's own wire remain free.
+Declare `version 3;` immediately after `service Inventory;`; leaving it out means version 1. Add `previous 2 { hash frozen::inventory::VERSION.hash(); ... }` after every current declaration. Repeat the original wire declarations in their original order, including attributes: serde metadata can change the schema hash, and configuration attributes gate the declarations and conversion arms together. A shipped application's pin is the literal hash read from that release's `VERSION`; examples in this repository name a frozen module's `VERSION` so changes to keylink's own wire remain free.
 
 Mark each changed or removed method `changed`. Implement the generated `version_2::Convert` for `version_2::Step`: all four request/reply upgrade/downgrade functions are required. Unchanged methods are carried automatically. More blocks extend the window through adjacent conversion steps. Blocks must descend by label, and a frozen declaration that no longer matches its pin fails to compile. Use `crate::` paths inside blocks rather than `super::`, since the frozen types live one generated module deeper. See `demo/src/main.rs` for the complete implementation.
 

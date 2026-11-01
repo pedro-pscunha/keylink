@@ -288,8 +288,11 @@
 /// `previous N { hash PIN; ... }` blocks after every declaration and feed, newest
 /// first. A block repeats that version's wire declarations in their original
 /// order, with `changed` before the kinds whose conversions the application writes.
-/// It accepts no attributes, feeds or `#[defer]`, since those do not describe wire
-/// shapes. Unmarked type changes fail in the generated plain conversion arms.
+/// Attributes are preserved just as on current declarations: serde metadata
+/// can change the wire hash, and cfg/cfg_attr gates the contract and conversion
+/// arms together. `#[defer]` is consumed because it changes no wire shape.
+/// Feeds remain local and do not belong in a frozen wire block.
+/// Unmarked type changes fail in the generated plain conversion arms.
 ///
 /// Each block generates `version_N::{Request, Response, Step, Convert, VERSION}`.
 /// Implement all four `Convert` methods for `Step`; generated arms carry plain
@@ -544,6 +547,12 @@ macro_rules! __keylink_cfg_attr {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_service_munch {
+    // Shared cfg_attr parsing resumes the frozen declaration parser here.
+    (@svc [@previous $svc:tt $upper:tt $newer:tt $label:tt $pin:tt]
+        @done [$($all:tt)*] @feeds [$($plain:tt)*] @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @defer [] @rest [$($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)*] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+
     (
         @svc [ $svc:ident $version:literal ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
         @attrs [ ] @cfg [ ] @defer [ ]
@@ -10190,32 +10199,57 @@ macro_rules! __keylink_previous {
         previous $label:literal { hash $pin:expr; $($body:tt)* } $($rest:tt)*) => {
         $crate::__keylink_previous! {
             @parse [$svc] [$upper] [$($newer)*] [$label] [$pin]
-            @all [] @plain [] @rest [$($body)*]
+            @attrs [] @cfg [] @all [] @plain [] @rest [$($body)*]
         }
         $crate::pastey::paste! {
             $crate::__keylink_previous! { @chain [$svc] [$label] [super::[<version_ $label>]] $($rest)* }
         }
     };
+
     (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
-        @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[defer] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)*] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[cfg($($condition:tt)*)] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)* #[cfg($($condition)*)]] @cfg [$($cfg)* #[cfg($($condition)*)]] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[cfg_attr($condition:meta, $($payload:tt)*)] $($rest:tt)*]) => {
+        $crate::__keylink_cfg_attr! {
+            @svc [@previous $svc $upper $newer $label $pin] @done [$($all)*] @feeds [$($plain)*]
+            @attrs [$($attrs)* #[cfg_attr($condition, $($payload)*)]] @cfg [$($cfg)*] @defer []
+            @guard $condition @payload [$($payload)*] @after [] @rest [$($rest)*]
+        }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @rest [#[$meta:meta] $($rest:tt)*]) => {
+        $crate::__keylink_previous! { @parse $svc $upper $newer $label $pin @attrs [$($attrs)* #[$meta]] @cfg [$($cfg)*] @all [$($all)*] @plain [$($plain)*] @rest [$($rest)*] }
+    };
+    (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
         @rest [changed $kind:ident $rpc:ident ($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty; $($rest:tt)*]) => {
         $crate::__keylink_previous! {
-            @parse $svc $upper $newer $label $pin
-            @all [$($all)* { [] [] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
+            @parse $svc $upper $newer $label $pin @attrs [] @cfg []
+            @all [$($all)* { [$($attrs)*] [$($cfg)*] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
             @plain [$($plain)*] @rest [$($rest)*]
         }
     };
     (@parse $svc:tt $upper:tt $newer:tt $label:tt $pin:tt
-        @all [$($all:tt)*] @plain [$($plain:tt)*]
+        @attrs [$($attrs:tt)*] @cfg [$($cfg:tt)*] @all [$($all:tt)*] @plain [$($plain:tt)*]
         @rest [$kind:ident $rpc:ident ($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty; $($rest:tt)*]) => {
         $crate::__keylink_previous! {
-            @parse $svc $upper $newer $label $pin
-            @all [$($all)* { [] [] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
-            @plain [$($plain)* { $rpc ($($arg),*) }] @rest [$($rest)*]
+            @parse $svc $upper $newer $label $pin @attrs [] @cfg []
+            @all [$($all)* { [$($attrs)*] [$($cfg)*] [] $kind $rpc ($($arg : $ty),*) -> $ret }]
+            @plain [$($plain)* { [$($cfg)*] $rpc ($($arg),*) }] @rest [$($rest)*]
         }
     };
     (@parse [$svc:ident] [$upper:literal] [$($newer:tt)*] [$label:literal] [$pin:expr]
-        @all [$($all:tt)+] @plain [$({ $plain:ident ($($arg:ident),*) })*] @rest []) => {
+        @attrs [] @cfg [] @all [$($all:tt)+] @plain [$({ [$(#[$pcfg:meta])*] $plain:ident ($($arg:ident),*) })*] @rest []) => {
         $crate::pastey::paste! {
             /// A frozen contract and its conversion step to the next newer shape.
             pub mod [<version_ $label>] {
@@ -10243,7 +10277,7 @@ macro_rules! __keylink_previous {
                     fn upgrade_request(old: Request) -> ::core::result::Result<__newer::Request, $crate::Unsupported> {
                         #[allow(unreachable_patterns)]
                         match old {
-                            $( Request::$plain { $($arg),* } => Ok(__newer::Request::$plain { $($arg),* }), )*
+                            $( $(#[$pcfg])* Request::$plain { $($arg),* } => Ok(__newer::Request::$plain { $($arg),* }), )*
                             Request::__Status {} => Ok(__newer::Request::__Status {}),
                             other => <Self as Convert>::upgrade_request(other),
                         }
@@ -10251,7 +10285,7 @@ macro_rules! __keylink_previous {
                     fn downgrade_request(new: __newer::Request) -> ::core::result::Result<Request, $crate::Unsupported> {
                         #[allow(unreachable_patterns)]
                         match new {
-                            $( __newer::Request::$plain { $($arg),* } => Ok(Request::$plain { $($arg),* }), )*
+                            $( $(#[$pcfg])* __newer::Request::$plain { $($arg),* } => Ok(Request::$plain { $($arg),* }), )*
                             __newer::Request::__Status {} => Ok(Request::__Status {}),
                             other => <Self as Convert>::downgrade_request(other),
                         }
@@ -10259,7 +10293,7 @@ macro_rules! __keylink_previous {
                     fn upgrade_response(old: Response) -> ::core::result::Result<__newer::Response, $crate::Unsupported> {
                         #[allow(unreachable_patterns)]
                         match old {
-                            $( Response::$plain(v) => Ok(__newer::Response::$plain(v)), )*
+                            $( $(#[$pcfg])* Response::$plain(v) => Ok(__newer::Response::$plain(v)), )*
                             Response::__Status(v) => Ok(__newer::Response::__Status(v)),
                             other => <Self as Convert>::upgrade_response(other),
                         }
@@ -10267,7 +10301,7 @@ macro_rules! __keylink_previous {
                     fn downgrade_response(new: __newer::Response) -> ::core::result::Result<Response, $crate::Unsupported> {
                         #[allow(unreachable_patterns)]
                         match new {
-                            $( __newer::Response::$plain(v) => Ok(Response::$plain(v)), )*
+                            $( $(#[$pcfg])* __newer::Response::$plain(v) => Ok(Response::$plain(v)), )*
                             __newer::Response::__Status(v) => Ok(Response::__Status(v)),
                             other => <Self as Convert>::downgrade_response(other),
                         }

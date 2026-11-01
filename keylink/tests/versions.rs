@@ -742,3 +742,77 @@ mod blob_versions {
         assert_eq!(guessed.verified_len().await.unwrap(), 8);
     }
 }
+
+mod attributed {
+    mod old {
+        keylink::service! {
+            service Attributed; version 1;
+            #[serde(rename = "wire-name")]
+            rpc Echo(value: u32) -> u32;
+            #[cfg(any())]
+            rpc Hidden(value: TypeThatMustNeverResolve) -> u8;
+            #[cfg_attr(all(), cfg(any()))]
+            rpc Nested(value: AnotherAbsentType) -> u8;
+        }
+    }
+    keylink::service! {
+        service Attributed; version 2;
+        #[serde(rename = "wire-name")]
+        rpc Echo(value: u32) -> u32;
+        #[cfg(any())]
+        rpc Hidden(value: TypeThatMustNeverResolve) -> u8;
+        #[cfg_attr(all(), cfg(any()))]
+        rpc Nested(value: AnotherAbsentType) -> u8;
+        previous 1 {
+            hash old::attributed::VERSION.hash();
+            #[serde(rename = "wire-name")]
+            rpc Echo(value: u32) -> u32;
+            #[cfg(any())]
+            rpc Hidden(value: TypeThatMustNeverResolve) -> u8;
+            #[cfg_attr(all(), cfg(any()))]
+            rpc Nested(value: AnotherAbsentType) -> u8;
+        }
+    }
+    impl attributed::version_1::Convert for attributed::version_1::Step {
+        fn upgrade_request(
+            _: attributed::version_1::Request,
+        ) -> Result<attributed::Request, keylink::Unsupported> {
+            unreachable!()
+        }
+        fn downgrade_request(
+            _: attributed::Request,
+        ) -> Result<attributed::version_1::Request, keylink::Unsupported> {
+            unreachable!()
+        }
+        fn upgrade_response(
+            _: attributed::version_1::Response,
+        ) -> Result<attributed::Response, keylink::Unsupported> {
+            unreachable!()
+        }
+        fn downgrade_response(
+            _: attributed::Response,
+        ) -> Result<attributed::version_1::Response, keylink::Unsupported> {
+            unreachable!()
+        }
+    }
+    struct Handler;
+    impl attributed::Handler for Handler {
+        async fn echo(&self, _cx: &keylink::Context, value: u32) -> u32 {
+            value
+        }
+    }
+    /// Watched red: retain only cfg attributes in plain frozen declarations,
+    /// dropping serde metadata. Compilation failed with E0080 at this fixture's
+    /// pinned hash, not at an absent cfg type. Restored full metadata.
+    #[tokio::test]
+    async fn previous_keeps_serde_and_configuration_attributes() {
+        let server = super::node().await;
+        let caller = super::node().await;
+        let _running = attributed::serve(&server, Handler, keylink::Allowlist::anyone()).unwrap();
+        let c = old::attributed::Client::connect(&caller, server.endpoint().addr())
+            .await
+            .unwrap();
+        assert_eq!(c.echo(19).await.unwrap(), 19);
+        assert_eq!(attributed::version_1::VERSION, old::attributed::VERSION);
+    }
+}
