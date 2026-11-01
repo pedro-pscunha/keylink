@@ -162,8 +162,8 @@ can hang. See the design item below.
 `tests/singleton.rs:558-559` says "One mailbox, two doors. A local call and a
 remote call to the same actor are serialized against each other", pinned by
 `local_and_remote_messages_share_one_mailbox`. No RFC claims it. That test
-survives — its 20 ms sleep puts the remote message inside its turn before the
-local call exists, and turns stay serial at `run_loop:1772` under any split. What
+survives — its wait for the actor to report busy puts the remote message inside its turn
+before the local call exists, and turns stay serial at `run_loop:1772` under any split. What
 does not survive is `entries_behind_a_held_turn`, which names FIFO as its method
 twice (`singleton.rs:759-761`, `806-807`) and reads a remote message through a
 local call. Resequence it onto a fact. Total: one doc sentence, one narrowed

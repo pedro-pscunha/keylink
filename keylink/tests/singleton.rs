@@ -172,6 +172,14 @@ async fn release_after_the_queued_budget(
     release: &Semaphore,
     budget: Duration,
 ) {
+    until_queued(actor).await;
+    tokio::time::sleep(budget * 2).await;
+    // Every turn after the held one passes too.
+    release.add_permits(16);
+}
+
+/// Wait until one message sits in the actor's mailbox behind the turn in progress.
+async fn until_queued(actor: &ledger::Handle<Ledger>) {
     tokio::time::timeout(Duration::from_secs(120), async {
         while actor.status().queued != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -179,9 +187,6 @@ async fn release_after_the_queued_budget(
     })
     .await
     .expect("the second message reached the mailbox within 120 s");
-    tokio::time::sleep(budget * 2).await;
-    // Every turn after the held one passes too.
-    release.add_permits(16);
 }
 
 // ────────────────────────────────────────────────────────── the local handle
@@ -620,24 +625,42 @@ async fn an_upload_goes_to_a_second_service_beside_the_actor() {
 /// serialized against each other, not merely against their own kind.
 #[tokio::test]
 async fn local_and_remote_messages_share_one_mailbox() {
-    let (server, actor, client) = served().await;
-    let seen = Arc::new(AtomicUsize::new(0));
+    let node = local_node().await;
+    let caller = local_node().await;
+    let release = Arc::new(Semaphore::new(0));
+    let actor = ledger::actor(Ledger {
+        release: Some(release.clone()),
+        ..Ledger::default()
+    });
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
 
     let remote = {
-        let seen = seen.clone();
-        tokio::spawn(async move {
-            let answer = client.post(1, 80).await.expect("answers");
-            seen.fetch_add(1, Ordering::SeqCst);
-            (answer, client)
-        })
+        let client = client.clone();
+        tokio::spawn(async move { client.post(1, 0).await })
     };
-
     // The remote call must be the one inside the turn, or there is no order to
     // read: asked of the actor, not slept for.
     until_busy(&actor).await;
-    let local = actor.post(2, 0).await.expect("running");
-    let (remote_answer, client) = remote.await.expect("no panic");
 
+    // The remote turn is parked, so the local call cannot run while it does: it
+    // either waits in the one mailbox, which is the claim, or it runs inside the
+    // remote turn and `Ledger::post`'s overlap assertion fires. The turn is let go
+    // only once the mailbox holds the local call, so no window decides which.
+    let local = {
+        let actor = actor.clone();
+        tokio::spawn(async move { actor.post(2, 0).await })
+    };
+    until_queued(&actor).await;
+    release.add_permits(16);
+
+    let remote_answer = remote.await.expect("no panic").expect("answers");
+    let local = local.await.expect("no panic").expect("running");
     assert_eq!(remote_answer, 1, "the remote call took the first turn");
     assert_eq!(local, 2, "and the local call waited for it");
 
@@ -854,7 +877,12 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
 /// message behind is held until twice this has passed with the message in the
 /// mailbox, so a message queued behind it has provably run out of budget before
 /// the actor is free again, whichever bound is in front of it.
-const BUDGET: Duration = Duration::from_millis(100);
+///
+/// **The one bet left, stated:** a `Timeout` starts at the call's arrival, so the
+/// message must reach the mailbox before this budget runs out, or the wait for it
+/// (`until_queued`) reads a message the bound already dropped and fails after two
+/// minutes. A second is a stall of a second between two adjacent in-process steps.
+const BUDGET: Duration = Duration::from_secs(1);
 
 /// The three facts one keyed message behind a held turn leaves behind.
 ///
@@ -1042,8 +1070,9 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
 /// two guards disagree about which one a peer gets.
 ///
 /// **The mailbox is filled with a permit, not with a held turn.** The two tests
-/// above sleep 80 ms to be sure a message is *in* its turn rather than racing for
-/// it; a permit needs neither, because a permit **is** the capacity. At
+/// above hold a turn on a semaphore and wait for the actor to report it busy, to
+/// be sure a message is *in* its turn rather than racing for it; a permit needs
+/// neither, because a permit **is** the capacity. At
 /// `Shed(1)` one outstanding permit is a full mailbox by construction, with no
 /// clock read anywhere and nothing to race.
 ///
