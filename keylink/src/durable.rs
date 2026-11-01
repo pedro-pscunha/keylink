@@ -10,10 +10,12 @@
 //! One entry per claimed key, keyed on the pair the ledger keys on — the peer
 //! iroh proved, and the key that peer chose. A value starts with a one-byte
 //! request-binding/version tag, a 32-byte request-and-authority commitment, and
-//! a one-byte state: 34 fixed bytes. A recordable settled reply appends its frame.
-//! The commitment binds received message bytes (not retry controls) and the
-//! selected principal and holder. Legacy unbound values are refused during
-//! recovery, never migrated or replayed with an invented binding.
+//! a one-byte state: 34 fixed bytes. A done reply then stores its contract label
+//! (u32 LE), shape hash (u64 LE), and header frame. The commitment binds received
+//! message bytes (not retry controls), the negotiated label, and the selected
+//! principal and holder. Legacy unbound values are refused during recovery,
+//! never migrated with an invented binding. Bound replies whose contract is
+//! unknown or whose frame is malformed become Forgotten with their binding kept.
 //!
 //! **The in-flight half is not stored and cannot be.** A claimed key belongs to
 //! a caller holding a live QUIC stream, and no disk carries one of those across
@@ -368,6 +370,7 @@ pub struct DurableRecords {
 }
 
 pub(crate) type Recovered = (EndpointId, IdempotencyKey, [u8; 32], Slot);
+type StoredRecord = (EndpointId, IdempotencyKey, [u8; 32], StoredSlot);
 
 /// The claimed store, and what it held when this process opened it.
 struct Store {
@@ -377,7 +380,7 @@ struct Store {
     ///
     /// A `std::sync::Mutex` and not the async one beside it: this is taken from
     /// `Ledger::new`, which is not a future, and holding it spans no await.
-    recovered: std::sync::Mutex<Vec<(EndpointId, IdempotencyKey, [u8; 32], StoredSlot)>>,
+    recovered: std::sync::Mutex<Vec<StoredRecord>>,
     /// Entries written since the log was last rewritten. Read against the live
     /// count, which only the ledger knows.
     since_compaction: AtomicU64,
@@ -433,10 +436,7 @@ impl DurableRecords {
     /// The ledger built from these records takes them; a second reader gets
     /// nothing, which is the honest answer — there is one ledger per store, and
     /// this value is how the first one is told what it already knows.
-    pub(crate) fn take_recovered(
-        &self,
-        upgrade: &crate::version::UpgradeRecord,
-    ) -> Vec<Recovered> {
+    pub(crate) fn take_recovered(&self, upgrade: &crate::version::UpgradeRecord) -> Vec<Recovered> {
         let mut held = self
             .store
             .recovered
@@ -444,7 +444,9 @@ impl DurableRecords {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *held)
             .into_iter()
-            .map(|(peer, key, fingerprint, stored)| (peer, key, fingerprint, stored.recover(upgrade)))
+            .map(|(peer, key, fingerprint, stored)| {
+                (peer, key, fingerprint, stored.recover(upgrade))
+            })
             .collect()
     }
 
@@ -648,9 +650,10 @@ mod versioned_records {
         )));
         let codec = lineage.records();
         let restore = |frame: Bytes| {
-            let encoded = encode_slot(&Slot::Done(frame), version);
+            let encoded = encode_slot(&Slot::Done(frame), [0; 32], version);
             decode_slot(&encoded)
                 .expect("valid full version identity")
+                .1
                 .recover(codec.upgrade.as_ref())
         };
         for len in 0..4 {
@@ -698,7 +701,10 @@ mod tests {
         ] {
             let bytes = encode_slot(&slot, [9; 32], crate::Version::__new(1, 0));
             let (fingerprint, stored) = decode_slot(&bytes).unwrap();
-            let decoded = match stored { StoredSlot::Plain(slot) => slot, StoredSlot::Done { frame, .. } => Slot::Done(frame) };
+            let decoded = match stored {
+                StoredSlot::Plain(slot) => slot,
+                StoredSlot::Done { frame, .. } => Slot::Done(frame),
+            };
             assert_eq!(fingerprint, [9; 32]);
             assert_eq!(
                 std::mem::discriminant(&decoded),

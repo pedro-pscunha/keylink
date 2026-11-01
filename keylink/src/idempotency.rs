@@ -2318,7 +2318,11 @@ impl Ledger {
     ) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if store.write(peer, key, slot, fingerprint, self.contract_version).await.is_err() {
+            if store
+                .write(peer, key, slot, fingerprint, self.contract_version)
+                .await
+                .is_err()
+            {
                 return Err(IdempotencyRefusal::Unrecordable.into());
             }
         }
@@ -2409,9 +2413,11 @@ impl Ledger {
             None => Reconcile::Erase,
             Some(entry) => match &entry.slot {
                 Slot::Running(_) => Reconcile::Untouched,
-                settled => {
-                    Reconcile::Write(crate::durable::encode_slot(settled, entry.fingerprint, self.contract_version))
-                }
+                settled => Reconcile::Write(crate::durable::encode_slot(
+                    settled,
+                    entry.fingerprint,
+                    self.contract_version,
+                )),
             },
         }
     }
@@ -3502,7 +3508,11 @@ mod tests {
         /// `right: Unrecordable`.
         #[test]
         fn a_retention_refusal_is_told_apart_from_an_eviction() {
-            let ledger = Ledger::new(holding(1), Records::None);
+            let ledger = Ledger::new(
+                holding(1),
+                Records::None,
+                crate::version::RecordCodec::testing(),
+            );
             settle(
                 guard(ledger.claim(peer(A), key("kept"), [0; 32])),
                 &frame(8),
@@ -3515,7 +3525,11 @@ mod tests {
                 "a configured retention policy is not an eviction"
             );
 
-            let evicting = Ledger::new(holding(1), Records::Memory);
+            let evicting = Ledger::new(
+                holding(1),
+                Records::Memory,
+                crate::version::RecordCodec::testing(),
+            );
             settle(
                 guard(evicting.claim(peer(A), key("old"), [0; 32])),
                 &frame(8),
@@ -3731,7 +3745,11 @@ mod tests {
         /// helper.
         #[test]
         fn memory_records_and_replays() {
-            let ledger = Ledger::new(Limits::default(), Records::Memory);
+            let ledger = Ledger::new(
+                Limits::default(),
+                Records::Memory,
+                crate::version::RecordCodec::testing(),
+            );
             settle(
                 guard(ledger.claim(peer(A), key("k"), [0; 32])),
                 &frame(16),
@@ -4870,7 +4888,11 @@ mod tests {
     }
     #[test]
     fn request_fingerprints_bind_running_settled_and_recovered_records() {
-        let ledger = Ledger::new(Limits::default(), Records::Memory);
+        let ledger = Ledger::new(
+            Limits::default(),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        );
         let first = guard(ledger.claim(peer(A), key("bound"), [1; 32]));
         assert_eq!(
             refusal(ledger.claim(peer(A), key("bound"), [2; 32])),
@@ -4888,6 +4910,7 @@ mod tests {
         #[cfg(feature = "persist")]
         {
             let recovered = Arc::new(Ledger {
+                contract_version: crate::Version::__new(0, 0),
                 inner: Mutex::new(recover(vec![(
                     peer(A),
                     key("bound"),

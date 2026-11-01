@@ -225,18 +225,14 @@ impl FrameReader {
             .transpose()
     }
 
-    /// Decode controls once and hash the remaining received message bytes before
-    /// deserialization can change map iteration order or any other representation.
-    pub(crate) async fn read_request<T: DeserializeOwned>(
-        &mut self,
-    ) -> Result<Option<(Envelope<T>, [u8; 32])>> {
+    /// Hash the caller's exact message bytes before version conversion or decoding.
+    pub(crate) async fn read_request_frame(&mut self) -> Result<Option<(Bytes, [u8; 32])>> {
         let Some(frame) = self.read_frame().await? else {
             return Ok(None);
         };
-        let (control, message_bytes) = postcard::take_from_bytes::<Control>(&frame)?;
+        let (_, message_bytes) = postcard::take_from_bytes::<Control>(&frame)?;
         let fingerprint = *blake3::hash(message_bytes).as_bytes();
-        let message = postcard::from_bytes(message_bytes)?;
-        Ok(Some((Envelope { control, message }, fingerprint)))
+        Ok(Some((frame, fingerprint)))
     }
 
     pub(crate) async fn read_frame(&mut self) -> Result<Option<Bytes>> {

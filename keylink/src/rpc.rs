@@ -191,10 +191,15 @@ pub trait Governed: GovernedSeal {}
 pub trait GovernedSeal {}
 
 // The ledger stores this commitment unchanged, including across durable recovery.
-// An identical request under another selected principal is not the same replay.
-fn replay_binding(message: [u8; 32], credential: Option<&crate::trust::Credential>) -> [u8; 32] {
+// An identical request under another negotiated label or selected principal is not the same replay.
+fn replay_binding(
+    message: [u8; 32],
+    credential: Option<&crate::trust::Credential>,
+    version: u32,
+) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"keylink replay binding v1");
+    hash.update(b"keylink replay binding v2");
+    hash.update(&version.to_le_bytes());
     hash.update(&message);
     match credential {
         Some(credential) => {
@@ -730,7 +735,7 @@ where
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some(frame) = frames.read_frame().await? else {
+    let Some((frame, received_fingerprint)) = frames.read_request_frame().await? else {
         return Ok(());
     };
     let request = match codec.decode_request(&frame)? {
@@ -763,7 +768,11 @@ where
     // One commitment drives both replay stores: the transport ledger and the
     // application's Applied state reached through Context::call.
     let fingerprint = if request.control.idempotency.is_some() {
-        replay_binding(received_fingerprint, credential.as_deref())
+        replay_binding(
+            received_fingerprint,
+            credential.as_deref(),
+            codec.version().label(),
+        )
     } else {
         [0; 32]
     };
@@ -825,10 +834,9 @@ where
     )
     .await;
 
-    // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
-    // is written, and that order is the whole property: the address reaches the
-    // caller only in this reply, so a peer cannot race ahead and fetch content
-    // it has not been told about.
+    // Prepare the negotiated reply before reserving its Content, and make the
+    // permit live before writing it. Conversion refusals reserve nothing; a
+    // successful conversion preserves the Content kind and root.
     //
     // This is also the only place both halves exist. The handler returned the
     // content and knows nothing about peers; `accept` proved the peer and knows
@@ -838,23 +846,42 @@ where
     //
     // **Two phases, because the ledger can refuse and a durable idempotency
     // ledger can too.** Reserving is where the byte budget answers: a reply that
-    // cannot be granted is replaced by `GrantsExhausted` before it is encoded, so
-    // the caller is never handed an address it cannot spend, and that refusal is
-    // what a keyed retry replays. Committing waits for the idempotency ledger to
+    // cannot be granted is replaced by `GrantsExhausted` in both the current
+    // record and the negotiated frame, so the caller is never handed unusable
+    // content and the same refusal is what a keyed retry replays. Committing waits for the idempotency ledger to
     // settle, because a grant made live above and a record refused below would
     // leave the far side holding a live grant for an address this reply never
     // carried. An early return drops the permit, which releases the reservation.
-    let (outcome, permit) = grant_or_refuse(
-        grants.as_ref().map(|(blobs, fence)| (blobs, fence)),
-        &admitted,
-        outcome,
-    );
-
-    let frame = wire::encode_header(
+    let current_grant = match &outcome {
+        Outcome::Ok(response) => response.granted(),
+        Outcome::Err(_) => None,
+    };
+    let mut frame = wire::encode_header(
         body.declared_len(),
         None,
         &WireResponse::<Resp>::Call(outcome),
     )?;
+    // Convert first. A refusal reserves nothing, and successful conversion must
+    // preserve the complete Content (both kind and root), not merely its bytes.
+    let converted = codec.reencode_response(frame.clone(), current_grant)?;
+    let (converted, permit) = grant_or_refuse(
+        grants.as_ref().map(|(blobs, fence)| (blobs, fence)),
+        &admitted,
+        Outcome::Ok(converted),
+    );
+    let encoded = match converted {
+        Outcome::Ok(encoded) => encoded,
+        Outcome::Err(refusal) => {
+            frame = wire::encode_header(
+                Some(0),
+                None,
+                &WireResponse::<Resp>::Call(Outcome::Err(refusal)),
+            )?;
+            let mut encoded = codec.reencode_response(frame.clone(), None)?;
+            encoded.carry_body = false;
+            encoded
+        }
+    };
     // Settled before the reply is written, so a reply lost on the way back
     // still replays. That is the failure this exists for: the handler finished
     // and the caller never heard.
@@ -894,7 +921,6 @@ where
             Reached::Dispatched => drop(guard),
         }
     }
-    let encoded = codec.reencode_response(frame, GrantSource::Current(granting))?;
     if let Some(permit) = permit {
         permit.commit();
     }
@@ -1103,10 +1129,14 @@ mod tests {
         let original = credential(&a, first.public());
         let different_principal = credential(&b, first.public());
         let different_holder = credential(&a, second.public());
-        let bound = replay_binding([9; 32], Some(&original));
-        assert_ne!(bound, replay_binding([9; 32], Some(&different_principal)));
-        assert_ne!(bound, replay_binding([9; 32], Some(&different_holder)));
-        assert_ne!(bound, replay_binding([9; 32], None));
+        let bound = replay_binding([9; 32], Some(&original), 1);
+        assert_ne!(bound, replay_binding([9; 32], Some(&original), 2));
+        assert_ne!(
+            bound,
+            replay_binding([9; 32], Some(&different_principal), 1)
+        );
+        assert_ne!(bound, replay_binding([9; 32], Some(&different_holder), 1));
+        assert_ne!(bound, replay_binding([9; 32], None, 1));
     }
     use crate::idempotency::{MAX_ATTACH, MAX_WAITING_PER_PEER};
 

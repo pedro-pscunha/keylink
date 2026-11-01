@@ -331,7 +331,7 @@ async fn a_tell_outside_the_caveat_never_reaches_the_actor() {
     // Generated keyed clients deliberately have no tell methods: registry
     // refusals need a reply. A raw peer can still send one, so guard that path.
     let client = keylink::RpcClient::<keylink::Addressed<tell_probe::Request>, tell_probe::Response>::connect(
-        &peer, node.endpoint().addr(), tell_probe::registry_alpn(),
+        &peer, node.endpoint().addr(), tell_probe::keyed_lineage(),
     ).await.unwrap();
     let _proof = client
         .tell(keylink::Addressed::new(

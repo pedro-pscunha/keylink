@@ -301,7 +301,7 @@
 /// `window()` lists the build's versions; the `Wire::version` method names the
 /// connection's negotiated version. Downgrades may lose fields: this is the
 /// application's policy, not optional-field compatibility in postcard. Blob
-/// metadata may convert, but the address must stay unchanged; an address change
+/// metadata may convert, but the Content kind and root must stay unchanged; an address change
 /// is `UnsupportedResponse`, or `Forgotten` during stored-reply recovery.
 ///
 /// Prefer `crate::` paths in a block, not `super::`: frozen declarations resolve

@@ -319,9 +319,24 @@ async fn a_keyed_registry_answers_an_older_registry_client() {
     assert_eq!(c.at(id).get(1).await.unwrap(), Some(v2::Entry { qty: 7 }));
 }
 
-/// A retry through a different negotiated version still meets the same ledger.
+/// Both versions share one ledger, but its binding distinguishes their labels.
+/// Get has identical received bytes in both versions, so only the label can
+/// separate these calls. A same-version retry must still replay without dispatch.
+/// Watched red by zeroing the label contribution in replay_binding: the newer
+/// caller received the older call's record instead of RequestMismatch (0 passed,
+/// 1 failed). Restored the label commitment shared with CallId v2.
 #[tokio::test]
-async fn every_version_shares_one_current_reply_ledger() {
+async fn contract_version_is_part_of_the_request_binding() {
+    assert_eq!(
+        postcard::to_allocvec(&keylink::WireRequest::Call(v2::ledger::Request::Get {
+            id: 1
+        }))
+        .unwrap(),
+        postcard::to_allocvec(&keylink::WireRequest::Call(v3::ledger::Request::Get {
+            id: 1
+        }))
+        .unwrap(),
+    );
     let server = node().await;
     let peer = node().await;
     let handler = Current::default();
@@ -337,12 +352,15 @@ async fn every_version_shares_one_current_reply_ledger() {
         old.with_idempotency(key.clone()).get(1).await.unwrap(),
         Some(v2::Entry { qty: 7 })
     );
+    assert!(matches!(
+        new.with_idempotency(key.clone()).get(1).await,
+        Err(Error::Remote(keylink::RemoteError::Idempotency(
+            keylink::IdempotencyRefusal::RequestMismatch
+        )))
+    ));
     assert_eq!(
-        new.with_idempotency(key).get(1).await.unwrap(),
-        Some(v3::Entry {
-            qty: 7,
-            memo: Some("late".into())
-        })
+        old.with_idempotency(key).get(1).await.unwrap(),
+        Some(v2::Entry { qty: 7 })
     );
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
@@ -427,10 +445,20 @@ mod recorded {
                 c.key_state(key.clone()).await.unwrap(),
                 keylink::KeyState::Done
             );
+            assert!(matches!(
+                c.with_idempotency(key.clone()).get(1).await,
+                Err(Error::Remote(keylink::RemoteError::Idempotency(
+                    keylink::IdempotencyRefusal::RequestMismatch
+                )))
+            ));
+            let old = v2::ledger::Client::connect(&peer, server.endpoint().addr())
+                .await
+                .unwrap();
             assert_eq!(
-                c.with_idempotency(key.clone()).get(1).await.unwrap(),
-                Some(v3::Entry { qty: 7, memo: None })
+                old.with_idempotency(key.clone()).get(1).await.unwrap(),
+                Some(v2::Entry { qty: 7 })
             );
+            old.close().await.unwrap();
             assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
             c.close().await.unwrap();
             running.shutdown().await.unwrap();
@@ -455,7 +483,7 @@ mod recorded {
             assert!(matches!(
                 c.with_idempotency(key).get(1).await,
                 Err(Error::Remote(keylink::RemoteError::Idempotency(
-                    keylink::IdempotencyRefusal::Forgotten
+                    keylink::IdempotencyRefusal::RequestMismatch
                 )))
             ));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -649,9 +677,10 @@ mod blob_versions {
             r: content::version_1::Response,
         ) -> Result<content::Response, Unsupported> {
             match r {
-                content::version_1::Response::Get((3, _)) => {
-                    Ok(content::Response::Get((13, *REPLACEMENT.get().unwrap())))
-                }
+                content::version_1::Response::Get((3, _)) => Ok(content::Response::Get((
+                    13,
+                    (*REPLACEMENT.get().unwrap()).into(),
+                ))),
                 content::version_1::Response::Get(v) => Ok(content::Response::Get(v)),
                 _ => unreachable!(),
             }
@@ -665,7 +694,11 @@ mod blob_versions {
                 }
                 content::Response::Get((1, _)) => Ok(content::version_1::Response::Get((
                     1,
-                    *REPLACEMENT.get().unwrap(),
+                    (*REPLACEMENT.get().unwrap()).into(),
+                ))),
+                content::Response::Get((4, content)) => Ok(content::version_1::Response::Get((
+                    4,
+                    keylink::Content::Closure(content.root()),
                 ))),
                 content::Response::Get((n, id)) => {
                     Ok(content::version_1::Response::Get((n + 10, id)))
@@ -676,13 +709,13 @@ mod blob_versions {
     }
     struct Handler(keylink::BlobId);
     impl content::Handler for Handler {
-        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::BlobId) {
-            (mode, self.0)
+        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::Grant) {
+            (mode, self.0.into())
         }
     }
     impl old::content::Handler for Handler {
-        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::BlobId) {
-            (mode, self.0)
+        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::Grant) {
+            (mode, self.0.into())
         }
     }
     /// Watched red: grant the current response's address instead of the
@@ -740,6 +773,15 @@ mod blob_versions {
             ),
             "an address-changing conversion must not grant its substituted address"
         );
+        assert!(
+            matches!(
+                c.get(4).await,
+                Err(Error::Remote(
+                    keylink::RemoteError::UnsupportedResponse { .. }
+                ))
+            ),
+            "conversion cannot broaden a blob into a closure with the same root"
+        );
         let (metadata, handle) = c.get(2).await.unwrap();
         assert_eq!(metadata, 12);
         assert_eq!(handle.id(), original);
@@ -763,11 +805,15 @@ mod blob_versions {
             keylink::RpcClient::connect(&caller, server.endpoint().addr(), content::lineage())
                 .await
                 .unwrap();
-        let _ = current_raw
-            .with_idempotency(key)
-            .call(content::Request::Get { mode: 2 }, keylink::Body::empty())
-            .await
-            .unwrap();
+        assert!(matches!(
+            current_raw
+                .with_idempotency(key)
+                .call(content::Request::Get { mode: 2 }, keylink::Body::empty())
+                .await,
+            Err(Error::Remote(keylink::RemoteError::Idempotency(
+                keylink::IdempotencyRefusal::RequestMismatch
+            )))
+        ));
         assert_eq!(guessed.verified_len().await.unwrap(), 8);
         let older_server = node().await;
         let _old_running = keylink::Server::builder(&older_server)
