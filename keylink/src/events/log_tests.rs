@@ -132,6 +132,60 @@ async fn age_and_byte_retention_keep_the_newest_event_and_expire_old_cursors() {
     assert_eq!(ring.events.front().unwrap().seq, Seq(2));
 }
 
+/// Finding 6 was watched red with front-only age checks: the backward-clock
+/// case kept sequences 1, 2, 3 instead of cutting through the expired sequence 2.
+#[test]
+fn age_retention_handles_forward_and_backward_clock_jumps() {
+    let policy = retention(100, 1 << 20).max_age(Duration::from_millis(100));
+    let cases: &[(&[u64], u64, &[u64])] = &[
+        (&[1000, 100, 500], 500, &[3]),
+        (&[100, 200, 300], 1000, &[3]),
+        (&[1000, 1100, 1200], 100, &[1, 2, 3]),
+        (&[1000, 100, 1200, 50, 500], 500, &[5]),
+        (&[1000, 100, 1100, 500], 500, &[3, 4]),
+    ];
+    for &(times, now, expected) in cases {
+        let events: VecDeque<_> = times
+            .iter()
+            .enumerate()
+            .map(|(index, at_ms)| {
+                let seq = Seq(index as u64 + 1);
+                Held {
+                    seq,
+                    at_ms: *at_ms,
+                    bytes: encode(seq.get()).unwrap(),
+                }
+            })
+            .collect();
+        let bytes = events.iter().map(|event| event.bytes.len() as u64).sum();
+        let head = Seq(times.len() as u64);
+        let mut ring = Ring {
+            events,
+            bytes,
+            head,
+            parked: 0,
+        };
+        ring.trim(policy, now);
+        let held: Vec<_> = ring.events.iter().map(|event| event.seq.get()).collect();
+        assert_eq!(
+            held, expected,
+            "clock jump left the wrong contiguous suffix at {now}"
+        );
+        assert_eq!(
+            ring.events.back().unwrap().seq,
+            head,
+            "the newest event survives every clock jump"
+        );
+        assert_eq!(
+            ring.bytes,
+            ring.events
+                .iter()
+                .map(|event| event.bytes.len() as u64)
+                .sum::<u64>()
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_cursor_past_the_head_is_explicitly_refused() {
     let log = EventLog::<u64>::memory(retention(100, 1 << 20));

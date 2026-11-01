@@ -399,7 +399,7 @@ handler may have left half applied — and `Ended` names which happened.
 
 `keylink::events::EventLog<E>` retains sequenced events. Declare an ordinary `rpc Events(from: Cursor) -> Pull<E>;` in your service. A concurrent handler awaits `log.pull(from)`. An actor declares the method `#[defer]` and returns `log.answer(reply, from)` so a waiting follower never holds its turn. The event type enters the service's schema hash, and every pull goes through the usual admission, authorization and layers.
 
-Create a memory log with `EventLog::memory(retention)` or, with `persist`, open `EventLog::durable(&snapshots, &id, retention).await?`. The durable log claims one id exclusively, stores its identity once in the snapshot slot, and appends each turn's batch as one checksummed `Claim` record. A torn batch is cut and reported, never recovered in part. `Retention::new(events, bytes)` takes nonzero bounds; `.max_age(age)` adds a wall-clock bound. The newest event is always kept, even when it exceeds that bound.
+Create a memory log with `EventLog::memory(retention)` or, with `persist`, open `EventLog::durable(&snapshots, &id, retention).await?`. The durable log claims one id exclusively, stores its identity once in the snapshot slot, and appends each turn's batch as one checksummed `Claim` record. A torn batch is cut and reported, never recovered in part. `Retention::new(events, bytes)` takes nonzero bounds; `.max_age(age)` adds a wall-clock bound. After a backward clock correction, retention cuts through the last expired non-newest event, including preceding future-dated events, to keep a contiguous suffix. The newest event is always kept, even when it exceeds that bound.
 
 ```rust
 keylink::service! {

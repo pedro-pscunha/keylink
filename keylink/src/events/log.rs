@@ -42,6 +42,9 @@ impl Retention {
     }
 
     /// Also remove events older than `age`, using the wall clock.
+    ///
+    /// After a clock regression, cut through the last expired non-newest event,
+    /// including preceding future-dated events, to retain a contiguous suffix.
     #[must_use]
     pub const fn max_age(mut self, age: Duration) -> Self {
         self.age = Some(age);
@@ -96,13 +99,20 @@ struct Held {
 
 impl Ring {
     fn trim(&mut self, retention: Retention, now_ms: u64) -> usize {
+        // Wall-clock timestamps need not increase with sequence. Keep a
+        // contiguous suffix by cutting through the LAST expired non-newest event.
+        let expired_through = retention.age.and_then(|age| {
+            self.events
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|event| u128::from(now_ms.saturating_sub(event.at_ms)) > age.as_millis())
+                .map(|event| event.seq)
+        });
         let mut removed = 0;
         while self.events.len() > 1 {
-            let over_age = self.events.front().is_some_and(|event| {
-                retention.age.is_some_and(|age| {
-                    u128::from(now_ms.saturating_sub(event.at_ms)) > age.as_millis()
-                })
-            });
+            let over_age = expired_through
+                .is_some_and(|last| self.events.front().is_some_and(|event| event.seq <= last));
             if self.events.len() <= retention.events.get()
                 && self.bytes <= retention.bytes.get()
                 && !over_age
