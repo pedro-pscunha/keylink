@@ -84,8 +84,8 @@
 //! Recovery holds the file, and then a `(Seq, Vec<u8>)` for every record it hands
 //! back in the [`Tail`]: a record's descriptor is 32 bytes on a 64-bit target plus
 //! its own allocation, and the smallest record takes 20 on disk, so a journal of
-//! tiny records needs several times its size in memory, not twice. There is no
-//! record-count budget, and nothing here turns the byte budget into a memory
+//! tiny records needs several times its size in memory, not twice. A record-count
+//! budget is not reached yet, and nothing here turns the byte budget into a memory
 //! figure. Size a process from the budget and the smallest record you write.
 //! What the budget does not do is make a journal smaller: a fold that keeps
 //! failing leaves the journal growing until appends are refused at the budget,
@@ -94,18 +94,24 @@
 //! # What reaches the disk, and what the adapter assumes
 //!
 //! A write is durable when the file, and the directory entry that names it, have
-//! been synced. The adapter syncs **the directory that directly contains the
-//! state's files**, after every rename that creates or replaces one and every
-//! time it opens an append handle. It does **not** sync the directories above
-//! that one. [`Files::open`] and the first claim on a state create the root and
-//! the state's directories with `create_dir_all`, and nothing makes those
-//! creations durable, so on a filesystem that needs the parent synced to keep a
-//! new directory, a state's very first write can be lost with its whole
-//! directory in a power cut even though it was acknowledged. The adapter
-//! therefore requires the root to be a durable, already existing directory tree:
-//! create it, and sync it, before the first claim. After that first claim's
-//! directories exist and have been synced by the caller or by an earlier run,
-//! every later write is as durable as this paragraph says.
+//! been synced, and so has every directory entry above it that was new. The adapter
+//! syncs:
+//!
+//! - **the directory that directly contains the state's files**, after every
+//!   rename that creates or replaces one and every time it opens an append handle;
+//! - **every directory it creates on the way to it.** [`Files::open`] creates the
+//!   root, and each claim creates the state's directories, with `create_dir_all`,
+//!   which makes the directories and leaves their entries in the page cache. Each
+//!   such level's parent is then synced, from the new leaf up to the first
+//!   directory that already existed ([`Files::open`]) or up to the root (a claim),
+//!   and a failure there is the claim's or the open's error. Without that, a
+//!   state's first write could be lost together with its whole directory in a power
+//!   cut, although it was acknowledged. A claim syncs those levels every time, not
+//!   only when it created them, so a process that crashed between creating a
+//!   directory and syncing it does not leave the level unsynced for good.
+//!
+//! What it does **not** sync is anything above the first directory that existed
+//! when [`Files::open`] ran: the root's own ancestors are the caller's.
 //!
 //! # Cancellation does not release the claim early
 //!
@@ -202,16 +208,23 @@ impl Files {
 
     /// Store snapshots under `root`, creating it if it is not there.
     ///
-    /// **Creating it does not make it durable.** The root should be a directory
-    /// that already exists and has been synced; see "What reaches the disk" in the
-    /// module header for exactly what this adapter syncs and what it assumes.
+    /// Every directory this creates is synced into its parent, up to the first one
+    /// that already existed; that directory and above are the caller's. See "What
+    /// reaches the disk" in the module header.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the directory cannot be created.
+    /// [`Error::Io`] when the directory cannot be created, or when a new level's
+    /// entry cannot be synced into its parent.
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        tokio::fs::create_dir_all(&root).await?;
+        let making = root.clone();
+        tokio::task::spawn_blocking(move || {
+            let existing = first_existing_ancestor(&making);
+            create_dirs_durably(&making, &existing)
+        })
+        .await
+        .map_err(|join| Error::Io(std::io::Error::other(join)))??;
         Ok(Self {
             root,
             limit: Self::DEFAULT_LIMIT,
@@ -302,7 +315,10 @@ impl Files {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.root.clone());
-        tokio::fs::create_dir_all(&parent).await?;
+        let (making, root) = (parent.clone(), self.root.clone());
+        tokio::task::spawn_blocking(move || create_dirs_durably(&making, &root))
+            .await
+            .map_err(|join| Error::Io(std::io::Error::other(join)))??;
 
         let id = id.clone();
         // Opening and locking are blocking calls. `try_lock` in particular parks
@@ -1458,12 +1474,91 @@ impl Held for FileLog {
     }
 }
 
+/// The nearest ancestor of `path` (or `path` itself) that exists now.
+fn first_existing_ancestor(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find(|ancestor| ancestor.exists())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Create `path` and every missing directory above it, and put each level's entry
+/// on the disk: sync the parent of `path`, of its parent, and so on, up to but not
+/// above `floor` (which must be `path` or an ancestor of it).
+///
+/// `create_dir_all` makes the directories and says nothing about their entries.
+/// The levels are synced whether or not this call created them, so a directory a
+/// crashed run created and never synced is made durable by the next one; it costs
+/// one directory sync per level of a state's path, once per claim.
+///
+/// Blocking.
+fn create_dirs_durably(path: &Path, floor: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    for level in path.ancestors().take_while(|level| *level != floor) {
+        match level.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+            // A relative path with one component: its parent is the working
+            // directory.
+            Some(_) => sync_dir(Path::new("."))?,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Test-only seam over [`sync_dir`]: records which directories were synced under a
+/// prefix, and fails the sync of one named directory, so a test can show that a
+/// directory-sync failure surfaces and that every new level was synced.
+#[cfg(test)]
+mod syncs {
+    #![allow(clippy::expect_used)]
+
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    pub(super) struct Watch {
+        prefix: PathBuf,
+        fail_at: Option<PathBuf>,
+        pub(super) seen: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    static WATCHES: Mutex<Vec<Watch>> = Mutex::new(Vec::new());
+
+    /// Watch every sync under `prefix`; `fail_at` is refused.
+    pub(super) fn watch(prefix: &Path, fail_at: Option<PathBuf>) -> Arc<Mutex<Vec<PathBuf>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        WATCHES.lock().expect("not poisoned").push(Watch {
+            prefix: prefix.to_path_buf(),
+            fail_at,
+            seen: Arc::clone(&seen),
+        });
+        seen
+    }
+
+    pub(super) fn observe(path: &Path) -> std::io::Result<()> {
+        for watch in WATCHES.lock().expect("not poisoned").iter() {
+            if path.starts_with(&watch.prefix) {
+                watch
+                    .seen
+                    .lock()
+                    .expect("not poisoned")
+                    .push(path.to_path_buf());
+                if watch.fail_at.as_deref() == Some(path) {
+                    return Err(std::io::Error::other("the directory sync was refused"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The step people skip: without it a rename can be lost to a power cut.
 ///
 /// Opening a directory as a file is a POSIX behaviour. On a platform without
 /// it, the write and the rename still hold and only the durability of the
 /// rename itself is at the mercy of the filesystem.
 fn sync_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    syncs::observe(parent)?;
     #[cfg(unix)]
     {
         std::fs::File::open(parent)?.sync_all()?;
@@ -2906,6 +3001,77 @@ mod tests {
             .expect_err("the claim is finished");
         assert!(matches!(error, Error::Io(_)), "got {error:?}");
         assert_eq!(std::fs::read(&snapshot).expect("reads"), b"after");
+    }
+
+    /// **A fresh nested state path syncs every new level.** The root and the state's
+    /// directories are created with `create_dir_all`, which leaves their entries in
+    /// the page cache; each level's parent must be synced, from the new leaf up to
+    /// the first directory that existed.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `create_dirs_durably`'s
+    /// `Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,` with
+    /// `Some(_) => {}`. Watched: nothing was synced, and the first assertion fails.
+    #[tokio::test]
+    async fn a_fresh_nested_path_has_every_new_level_synced() {
+        let scratch = Scratch::new("dirs-fresh");
+        std::fs::create_dir_all(&scratch.0).expect("creates");
+        let seen = syncs::watch(&scratch.0, None);
+
+        // `a/b` is new under the existing scratch directory.
+        let root = scratch.0.join("a").join("b");
+        let files = Files::open(&root).await.expect("opens");
+        let synced = seen.lock().expect("not poisoned").clone();
+        for level in [scratch.0.clone(), scratch.0.join("a")] {
+            assert!(
+                synced.contains(&level),
+                "{level:?} was not synced: {synced:?}"
+            );
+        }
+        assert!(
+            !synced.contains(&root),
+            "a directory is synced into its parent, and the root's own contents are not new"
+        );
+
+        // A claim on a nested id: the state's directories are new under the root.
+        let _claim = files
+            .claim(&id("ledgers/europe/sp-01"))
+            .await
+            .expect("claims");
+        let synced = seen.lock().expect("not poisoned").clone();
+        for level in [root.clone(), root.join("ledgers")] {
+            assert!(
+                synced.contains(&level),
+                "{level:?} was not synced: {synced:?}"
+            );
+        }
+    }
+
+    /// A parent whose sync fails is an error, and not a silent success: neither the
+    /// open nor the claim reports a directory it could not make durable.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing the `sync_dir(parent)?` in
+    /// `create_dirs_durably` with `let _ = sync_dir(parent);`. Watched: the open
+    /// succeeds.
+    #[tokio::test]
+    async fn a_directory_sync_that_fails_surfaces() {
+        let scratch = Scratch::new("dirs-fail");
+        std::fs::create_dir_all(&scratch.0).expect("creates");
+
+        // The parent of the new root cannot be synced.
+        let root = scratch.0.join("a").join("b");
+        let _ = syncs::watch(&scratch.0, Some(scratch.0.join("a")));
+        let error = Files::open(&root).await.expect_err("the sync was refused");
+        assert!(matches!(error, Error::Io(_)), "got {error:?}");
+
+        // And for a claim: the root exists, a level under it cannot be synced.
+        let root = scratch.0.join("ok");
+        let files = Files::open(&root).await.expect("opens");
+        let _ = syncs::watch(&root, Some(root.clone()));
+        let error = files
+            .claim(&id("ledgers/sp-01"))
+            .await
+            .expect_err("the state's directory entry could not be synced");
+        assert!(matches!(error, Error::Io(_)), "got {error:?}");
     }
 
     /// A claim whose journal is broken stores no snapshot either.
