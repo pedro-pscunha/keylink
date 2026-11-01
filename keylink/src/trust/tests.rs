@@ -275,3 +275,32 @@ fn removing_a_root_never_resurrects_an_accepted_revocation() {
         ChainError::Revoked { at: 0 }
     );
 }
+
+#[test]
+fn equal_expiry_retention_is_independent_of_feed_order() {
+    let (root, _, device) = keys();
+    let make = || Trust::new(Roots::only([root.public()]).unwrap());
+    let a = make();
+    let b = make();
+    let chains: Vec<_> = (0..(MAX_CHAINS_PER_HOLDER + 4) as u64)
+        .map(|serial| {
+            let mut delegation = grant(device.public(), "repo", 0);
+            delegation.serial = serial;
+            Chain::new(vec![Certificate::issue(&root, delegation).unwrap()])
+        })
+        .collect();
+    for chain in &chains {
+        let _ = a.insert(chain.clone());
+    }
+    for chain in chains.iter().rev() {
+        let _ = b.insert(chain.clone());
+    }
+    let ids = |trust: &Trust| {
+        trust.store().chains[&device.public()]
+            .iter()
+            .map(|c| c.chain().links()[0].id())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&a), ids(&b));
+    assert_eq!(ids(&a).len(), MAX_CHAINS_PER_HOLDER);
+}

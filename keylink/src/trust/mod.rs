@@ -121,6 +121,20 @@ impl Store {
         candidates
     }
 }
+fn retention_order(a: &Credential, b: &Credential) -> std::cmp::Ordering {
+    a.caveats()
+        .validity
+        .not_after()
+        .cmp(&b.caveats().validity.not_after())
+        .then_with(|| {
+            a.chain()
+                .links()
+                .iter()
+                .map(Certificate::id)
+                .cmp(b.chain().links().iter().map(Certificate::id))
+        })
+}
+
 #[derive(Debug)]
 struct Inner {
     store: Mutex<Store>,
@@ -151,7 +165,9 @@ impl Trust {
     }
     /// Verify and retain one chain at the current time. Refused data is not stored.
     /// Identical certificate-id sequences are a no-op. At capacity, the chain
-    /// with the earliest expiry is evicted. Returns `NotRetained` if the offered
+    /// with the earliest expiry is evicted, breaking ties by ordered certificate
+    /// IDs. This total order makes retention independent of feed order. Returns
+    /// `NotRetained` if the offered
     /// chain loses that comparison, or the first verification fault.
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
@@ -172,7 +188,7 @@ impl Trust {
             if let Some((index, _)) = chains
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, c)| c.caveats().validity.not_after())
+                .min_by(|(_, a), (_, b)| retention_order(a, b))
             {
                 let offered = index == chains.len() - 1;
                 chains.remove(index);
@@ -181,6 +197,7 @@ impl Trust {
                 }
             }
         }
+        chains.sort_by(|a, b| retention_order(a, b));
         Ok(())
     }
     /// Verify a chain against this view's roots and revocations at `now`.
