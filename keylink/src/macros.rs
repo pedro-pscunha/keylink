@@ -365,6 +365,46 @@
 /// # fn main() {}
 /// ```
 ///
+/// A caller's assertion macro cannot disable the pin or label guards:
+///
+/// ```compile_fail
+/// # #[allow(unused_macros)]
+/// # macro_rules! assert { ($($ignored:tt)*) => { () }; }
+/// # mod frozen { keylink::service! { service PinExample; version 2; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 2 { hash frozen::pin_example::VERSION.hash() ^ 1; keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_2::Convert for pin_example::version_2::Step {
+/// # fn upgrade_request(_: pin_example::version_2::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_2::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_2::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_2::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// # #[allow(unused_macros)]
+/// # macro_rules! assert { ($($ignored:tt)*) => { () }; }
+/// # mod frozen { keylink::service! { service PinExample; version 4; rpc Ping() -> u64; } }
+/// keylink::service! {
+///     service PinExample;
+///     version 3;
+///     rpc Ping() -> u64;
+///     previous 4 { hash frozen::pin_example::VERSION.hash(); keyed_hash frozen::pin_example::KEYED_VERSION.hash(); rpc Ping() -> u64; }
+/// }
+/// # impl pin_example::version_4::Convert for pin_example::version_4::Step {
+/// # fn upgrade_request(_: pin_example::version_4::Request) -> Result<pin_example::Request, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_request(_: pin_example::Request) -> Result<pin_example::version_4::Request, keylink::Unsupported> { unreachable!() }
+/// # fn upgrade_response(_: pin_example::version_4::Response) -> Result<pin_example::Response, keylink::Unsupported> { unreachable!() }
+/// # fn downgrade_response(_: pin_example::Response) -> Result<pin_example::version_4::Response, keylink::Unsupported> { unreachable!() }
+/// # }
+/// # fn main() {}
+/// ```
+///
 /// The label and singleton guards were watched red with `scripts/break-once.sh`: replacing the
 /// hash assertion's condition with `true` made the first fence compile, and
 /// replacing the descending-label assertion's condition with `true` made the
@@ -376,6 +416,11 @@
 /// The independent keyed pin was also watched red: replacing its assertion's
 /// condition with `true` made the third fence compile (0 passed, 1 failed).
 /// The singleton pin matched throughout. Restored the keyed assertion.
+///
+/// Both assertion-shadowing fixtures were watched red independently: removing
+/// the core qualification from the corresponding guard let the caller's
+/// const-compatible no-op compile the invalid contract (0 passed, 1 failed each).
+/// Restored both qualified assertions.
 ///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
@@ -10280,9 +10325,9 @@ macro_rules! __keylink_previous {
                 use super::*;
                 use $($newer)* as __newer;
                 $crate::__keylink_contract! { $svc, $label; $($all)+ }
-                const _: () = assert!($label < $upper, concat!("previous ", stringify!($label), " must be lower than ", stringify!($upper), " in ", stringify!($svc)));
-                const _: () = assert!(VERSION.hash() == $pin, concat!("previous ", stringify!($label), " of ", stringify!($svc), " does not hash to its pin: the frozen declaration differs from the one that was current, or keylink's own wire types moved since. Print version_", stringify!($label), "::VERSION to read what this one hashes to."));
-                const _: () = assert!(KEYED_VERSION.hash() == $keyed_pin, concat!("previous keyed ", stringify!($label), " of ", stringify!($svc), " does not hash to its keyed pin: print version_", stringify!($label), "::KEYED_VERSION to inspect the frozen addressed contract."));
+                const _: () = ::core::assert!($label < $upper, ::core::concat!("previous ", ::core::stringify!($label), " must be lower than ", ::core::stringify!($upper), " in ", ::core::stringify!($svc)));
+                const _: () = ::core::assert!(VERSION.hash() == $pin, ::core::concat!("previous ", ::core::stringify!($label), " of ", ::core::stringify!($svc), " does not hash to its pin: the frozen declaration differs from the one that was current, or keylink's own wire types moved since. Print version_", ::core::stringify!($label), "::VERSION to read what this one hashes to."));
+                const _: () = ::core::assert!(KEYED_VERSION.hash() == $keyed_pin, ::core::concat!("previous keyed ", ::core::stringify!($label), " of ", ::core::stringify!($svc), " does not hash to its keyed pin: print version_", ::core::stringify!($label), "::KEYED_VERSION to inspect the frozen addressed contract."));
                 /// The adjacent conversion step; implement `Convert` for it.
                 pub struct Step;
                 /// Conversions for changed, added and removed methods.
@@ -10335,7 +10380,7 @@ macro_rules! __keylink_previous {
             }
         }
     };
-    ($($other:tt)*) => { compile_error!("previous blocks require hash PIN; keyed_hash KEYED_PIN; followed by wire declarations, optionally prefixed with changed, and must follow all current declarations"); };
+    ($($other:tt)*) => { ::core::compile_error!("previous blocks require hash PIN; keyed_hash KEYED_PIN; followed by wire declarations, optionally prefixed with changed, and must follow all current declarations"); };
 }
 
 /// One expansion of [`service!`], inside the library's own test build.
