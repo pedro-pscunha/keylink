@@ -2378,6 +2378,8 @@ ANCHORS = [
      "    drop(away);"),
     ("OT3", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => crate::away::push::<A>(Box::pin(async move {"),
+    ("OT5", "keylink/tests/away.rs", "keylink/src/away.rs",
+     "    Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.

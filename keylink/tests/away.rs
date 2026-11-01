@@ -10,6 +10,9 @@
 //! | the actor serves other messages while the work is away, and the work then comes back as a turn | `a_slow_off_turn_step_does_not_hold_the_actor` |
 //! | the actor ending cancels the work and tells the parked caller the truth | `stopping_while_work_is_away_answers_the_parked_caller` |
 //! | a launching turn that is refused never starts its work | `work_launched_by_a_refused_turn_never_starts` |
+//! | a `back` that sends before it returns its future is still gated by its turn's commit | `a_back_that_sends_eagerly_is_still_gated_by_its_turns_commit` |
+//! | a `back` that launches before it returns its future launches nothing for a refused turn | `a_back_that_relaunches_eagerly_launches_nothing_for_a_refused_turn` |
+//! | a `back` that panics before it returns its future costs the message and not the actor | `a_back_that_panics_before_returning_a_future_costs_the_message_and_not_the_actor` |
 //!
 //! Not one assertion reads a clock. The first test runs on a paused clock, so the
 //! hour of "slow" work costs nothing, and the other two bound a wait only to turn a
@@ -25,7 +28,8 @@ use std::time::Duration;
 
 use keylink::prelude::*;
 use keylink::{
-    Back, Caller, Deferred, Observer, Replied, Reply, Stop, TurnFut, TurnInfo, Unanswered, Withheld,
+    Back, Caller, Deferred, Observer, Replied, Reply, Stop, TurnFut, TurnInfo, TurnOutcome,
+    Unanswered, Withheld,
 };
 use tokio::sync::{oneshot, Notify};
 
@@ -343,4 +347,215 @@ async fn work_launched_by_a_refused_turn_never_starts() {
         .await
         .expect("the actor ends when an observer refuses");
     assert!(!ran.load(Ordering::SeqCst), "the work never started");
+}
+
+// ───────────────────────────────────── a `back` that does work before it returns a future
+
+keylink::service! {
+    service Eager;
+
+    /// Comes back to a `back` that sends from the body of a plain `fn`.
+    #[defer]
+    rpc Settle(n: u64) -> u64;
+
+    /// Comes back to a `back` that sends the work away again from a plain `fn`.
+    #[defer]
+    rpc Relaunch(n: u64) -> u64;
+
+    /// Comes back to a `back` that panics before it returns anything.
+    #[defer]
+    rpc Explode(n: u64) -> u64;
+
+    /// What the `back` turns added, so a test can ask whether the actor is serving.
+    rpc Applied() -> u64;
+}
+
+/// The three outputs the away work produces, one per `back` below. Distinct types
+/// because a state has one `Back` impl per output type, and one per behaviour is
+/// the point.
+struct Settled(u64);
+struct Relaunched(u64);
+struct Exploded(u64);
+
+#[derive(Default)]
+struct Eager {
+    applied: u64,
+}
+
+impl eager::Actor for Eager {
+    async fn settle(&mut self, _cx: Caller<'_>, reply: Reply<u64>, n: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        deferred.away(self, async move { Settled(n) });
+        replied
+    }
+
+    async fn relaunch(&mut self, _cx: Caller<'_>, reply: Reply<u64>, n: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        deferred.away(self, async move { Relaunched(n) });
+        replied
+    }
+
+    async fn explode(&mut self, _cx: Caller<'_>, reply: Reply<u64>, n: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        deferred.away(self, async move { Exploded(n) });
+        replied
+    }
+
+    async fn applied(&mut self, _cx: Caller<'_>) -> u64 {
+        self.applied
+    }
+}
+
+/// A plain `fn`, which the trait permits: it changes the state and sends **before**
+/// it returns its future. An `async fn` could not.
+impl Back<Settled, u64> for Eager {
+    fn back(&mut self, out: Settled, reply: Deferred<u64>) -> impl Future<Output = ()> + Send {
+        self.applied += out.0;
+        reply.send(out.0);
+        async {}
+    }
+}
+
+/// A plain `fn` that sends the work away again before it returns its future.
+impl Back<Relaunched, u64> for Eager {
+    fn back(&mut self, out: Relaunched, reply: Deferred<u64>) -> impl Future<Output = ()> + Send {
+        self.applied += out.0;
+        reply.away(self, async move { Settled(out.0) });
+        async {}
+    }
+}
+
+/// A plain `fn` that panics before there is a future to return.
+impl Back<Exploded, u64> for Eager {
+    #[allow(unreachable_code)]
+    fn back(&mut self, out: Exploded, _reply: Deferred<u64>) -> impl Future<Output = ()> + Send {
+        panic!(
+            "a back that fell over before it returned a future: {}",
+            out.0
+        );
+        async {}
+    }
+}
+
+/// Refuses a turn that leaves `applied` above zero, which is exactly the `back`
+/// turn: the launching turn changes nothing and is accepted.
+struct RefusesWhatApplied;
+
+impl Observer<Eager> for RefusesWhatApplied {
+    fn name(&self) -> &'static str {
+        "unapplied"
+    }
+
+    fn after_turn<'a>(&'a mut self, state: &'a Eager, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let applied = state.applied;
+        Box::pin(async move {
+            if applied > 0 {
+                Err(Stop::new("a back turn applied something"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Records every turn's method and whether it panicked.
+struct Recording(Arc<Mutex<Vec<(&'static str, bool)>>>);
+
+impl Observer<Eager> for Recording {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Eager, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let panicked = matches!(turn.outcome, TurnOutcome::Panicked { .. });
+        self.0.lock().unwrap().push((turn.method, panicked));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A `back` that answers from the body of a plain `fn` is still answered by its
+/// turn's commit.
+///
+/// The turn's observer refuses it, so the caller must read the refusal. When the
+/// loop called `back` before it built the lot that parks a turn's answers, the
+/// send crossed at once and the caller held `1` for a turn that was then refused:
+/// a durable actor's caller would hold a success the store never accepted.
+///
+/// Made red by `scripts/break-once.sh keylink/src/away.rs` on `comeback`'s
+/// `Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))`
+/// (the whole line, indented four spaces; registered as `OT5`) and the replacement
+/// `Box::new(move |state: &mut A| Box::pin(state.back(out, reply)))`, which is the
+/// call made before the lot exists. Watched: `the caller is told the observer
+/// refused: got Ok(1)`.
+#[tokio::test]
+async fn a_back_that_sends_eagerly_is_still_gated_by_its_turns_commit() {
+    let eager = eager::setup(Eager::default())
+        .observe(RefusesWhatApplied)
+        .actor();
+
+    let landed = eager.settle(1).await;
+    assert!(
+        matches!(
+            &landed,
+            Err(Unanswered::Turn(Withheld::Refused { name })) if name == "unapplied"
+        ),
+        "the caller is told the observer refused: got {landed:?}"
+    );
+}
+
+/// A `back` that sends its work away again from the body of a plain `fn` launches
+/// nothing for a turn that is then refused.
+///
+/// Launched before the verdict, the work took the caller's reply with it, the
+/// refused turn ended the actor, and the caller was told the actor was gone. Held
+/// until the verdict, the caller is told the observer refused.
+///
+/// Made red by the same edit as the test above. Watched: `the caller is told the
+/// observer refused: got Err(Turn(Gone))`.
+#[tokio::test]
+async fn a_back_that_relaunches_eagerly_launches_nothing_for_a_refused_turn() {
+    let eager = eager::setup(Eager::default())
+        .observe(RefusesWhatApplied)
+        .actor();
+
+    let landed = eager.relaunch(1).await;
+    assert!(
+        matches!(
+            &landed,
+            Err(Unanswered::Turn(Withheld::Refused { name })) if name == "unapplied"
+        ),
+        "the caller is told the observer refused: got {landed:?}"
+    );
+}
+
+/// A `back` that panics before it returns a future costs the message and not the
+/// actor, and its observers read the turn as panicked.
+///
+/// Called outside the panic guard, the panic unwound the loop itself: the actor
+/// task died, every handle read `Gone`, and no observer saw a turn.
+///
+/// Made red by the same edit as the first test. Watched: `the caller's reply died
+/// in the unwind: got Err(Turn(Gone))`, after the panic itself unwound the loop.
+#[tokio::test]
+async fn a_back_that_panics_before_returning_a_future_costs_the_message_and_not_the_actor() {
+    let turns = Arc::new(Mutex::new(Vec::new()));
+    let eager = eager::setup(Eager::default())
+        .observe(Recording(Arc::clone(&turns)))
+        .actor();
+
+    let lost = eager.explode(1).await;
+    assert!(
+        matches!(&lost, Err(Unanswered::Turn(Withheld::Dropped))),
+        "the caller's reply died in the unwind: got {lost:?}"
+    );
+    assert_eq!(
+        eager.applied().await.expect("the actor survived"),
+        0,
+        "and the actor is serving the next message"
+    );
+    assert!(
+        turns.lock().unwrap().contains(&("Explode", true)),
+        "an observer read the back turn as panicked: {:?}",
+        turns.lock().unwrap()
+    );
 }

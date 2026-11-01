@@ -67,6 +67,11 @@ use crate::Deferred;
 ///
 /// A panic in `back` costs this one message and not the actor, as for an `rpc`.
 /// The caller is told [`Withheld::Dropped`](crate::Withheld::Dropped).
+///
+/// All of that holds whether `back` is an `async fn` or a plain `fn` that does
+/// work before it returns a future. The loop calls it from inside the turn's guard
+/// and the lot that parks its answers, so an eager `reply.send(..)` is still gated
+/// by this turn's commit.
 pub trait Back<W, T>: Send + 'static {
     /// Run against the state with the work's output and the parked reply.
     fn back(&mut self, out: W, reply: Deferred<T>) -> impl Future<Output = ()> + Send;
@@ -88,13 +93,27 @@ pub(crate) type Started<A> = Pin<Box<dyn Future<Output = (&'static str, Comeback
 /// Build the turn that runs `A::back`. A function and not a closure at the one call
 /// site, because the signature has to be higher ranked and a closure that is
 /// inferred does not get one.
+///
+/// # The call to `back` is inside the future, not beside it
+///
+/// `observed_turn` calls this closure **before** it builds the lot that parks a
+/// turn's answers and before it enters the panic guard, so anything the closure
+/// does itself runs outside both. [`Back::back`] is declared as a function that
+/// returns a future, which lets an implementation do work before it returns one:
+/// a plain `fn` that mutates the state and calls `reply.send(..)` would answer its
+/// caller before the turn's observers had decided, an eager `reply.away(..)` would
+/// launch work for a turn that is then refused, and a panic would unwind past the
+/// guard and take the actor with it. So the closure builds nothing but an `async`
+/// block, and `state.back(..)` is called when that block is first polled, which is
+/// inside the lot and inside the guard, exactly where an `async fn` body would
+/// run. The generated arms for the service's own methods do the same.
 pub(crate) fn comeback<A, W, T>(out: W, reply: Deferred<T>) -> Comeback<A>
 where
     A: Back<W, T>,
     W: Send + 'static,
     T: Send + 'static,
 {
-    Box::new(move |state: &mut A| Box::pin(state.back(out, reply)))
+    Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))
 }
 
 thread_local! {
