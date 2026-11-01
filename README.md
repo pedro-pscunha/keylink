@@ -542,8 +542,13 @@ The budget is also stamped on the call as a queueing bound, as `QueueTimeout`
 does, so a message that is still queued when the caller stops waiting never
 starts and its key stays claimable. The caller's own error is
 `Error::DeadlinePassed`, and it knows nothing about the far side: the call may not
-have arrived, may be running, or may have finished with its reply lost. It does
-not bound the body of a `recv` reply, and the blocking clients do not take one.
+have arrived, may be running, or may have finished with its reply lost. A deadline
+does not bound the body of a `recv` reply, and the blocking clients do not take
+one. A service-only deadline also cannot end a call whose own upload source
+stalls: the client writes the whole request body before it reads any reply, so a
+`send` call whose `Body` stops producing never reads the `DeadlinePassed` already
+written. The caller's `with_deadline` wraps the whole exchange, upload included,
+and does end it.
 
 ### Many instances behind one ALPN
 
