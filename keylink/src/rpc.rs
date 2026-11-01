@@ -1011,19 +1011,49 @@ where
     }
 }
 
+/// The longest wait a timer on this target can express.
+///
+/// In a browser `setTimeout` takes a signed 32-bit number of milliseconds, and
+/// `n0_future`'s timer casts a duration to one with `as i32`, unchecked: a wait of
+/// `i32::MAX + 1` milliseconds (about 24.8 days) becomes a negative delay and fires
+/// at once. A deadline that long would then end every unkeyed call the moment it
+/// began, and a keyed one would be answered `DeadlinePassed` immediately. So a
+/// budget is **clamped** to this ceiling, in the browser only: a deadline longer
+/// than it waits this long and no longer. Native timers hold any duration the clock
+/// does, and the ceiling there is `Duration::MAX`, which clamps nothing.
+const TIMER_CEILING: Duration = if cfg!(all(target_family = "wasm", target_os = "unknown")) {
+    Duration::from_millis(i32::MAX as u64)
+} else {
+    Duration::MAX
+};
+
 /// The shorter of the service's deadline and the caller's, and when it runs out.
 ///
 /// `None` when neither is set, and also when the instant is not representable on
 /// this clock: a caller that asks to wait for ever is a caller with no deadline,
-/// and a panic in the accept task is not an answer to it.
+/// and a panic in the accept task is not an answer to it. A budget the clock holds
+/// but the timer cannot is clamped to [`TIMER_CEILING`], not dropped.
 fn bound_of(service: Option<Duration>, caller_ms: Option<u64>) -> Option<(Duration, Instant)> {
+    bound_within(service, caller_ms, TIMER_CEILING)
+}
+
+/// [`bound_of`] against a given ceiling, so the clamp is testable on a target whose
+/// own ceiling is not the browser's.
+fn bound_within(
+    service: Option<Duration>,
+    caller_ms: Option<u64>,
+    ceiling: Duration,
+) -> Option<(Duration, Instant)> {
     let caller = caller_ms.map(Duration::from_millis);
     let budget = match (service, caller) {
         (Some(service), Some(caller)) => service.min(caller),
         (Some(only), None) | (None, Some(only)) => only,
         (None, None) => return None,
     };
-    Instant::now().checked_add(budget).map(|at| (budget, at))
+    let now = Instant::now();
+    now.checked_add(budget)?;
+    let budget = budget.min(ceiling);
+    now.checked_add(budget).map(|at| (budget, at))
 }
 
 /// A budget as the milliseconds `DeadlinePassed` and `TimedOut` report.
@@ -1435,6 +1465,55 @@ mod tests {
             budget(Some(Duration::MAX), None),
             None,
             "a budget the clock cannot hold must not panic the accept task"
+        );
+    }
+
+    /// A budget longer than the target's timer can hold is clamped to the ceiling
+    /// and not wrapped, and a budget at the ceiling is left alone.
+    ///
+    /// The browser's ceiling is `i32::MAX` milliseconds, because its timer casts to
+    /// `i32` and a longer wait becomes a negative delay that fires at once. This
+    /// native build has no such ceiling, so the test hands `bound_within` the
+    /// browser's and checks both sides of it, on the service's budget and on the
+    /// caller's. A budget the clock cannot hold stays no deadline at all, clamp or
+    /// not.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `bound_within`'s
+    /// `let budget = budget.min(ceiling);` (indented four spaces) and the
+    /// replacement `let budget = budget;`. Watched: `a budget over the ceiling is
+    /// clamped`.
+    #[test]
+    fn a_budget_over_the_timer_ceiling_is_clamped_and_not_wrapped() {
+        const CEILING_MS: u64 = i32::MAX as u64;
+        let ceiling = Duration::from_millis(CEILING_MS);
+        let one_over = ceiling + Duration::from_millis(1);
+        let budget =
+            |service, caller| bound_within(service, caller, ceiling).map(|(budget, _)| budget);
+
+        assert_eq!(
+            budget(None, Some(CEILING_MS + 1)),
+            Some(ceiling),
+            "a budget over the ceiling is clamped: the caller's"
+        );
+        assert_eq!(
+            budget(Some(one_over), None),
+            Some(ceiling),
+            "a budget over the ceiling is clamped: the service's"
+        );
+        assert_eq!(
+            budget(None, Some(CEILING_MS)),
+            Some(ceiling),
+            "a budget at the ceiling is left alone"
+        );
+        assert_eq!(
+            budget(Some(ceiling - Duration::from_millis(1)), None),
+            Some(ceiling - Duration::from_millis(1)),
+            "a budget under the ceiling is left alone"
+        );
+        assert_eq!(
+            budget(Some(Duration::MAX), None),
+            None,
+            "a budget the clock cannot hold is still no deadline, not a clamped one"
         );
     }
 
@@ -2754,6 +2833,10 @@ where
     /// It counts from the moment the call is claimed. A wait for the idempotency
     /// ledger is bounded by [`Limits::attach`], not by this.
     ///
+    /// In a browser a deadline is **clamped** to what its timer can express,
+    /// `i32::MAX` milliseconds (about 24.8 days); a longer one waits that long. The
+    /// timer would otherwise wrap it to an immediate expiry.
+    ///
     /// # What a service-only deadline cannot end
     ///
     /// **A call whose own upload source stalls.** The client writes the whole
@@ -3235,6 +3318,10 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     ///     .await;
     /// ```
     ///
+    /// In a browser the budget is **clamped** to `i32::MAX` milliseconds (about 24.8
+    /// days), the longest wait its timer can express; a longer one would wrap to an
+    /// immediate expiry. The clamped value is what travels in the request.
+    ///
     /// # Not bounded
     ///
     /// The deadline covers the exchange up to the reply header. The body of a
@@ -3248,7 +3335,7 @@ impl<Req, Resp> RpcClient<Req, Resp> {
             conn: self.conn.clone(),
             endpoint: self.endpoint.clone(),
             idempotency: self.idempotency.clone(),
-            deadline: Some(budget),
+            deadline: Some(budget.min(TIMER_CEILING)),
             _p: PhantomData,
         }
     }

@@ -2415,6 +2415,10 @@ ANCHORS = [
      "    let mut written = false;"),
     ("AT1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
      "            Reached::Completed => return guard.record(frame, payload, commit).await,"),
+    # The browser's timer ceiling. Lives in the file it breaks, so the record's quote
+    # is unindented where the literal carries four spaces.
+    ("CL1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "    let budget = budget.min(ceiling);"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -4144,7 +4148,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 427
+RECORD_BLOCKS = 428
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -557,6 +557,10 @@ stalls: the client writes the whole request body before it reads any reply, so a
 written. The caller's `with_deadline` wraps the whole exchange, upload included,
 and does end it.
 
+In a browser a deadline is clamped to `i32::MAX` milliseconds (about 24.8 days),
+the longest wait its timer can express: a longer one would wrap to an immediate
+expiry, so it waits that long instead.
+
 ### Many instances behind one ALPN
 
 Keyed actors, addressed by an id inside the request, live in
