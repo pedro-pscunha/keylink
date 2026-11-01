@@ -169,25 +169,31 @@ bytes the store already held and did not ask for. Resume goes down into a member
 the store's bitfield says which 16 KiB chunk groups it holds, and only the others
 are requested, so after a cut no verified group is sent twice. A 4 MiB member cut
 after exactly 100 groups resumed reading 2,556,004 of its 4,194,404 bytes and
-keeping 1,638,400. A window's requests carry at most 2 KiB of ranges each, so a
-window of many partly held members is several requests. `Blobs::missing` (and
+keeping 1,638,400. A request carries at most 64 KiB of ranges; a blob, a closure's
+root, or a window of members with more fragments than that is cut across several
+requests and never refetched whole. `kept` counts each distinct blob once for the
+whole call and never counts bytes the call itself read (32 bytes of accounting for
+each distinct member, so linear in the closure, where planning memory is not).
+`Blobs::missing` (and
 `handle.missing(&store)`) answer what is lacking, from the fetcher's own store.
 
 `Blobs::reader(id)` reads a blob the node holds, as the same `BlobReader` a
-holder's blob opens as: pieces of at most a chunk group, in a bounded amount of
-memory, each window verified against the address before any of it is handed out.
+holder's blob opens as: pieces of at most a chunk group, a 256 KiB payload window
+at a time (a little over twice that in memory while a window is verified), each
+window verified against the address before any of it is handed out.
 A blob the store does not hold in full, absent or part way, is refused with
 `Error::BlobNotHeld` before a byte is read, and one whose stored data or hashes
 no longer verify fails with `Error::BlobCorrupt` at the window where they differ.
-(The file store's own export already refuses data that no longer matches the
-hashes beside it; the reader also checks those hashes against the address.)
+A store that cannot be read at all is `Error::Io`, not corruption. (The file
+store's own export already validates down from the address and refuses data that
+no longer matches; the reader's decode is a second, independent verification.)
 `Blobs::read_to_bytes(id, limit)` is the same for a small blob into memory.
 
 A closure has no limit on how many members it lists. Planning memory and
 request size are bounded, the work is not linear: iroh-blobs 0.104 walks offsets
 one at a time on both ends, so a window starting at member `k` costs `k` steps and
 a whole closure about `N^2 / 4096` of them. A 300,000-member closure with
-alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, not in
+alternating gaps takes 74 s from a cold start on an idle machine and 216 to 283 s on a busy one (`mise run closure-300k`, not in
 the gate), 12,289 members take 8 s (in it). A blob listed twice in one window is
 requested once. The fetcher plans each
 window of 4096 members from that slice of the root alone, so what it holds in

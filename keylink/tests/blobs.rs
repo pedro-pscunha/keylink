@@ -3179,8 +3179,8 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
 /// arrived whole.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK62`) by replacing
-/// `wanted.push(lacking(&held));`
-/// with `wanted.push(ChunkRanges::all());` in `keylink/src/blobs.rs`: every
+/// `let lacking = held.lacking();`
+/// with `let lacking = ChunkRanges::all();` in `keylink/src/blobs.rs`: every
 /// window then asks for all of its members, and the retry moves every member
 /// again (20,480,000 bytes) instead of the roughly half it lacked.
 #[tokio::test]
@@ -3359,10 +3359,10 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
 /// 10000.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK63`) by replacing
-/// `if !seen.insert(*member) {`
-/// with `if false {` in `keylink/src/blobs.rs`: the fetch then asks for every
-/// listed place and fails with `each blob crossed once` (left: 10000, right:
-/// 6000).
+/// `.filter(|(_, member)| touched.insert(**member))`
+/// with `.filter(|(_, member)| true || touched.insert(**member))` in
+/// `keylink/src/blobs.rs`: the fetch then asks for every listed place and fails
+/// with `each blob crossed once` (left: 10000, right: 6000).
 #[tokio::test]
 async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
     let cluster = cluster().await;
@@ -3451,8 +3451,8 @@ fn bytes_through_group(len: u64, groups: u64) -> usize {
 /// groups held. Nothing of the first 100 groups crosses the wire twice.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK64`) by replacing
-/// `ChunkRanges::all().difference(&held.ranges)`
-/// with `ChunkRanges::all()` in `keylink/src/blobs.rs`, which is what the planner
+/// `Self::Part(held) => ChunkRanges::all().difference(&held.ranges),`
+/// with `Self::Part(_) => ChunkRanges::all(),` in `keylink/src/blobs.rs`, which is what the planner
 /// did before: it asks for a partly held member whole again, and `read` is the
 /// whole 4 194 404 bytes against the 2 556 004 that were lacking.
 #[tokio::test]
@@ -3652,10 +3652,70 @@ async fn a_blob_the_store_does_not_hold_in_full_is_refused_by_the_local_reader()
     assert!(local.read_to_bytes(member, 1 << 20).await.is_err());
 }
 
+// ═══════════════════════════════════════ a blob listed in two windows is counted once
+
+/// `Fetched` counts each distinct blob once for the whole fetch, not once a
+/// window. `[A; 4097]` is two windows (4096 and 1) listing the same blob.
+///
+/// With `A` absent: the first window reads it, and the second must not count the
+/// bytes that were just read as `kept`. The exact counters:
+///
+/// ```text
+/// read = A (30 000) + the root's 131 104 bytes + its size probe's last chunk (32)
+/// kept = 0
+/// ```
+///
+/// With `A` already held: it is `kept` once, not twice, and only the root crosses.
+///
+/// ```text
+/// read = 131 104 + 32      kept = 30 000
+/// ```
+///
+/// Watched red with `scripts/break-once.sh` (row `HK71`) by replacing
+/// `.filter(|(_, member)| touched.insert(**member))`
+/// with `.filter(|(_, member)| true || touched.insert(**member))` in
+/// `keylink/src/blobs.rs`: the second window counts `A` again, `kept` is 30,000
+/// where it should be 0 (absent) and 60,000 where it should be 30,000 (held).
+#[tokio::test]
+async fn a_blob_listed_in_two_windows_is_counted_once_whether_absent_or_held() {
+    const LEN: usize = 30_000;
+    let cluster = cluster().await;
+    let a = cluster.add_bytes(&payload(LEN)).await;
+    let seq = cluster
+        .blobs
+        .add_seq(vec![a; 4097])
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+    let handle = BlobHandle::new(
+        &cluster.peer,
+        cluster.server.endpoint().addr(),
+        Content::Closure(seq.id()),
+    );
+    let root = 4097 * 32;
+    let probe = (root - 1) % 1024 + 1;
+    assert_eq!((root, probe), (131_104, 32));
+
+    let absent = Blobs::memory();
+    let fetched = handle.fetch_into(&absent).await.expect("fetches");
+    assert_eq!(fetched.read, (LEN + root + probe) as u64);
+    assert_eq!(fetched.kept, 0, "nothing was held before this call");
+
+    let held = Blobs::memory();
+    held.add_bytes(payload(LEN)).await.expect("stores");
+    let fetched = handle.fetch_into(&held).await.expect("fetches");
+    assert_eq!(fetched.read, (root + probe) as u64);
+    assert_eq!(fetched.kept, LEN as u64, "held once, listed 4097 times");
+}
+
 // ═══════════════════════════════════════ on a disk (needs `--features blobs-fs`)
 //
-// These run with `mise run test`'s second command, which turns the feature on:
-// a default build has no file store to put a partial blob in or to corrupt.
+// These run under the literal invocation
+// `cargo test -p keylink --features blobs-fs --test blobs on_disk_`, which is the
+// `blobs-fs` command in `mise.toml`'s `test` task: a default build has no file
+// store to put a partial blob in or to corrupt.
 
 #[cfg(feature = "blobs-fs")]
 mod on_disk {
@@ -3729,13 +3789,11 @@ mod on_disk {
     /// A blob of 1 MiB is stored on a disk and one byte of its data file, at
     /// 900,000 (in the fourth window of 256 KiB), is flipped.
     ///
-    /// First, what iroh-blobs does with it, stated plainly because it is easy to
-    /// assume the other thing: the file store's own `get_bytes`, which is its
-    /// export, **does** check the data it reads against the hashes stored beside
-    /// it, and refuses the damaged blob with `LeafHashMismatch(864)` (the leaf at
-    /// chunk 864, which holds byte 900,000). That check is the store's, against
-    /// its own outboard; it does not reach the address, and it is not an
-    /// interface a caller of keylink is promised.
+    /// First, what iroh-blobs does with it: the file store's own `get_bytes`,
+    /// which is its export, validates what it reads down from the address it was
+    /// asked for, and refuses the damaged blob with `LeafHashMismatch(864)` (the
+    /// leaf at chunk 864, which holds byte 900,000). The reader's own decode is a
+    /// second, independent verification of the same bytes, not the only one.
     ///
     /// Then the local reader on the same damage: it delivers the three windows
     /// before the damaged one (786,432 bytes, each equal to what was stored) and
@@ -3745,9 +3803,9 @@ mod on_disk {
     /// `a_window_verifies_against_its_address_and_nothing_else_does`.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK67`) by replacing
-    /// `.map_err(|_| corrupt())?;`
-    /// with `.map_err(store_error)?;` in `keylink/src/blobs.rs`: the store's
-    /// refusal then arrives as `Error::Io` and the typed-error assertion fails.
+    /// `if damaged(&error) {`
+    /// with `if false {` in `keylink/src/blobs.rs`: the store's refusal then
+    /// arrives as `Error::Io` and the typed-error assertion fails.
     #[tokio::test]
     async fn on_disk_the_local_reader_refuses_a_blob_whose_data_changed() {
         const LEN: usize = 1024 * 1024;
@@ -3807,161 +3865,36 @@ mod on_disk {
         assert!(blobs.read_to_bytes(id, 2 << 20).await.is_err());
     }
 
-    /// **A window of many partly held members is split into requests, each
-    /// within the byte budget, and the fetch still ends at `Missing::Nothing`.**
+    /// **A store that cannot be read is not a blob that does not verify.** The
+    /// same 1 MiB blob, committed to a disk, has its data file removed under the
+    /// open store. The blob is still held as far as the database knows, so the
+    /// reader opens, and the first window fails because the file is gone: that is `Error::Io`, with the cause, and not `Error::BlobCorrupt`,
+    /// which says the bytes are wrong and that a retry will not help.
     ///
-    /// 800 members of 16,385 bytes (a group of 16,384 and a group of one byte)
-    /// are listed by a closure. A file store is seeded, with iroh-blobs' own
-    /// import, so that a third of them have only their first group, a third only
-    /// their second, and a third nothing, and the member list itself is whole.
-    /// What each member lacks differs from its neighbour's, so each is a run of
-    /// its own in the request, and 800 of them outgrow the 2 KiB a request may
-    /// carry: the holder is asked more than once, and no request is over it.
-    ///
-    /// `read` is exactly the bytes the store lacked and `kept` exactly the bytes
-    /// it held:
-    ///
-    /// ```text
-    /// read = 267 * 1 + 267 * 16 384 + 266 * 16 385 = 8 733 205
-    /// kept = 800 * 32 (the list) + 267 * 16 384 + 267 * 1 = 4 400 395
-    /// ```
-    ///
-    /// Watched red with `scripts/break-once.sh` (row `HK65`, the same line the
-    /// planner's unit test is watched on): with the budget check off, one
-    /// request carries every run and the assertion that none is over 2 KiB fails.
+    /// Watched red with `scripts/break-once.sh` (row `HK72`) by replacing
+    /// `None => by_kind(io),`
+    /// with `None => true,` in `keylink/src/blobs.rs` (every export failure that
+    /// is not an `EncodeError` counted as damage): the assertion below fails with
+    /// `BlobCorrupt`.
     #[tokio::test]
-    async fn on_disk_a_window_of_many_partly_held_members_is_split_and_completes() {
-        use iroh_blobs::store::mem::MemStore;
-        use iroh_blobs::BlobFormat;
-
-        const MEMBERS: u64 = 800;
-        const LEN: usize = 16 * 1024 + 1;
-        let member_bytes = |nth: u64| {
-            let mut bytes = payload(LEN);
-            bytes[..8].copy_from_slice(&nth.to_le_bytes());
-            bytes
-        };
-
-        let cluster = cluster().await;
-        let mut ids = Vec::new();
-        for nth in 0..MEMBERS {
-            ids.push(cluster.add_bytes(&member_bytes(nth)).await);
-        }
-        let seq = cluster
-            .blobs
-            .add_seq(ids.clone())
+    async fn on_disk_a_store_that_cannot_be_read_is_an_io_error_and_not_corruption() {
+        const LEN: usize = 1024 * 1024;
+        let scratch = Scratch::new("unreadable");
+        let blobs = Blobs::persistent(&scratch.0, keylink::Retention::Forever)
             .await
-            .expect("stores the list");
-        cluster
-            .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
-            .await;
+            .expect("opens a file store");
+        let id = blobs.add_bytes(payload(LEN)).await.expect("stores");
+        blobs.flush().await.expect("commits");
+        std::fs::remove_file(data_file(&scratch.0, LEN as u64)).expect("removes the data file");
 
-        // Seed the fetcher's disk: the whole list, and a piece of each member.
-        let seeded = Scratch::new("partial-members");
-        let source = MemStore::new();
-        let disk = FsStore::load(&seeded.0).await.expect("opens a file store");
-        let list: Vec<u8> = ids.iter().flat_map(|id| *id.as_bytes()).collect();
-        let list_tag = source
-            .blobs()
-            .add_bytes_with_opts((list, BlobFormat::HashSeq))
+        let mut reader = blobs.reader(id).await.expect("the database still holds it");
+        let error = reader
+            .next_chunk()
             .await
-            .expect("stores the list");
-        assert_eq!(list_tag.hash, hash_of(seq.id()));
-        let whole = source
-            .blobs()
-            .export_bao(list_tag.hash, ChunkRanges::all())
-            .bao_to_vec()
-            .await
-            .expect("exports");
-        disk.blobs()
-            .import_bao_bytes(list_tag.hash, ChunkRanges::all(), whole)
-            .await
-            .expect("imports the list");
-        let (mut read, mut kept) = (0u64, MEMBERS * 32);
-        for nth in 0..MEMBERS {
-            let tag = source
-                .add_bytes(member_bytes(nth))
-                .await
-                .expect("stores a member");
-            let held = match nth % 3 {
-                0 => ChunkRanges::chunks(0..16),
-                1 => ChunkRanges::chunks(16..17),
-                _ => ChunkRanges::empty(),
-            };
-            let (had, lacked) = match nth % 3 {
-                0 => (16 * 1024, 1),
-                1 => (1, 16 * 1024),
-                _ => (0, LEN as u64),
-            };
-            kept += had;
-            read += lacked;
-            if !held.is_empty() {
-                let piece = source
-                    .blobs()
-                    .export_bao(tag.hash, held.clone())
-                    .bao_to_vec()
-                    .await
-                    .expect("exports a piece");
-                disk.blobs()
-                    .import_bao_bytes(tag.hash, held, piece)
-                    .await
-                    .expect("imports a piece");
-            }
-        }
-        disk.shutdown().await.expect("shuts down");
-
-        let local = Blobs::persistent(&seeded.0, keylink::Retention::Forever)
-            .await
-            .expect("reopens the seeded store");
-        let from = cluster.peer.endpoint().clone();
-        let to = cluster.server.endpoint().addr();
-        let holder = forgery(move |request: GetRequest| {
-            let (from, to) = (from.clone(), to.clone());
-            async move { ask(from, to, request).await }
-        })
-        .await;
-        let handle = holder.handle(seq);
-
-        let fetched = handle
-            .fetch_into(&local)
-            .await
-            .expect("completes the members");
-        println!(
-            "many partial members: read {} kept {}",
-            fetched.read, fetched.kept
-        );
-        assert_eq!(fetched.read, read, "exactly the bytes the store lacked");
-        assert_eq!(fetched.kept, kept, "and exactly the bytes it held");
-        assert_eq!(
-            handle.missing(&local).await.expect("answers"),
-            keylink::Missing::Nothing
-        );
-
-        let asked: Vec<GetRequest> = holder
-            .asked()
-            .into_iter()
-            .filter(|request| request.ranges != preflight_ranges())
-            .collect();
+            .expect_err("the first window cannot be read");
         assert!(
-            asked.len() >= 2,
-            "the window was split: {} request",
-            asked.len()
+            matches!(error, Error::Io(_)),
+            "an unreadable store is an I/O failure, got {error:?}"
         );
-        for request in &asked {
-            let bytes = postcard::to_stdvec(&request.ranges).expect("encodes").len();
-            assert!(
-                bytes <= 2 * 1024,
-                "a request of {bytes} bytes is over the budget"
-            );
-        }
-
-        // And what landed is the content.
-        for nth in [0u64, 1, 2, 399, 799] {
-            let (bytes, hash, _) = stream_and_hash(&local, ids[nth as usize])
-                .await
-                .expect("held");
-            assert_eq!(bytes, member_bytes(nth));
-            assert_eq!(hash.as_bytes(), ids[nth as usize].as_bytes());
-        }
     }
 }
