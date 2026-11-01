@@ -189,6 +189,25 @@ pub trait Governed: GovernedSeal {}
 #[doc(hidden)]
 pub trait GovernedSeal {}
 
+// The ledger stores this commitment unchanged, including across durable recovery.
+// An identical request under another selected principal is not the same replay.
+fn replay_binding(message: [u8; 32], credential: Option<&crate::trust::Credential>) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"keylink replay binding v1");
+    hash.update(&message);
+    match credential {
+        Some(credential) => {
+            hash.update(&[1]);
+            hash.update(credential.principal().as_bytes());
+            hash.update(credential.holder().as_bytes());
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    *hash.finalize().as_bytes()
+}
+
 pub(crate) type Checked<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -725,7 +744,10 @@ where
     // UNKEYED call still costs nothing: `request.idempotency` is `None`, which is
     // the first thing `claim_key` reads and the only thing it needs.
     let fingerprint = if request.idempotency.is_some() {
-        *blake3::hash(&postcard::to_stdvec(&message)?).as_bytes()
+        replay_binding(
+            *blake3::hash(&postcard::to_stdvec(&message)?).as_bytes(),
+            cx.credential(),
+        )
     } else {
         [0; 32]
     };
@@ -2235,7 +2257,8 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// meant for one. A second, DIFFERENT call through the same handle is
     /// refused as [`IdempotencyRefusal::RequestMismatch`] before any recorded
     /// reply is returned. The binding covers the encoded request message,
-    /// including method, actor and arguments; retries must send the same bytes.
+    /// including method, actor and arguments, and the selected credential's
+    /// principal and holder. Retries must retain both request and authority.
     ///
     /// # Why this returns a different type
     ///

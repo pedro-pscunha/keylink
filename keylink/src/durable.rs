@@ -76,7 +76,7 @@ const PEER_LEN: usize = 32;
 
 /// A claimed key whose call never settled. Recovers as `Interrupted`.
 const TAG_CLAIMED: u8 = 0;
-/// Versioned request-bound records, never confused with the former unbound states.
+/// Versioned request/authority-bound records, never confused with the former unbound states.
 const TAG_BOUND: u8 = 5;
 /// A settled key holding a replayable reply.
 const TAG_DONE: u8 = 1;

@@ -804,3 +804,68 @@ async fn learning_pending_revocation_authority_also_closes_existing_connections(
         Some(Refusal::Denied)
     );
 }
+
+#[tokio::test]
+async fn a_recorded_reply_cannot_cross_principals_for_the_same_request() {
+    struct PrincipalData {
+        a: keylink::EndpointId,
+        b: keylink::EndpointId,
+    }
+    impl methods::Handler for PrincipalData {
+        async fn read(&self, cx: &Context) -> u64 {
+            let principal = cx.credential().unwrap().principal();
+            if principal == self.a {
+                11
+            } else {
+                assert_eq!(principal, self.b);
+                22
+            }
+        }
+    }
+    let root_a = SecretKey::from_bytes(&[24; 32]);
+    let root_b = SecretKey::from_bytes(&[25; 32]);
+    let device = SecretKey::from_bytes(&[26; 32]);
+    let ca = Certificate::issue(&root_a, grant(device.public(), "repo/a", 0)).unwrap();
+    let cb = Certificate::issue(&root_b, grant(device.public(), "repo/a", 0)).unwrap();
+    let (first, selected, other) = if ca.id() < cb.id() {
+        (root_a.clone(), ca.clone(), root_b.public())
+    } else {
+        (root_b.clone(), cb.clone(), root_a.public())
+    };
+    let trust = Trust::new(Roots::only([root_a.public(), root_b.public()]).unwrap());
+    trust.insert(Chain::new(vec![ca])).unwrap();
+    trust.insert(Chain::new(vec![cb])).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<methods::Request, _>(WithinCaveats)
+        .resource(resource)
+        .install(|allow| {
+            methods::service(
+                PrincipalData {
+                    a: first.public(),
+                    b: other,
+                },
+                allow,
+            )
+        })
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let keyed = client.with_idempotency(keylink::IdempotencyKey::new("principal-data").unwrap());
+    assert_eq!(keyed.read().await.unwrap(), 11);
+    assert_eq!(keyed.read().await.unwrap(), 11);
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(&first, selected.id())))
+        .unwrap()
+        .is_empty());
+    assert_eq!(client.read().await.unwrap(), 22);
+    assert!(matches!(
+        keyed.read().await.unwrap_err(),
+        Error::Remote(RemoteError::Idempotency(
+            keylink::IdempotencyRefusal::RequestMismatch
+        ))
+    ));
+}

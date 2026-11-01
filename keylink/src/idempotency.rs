@@ -2055,6 +2055,9 @@ pub(crate) enum Claim {
 /// let one peer read another peer's reply by guessing `order-1`, which is an
 /// information leak before it is a collision. It is also what makes `attach`
 /// safe for free: one peer can never wait on another peer's call.
+/// Each entry additionally commits to its request and selected authority
+/// (principal and holder). A different binding is refused before attachment or
+/// replay; the same commitment is retained by durable records.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     inner: Mutex<Inner>,
