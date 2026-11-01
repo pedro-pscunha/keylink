@@ -5,6 +5,10 @@
 //! [`Revocable::apply`]. Every call checks current standing, even before the
 //! connection-closing sweep finishes. Calls already dispatched run to completion.
 //!
+//! Verifying a previously unseen chain can establish a pending revoker's authority.
+//! That decision is retained as a permanent tombstone and closes affected live
+//! connections, even when the offered chain itself is consequently refused.
+//!
 //! Each store is one node's view. Revocation reaches other nodes only as fast as
 //! the application's feeder delivers it. Idle expired connections close on
 //! [`Change::Expire`](crate::trust::Change::Expire); expiry is always enforced at admission and per call.
@@ -247,6 +251,8 @@ impl Trust {
         result
     }
     /// Verify a chain against this view's roots and revocations at `now`.
+    /// Establishing a pending revocation's authority makes it permanent and closes
+    /// affected connections, including when verification returns `Revoked`.
     pub fn verify(&self, chain: &Chain, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(chain)?;
         let mut store = self.store();
@@ -263,6 +269,7 @@ impl Trust {
     /// Checks signature, chain standing and the purpose's operation caveat before
     /// decoding. Resource caveats are not checked: the application must authorize
     /// the value's resource against the returned credential before using it.
+    /// Like `verify`, learning pending revocation authority can close connections.
     pub fn open<T: Serialize + DeserializeOwned>(
         &self,
         signed: &Signed<T>,
