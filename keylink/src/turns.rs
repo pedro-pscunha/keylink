@@ -2422,8 +2422,9 @@ where
     // The work this actor has sent away with [`Deferred::away`]. **Declared
     // before `floor`, so it drops after it**: an unwind or an `abort` settles the
     // verdict first, and only then cancels the tasks, whose dying `Deferred`s read
-    // that verdict. The orderly path settles it explicitly and drops this right
-    // after, below. Every one of these is a body local, so it drops before `state`.
+    // that verdict. The orderly path settles it explicitly and shuts this down
+    // right after, below, and waits for the tasks to be gone. Every one of these
+    // is a body local, so it drops before `state`.
     let mut away: Away<A> = None;
     // **Declared next, so it drops last of the locals that follow it — and every
     // body local drops before a parameter.** `state` is a parameter, so an
