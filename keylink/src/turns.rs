@@ -866,21 +866,28 @@ impl<T> Deferred<T> {
     /// needs, move it in, and decide what to do with the result in [`Back::back`],
     /// where the state may be different from what the launching turn saw.
     ///
-    /// # Why `state` is an argument
+    /// # Why `state` is an argument, and what it does not identify
     ///
-    /// It is the witness that names the actor the work comes back to, and it fixes
-    /// `A` for inference. `&mut` and not `&` means only a running turn can call
-    /// this: a [`read`](LocalActor::read) closure holds `&A`, and a spawned task
-    /// holds no state at all.
+    /// It fixes the **type** `A` for inference and for [`Back`], and nothing more.
+    /// `&mut` and not `&` means only a running turn can call this: a
+    /// [`read`](LocalActor::read) closure holds `&A`, and a spawned task holds no
+    /// state at all. The argument is **not** used to pick the actor: the running
+    /// loop picks the instance, and the work comes back to the actor whose turn is
+    /// running, whichever value was passed.
     ///
-    /// # Misuse is deterministic and not a compile error
+    /// # Misuse that is detected, and misuse that is not
     ///
     /// Calling this outside any turn, or with a different state type than the
-    /// running turn's (`&mut self.sub`), drops the work unstarted and the reply with
-    /// it, so the caller is told [`Withheld::Dropped`]. The first call shows the
-    /// mistake. That is the cost of finding the loop through the running turn
-    /// instead of through a handle the `Deferred` would have to carry; `away.rs`
-    /// argues the choice.
+    /// running turn's (`&mut self.sub` where `sub` is a field of another type),
+    /// drops the work unstarted and the reply with it, so the caller is told
+    /// [`Withheld::Dropped`]. The first call shows the mistake. That is the cost of
+    /// finding the loop through the running turn instead of through a handle the
+    /// `Deferred` would have to carry; `away.rs` argues the choice.
+    ///
+    /// **Passing another value of the same type is not detected.** A boxed
+    /// sub-state of type `A`, or a second `A` held in a field, type-checks, and
+    /// `back` then runs against the actor that is running, not against the value
+    /// passed. Pass `self`.
     ///
     /// # What a deadline does to it
     ///
