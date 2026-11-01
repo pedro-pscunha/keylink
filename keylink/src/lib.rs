@@ -340,7 +340,7 @@ pub use observe::{
 pub use panic::Panic;
 pub use peer::{Dial, Peer};
 #[cfg(feature = "persist")]
-pub use persist::{Opened, Persist};
+pub use persist::{Deltas, Opened, Persist, Whole};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{
     Dispatch, Governed, GovernedSeal, IdempotentClient, RpcClient, Server, ServerBuilder, Service,

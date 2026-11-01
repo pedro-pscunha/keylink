@@ -42,12 +42,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(feature = "persist-file")]
-use keylink::Persist;
 use keylink::{
     Allowlist, Caller, Deferred, EndReason, Ended, Intensity, Observer, RemoteError, Replied,
     Reply, Server, Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Unanswered, Withheld,
 };
+#[cfg(feature = "persist-file")]
+use keylink::{Persist, Whole};
 #[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
 #[cfg(feature = "persist-file")]
@@ -472,7 +472,7 @@ async fn an_actor_restarts_from_its_last_committed_state() {
                     built.fetch_add(1, Ordering::SeqCst);
                     // The previous incarnation's claim is already released:
                     // `run_loop` drops the observers before this is called.
-                    let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                    let (restored, saver) = Persist::<Ledger, _, Whole>::open(&files, &id)
                         .await?
                         .start_from(Ledger::default);
                     let observers: Vec<Box<dyn Observer<Ledger>>> =
@@ -1386,7 +1386,7 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
                     let built = built.clone();
                     async move {
                         built.fetch_add(1, Ordering::SeqCst);
-                        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                        let (restored, saver) = Persist::<Ledger, _, Whole>::open(&files, &id)
                             .await?
                             .start_from(Ledger::default);
                         let observers: Vec<Box<dyn Observer<Ledger>>> =
@@ -1819,7 +1819,7 @@ async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
             let files = files.clone();
             let id = id.clone();
             async move {
-                let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                let (restored, saver) = Persist::<Ledger, _, Whole>::open(&files, &id)
                     .await?
                     .start_from(Ledger::default);
                 let observers: Vec<Box<dyn Observer<Ledger>>> =

@@ -60,7 +60,7 @@ use keylink::prelude::*;
 use keylink::{
     Allowlist, Caller, Deferred, DurableRecords, Error, Idempotency, IdempotencyKey,
     IdempotencyRefusal, KeyState, Node, Persist, RecordError, Records, Refusal, RemoteError,
-    Replied, Reply, Server,
+    Replied, Reply, Server, Whole,
 };
 use keylink_persist::file::Files;
 use keylink_persist::{Durable, RestoreError, StateId};
@@ -242,7 +242,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  `start_from` is the only way to reach the observer. There is no spelling
     //  of these two lines that starts the actor empty while a full state sits
     //  on the disk.
-    let (state, saver) = Persist::<Treasury, _>::open(&store, &id)
+    let (state, saver) = Persist::<Treasury, _, Whole>::open(&store, &id)
         .await?
         .start_from(Treasury::default);
 
@@ -434,7 +434,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let reopened = {
         let mut opened = None;
         for _ in 0..200 {
-            match Persist::<Treasury, _>::open(&store, &id).await {
+            match Persist::<Treasury, _, Whole>::open(&store, &id).await {
                 Ok(ready) => {
                     opened = Some(ready);
                     break;

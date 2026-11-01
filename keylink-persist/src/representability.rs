@@ -60,12 +60,12 @@
 //! [`RestoreError::NoMigration`](crate::RestoreError::NoMigration) carry it so
 //! that a `Durable` implementation cannot construct them and lie about
 //! provenance — but here, in the defining crate, they construct fine, and
-//! `decode` constructs both. No in-crate probe can see it, and neither can
+//! `decode_payload` constructs both. No in-crate probe can see it, and neither can
 //! `keylink-persist/tests/versioned.rs`, which is outside the crate but only
 //! ever *matches* those variants: matching one, with `..`, is legal on an
 //! ordinary variant too. **Construction is the one thing the attribute
-//! forbids**, so the guard is a `compile_fail` doctest on each of the three
-//! variants — a doctest compiles as its own crate, which is where the attribute
+//! forbids**, so the guard is a `compile_fail` doctest on each of the
+//! loader's variants — a doctest compiles as its own crate, which is where the attribute
 //! bites.
 //!
 //! Each fails with `E0639: cannot create non-exhaustive variant using struct
@@ -75,7 +75,7 @@
 //! claims exactly the one thing it can — this does not compile. What stops it
 //! claiming that for the wrong reason, a rename making the variant vanish rather
 //! than the attribute holding, is `keylink-persist/tests/versioned.rs` naming
-//! all three variants from outside the crate.
+//! every one of those variants from outside the crate.
 //!
 //! **That a wrapper cannot be converted back into its claim is not probed
 //! here, and what replaced the probe is stronger than one.** The break such a
@@ -152,8 +152,8 @@ use std::cell::RefCell;
 use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
 
-use crate::versioned::{Snapshot, Versioned};
-use crate::{Claim, Durable, RestoreError, Result, Seq, Tail};
+use crate::versioned::{Recovered, Snapshot, Staged, Versioned};
+use crate::{Changes, Claim, Durable, RestoreError, Result, Seq, Tail};
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
 /// would return, so an inherent method that shadows one is a type error rather
@@ -308,6 +308,21 @@ trait AWrapperGivesNothingBack {
     fn store_unframed(&mut self) -> NoSuchMethod {
         NoSuchMethod
     }
+    // The log half of the port: a record appended through the wrapper is framed
+    // by `stage` and `commit`, and a raw one is the unversioned write the whole
+    // wrapper exists to prevent.
+    fn append(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn append_raw(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn recover(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn truncate_before(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
 }
 
 impl<C: Claim> AWrapperGivesNothingBack for Versioned<C> {}
@@ -321,6 +336,10 @@ fn a_wrapper_gives_nothing_back(mut versioned: Versioned<ProbeClaim>) {
     let _: NoSuchMethod = versioned.store_raw();
     let _: NoSuchMethod = versioned.store_bytes();
     let _: NoSuchMethod = versioned.store_unframed();
+    let _: NoSuchMethod = versioned.append();
+    let _: NoSuchMethod = versioned.append_raw();
+    let _: NoSuchMethod = versioned.recover();
+    let _: NoSuchMethod = versioned.truncate_before();
     let _: NoSuchMethod = versioned.into_claim();
 }
 
@@ -507,6 +526,24 @@ trait TheClaimPortDoesNotKnowAboutFraming {
     fn frame(&self) -> NoSuchMethod {
         NoSuchMethod
     }
+    // The log half must not learn about versions either: a record's version and
+    // count are `Versioned`'s, and an adapter that understood them would be an
+    // adapter whose review includes the record layout.
+    fn append_durable(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn append_versioned(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn append_framed(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn recover_durable(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn recover_versioned(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
 }
 
 impl TheClaimPortDoesNotKnowAboutFraming for ProbeClaim {}
@@ -519,4 +556,183 @@ fn the_port_stayed_dumb(claim: &mut ProbeClaim) {
     let _: NoSuchMethod = claim.load_versioned();
     let _: NoSuchMethod = claim.version();
     let _: NoSuchMethod = claim.frame();
+    let _: NoSuchMethod = claim.append_durable();
+    let _: NoSuchMethod = claim.append_versioned();
+    let _: NoSuchMethod = claim.append_framed();
+    let _: NoSuchMethod = claim.recover_durable();
+    let _: NoSuchMethod = claim.recover_versioned();
+}
+
+// ──────────────────────── a change buffer, a staged turn, a recovery: no way round
+
+/// The claim: nothing outside this crate can take changes out of a
+/// [`Changes`], and nothing can build a [`Staged`] from bytes.
+///
+/// A change buffer is drained by exactly one thing: [`Versioned::stage`], whose
+/// owner holds the claim. A public `take`, `drain` or `clear` lets any code with
+/// the state empty the buffer between a turn and its store, and the turn is then
+/// answered and never written. A public constructor on `Staged` lets a caller
+/// hand [`Versioned::commit`] a record it did not get from a drained buffer,
+/// framed under a version of its choosing.
+///
+/// The break: add `pub fn drain(&mut self) -> Vec<T>` to `Changes`. The call below
+/// then resolves to the inherent method and this module stops compiling. Watched:
+/// `E0308` at `let _: NoSuchMethod = changes.drain();`.
+///
+/// # What this does not prove
+///
+/// **Not `take`, which is `pub(crate)`** and so visible to this module: an
+/// inherent method outranks the trait's here, and a probe on that name would fail
+/// on a clean tree. That name is held by the `compile_fail` doctest on
+/// [`Changes`], which compiles as a foreign crate. And only these names.
+trait AChangeBufferCannotBeDrained {
+    fn drain(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn clear(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn into_inner(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+    fn into_vec(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+    fn iter(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn as_slice(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn pop(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl<T> AChangeBufferCannotBeDrained for Changes<T> {}
+
+fn a_change_buffer_cannot_be_drained(mut changes: Changes<u8>) {
+    let _: NoSuchMethod = changes.drain();
+    let _: NoSuchMethod = changes.clear();
+    let _: NoSuchMethod = changes.iter();
+    let _: NoSuchMethod = changes.as_slice();
+    let _: NoSuchMethod = changes.pop();
+    let _: NoSuchMethod = changes.into_vec();
+}
+
+fn a_change_buffer_cannot_be_unwrapped(changes: Changes<u8>) {
+    let _: NoSuchMethod = changes.into_inner();
+}
+
+/// A path and not a method, for the reason `a_snapshot_comes_only_from_its_state`
+/// gives: a constructor has no receiver. The break: add `pub fn new() -> u8` to
+/// `impl Staged`. Watched: `E0308` at `Probe::new()`.
+trait AStagedTurnComesOnlyFromStage {
+    #[allow(
+        clippy::new_ret_no_self,
+        reason = "the probe's whole job is to return something that is not Self"
+    )]
+    fn new() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_bytes() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_record() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn append() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn compact() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn nothing() -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl<D: Durable> AStagedTurnComesOnlyFromStage for Staged<D> {}
+
+fn a_staged_turn_comes_only_from_stage() {
+    type Probe = Staged<ProbeDurable>;
+    let _: NoSuchMethod = Probe::new();
+    let _: NoSuchMethod = Probe::from_bytes();
+    let _: NoSuchMethod = Probe::from_record();
+    let _: NoSuchMethod = Probe::append();
+    let _: NoSuchMethod = Probe::compact();
+    let _: NoSuchMethod = Probe::nothing();
+}
+
+/// The claim: a [`Recovered`] has no accessor for the state it holds or for the
+/// records after it, so the only way to get the state is a finisher that has dealt
+/// with the records.
+///
+/// An `into_state` or `state` is the quick way to read a journaled state as a
+/// whole one, and that is the bug the type exists to make unwritable: the state
+/// from before every record, handed back as if it were current.
+///
+/// The break: add `pub fn state(&self) -> Option<&D>` to `Recovered`. Watched:
+/// `E0308` at `let _: NoSuchMethod = recovered.state();`.
+trait ARecoveredHasNoWayToReadItsStateAlone {
+    fn state(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn into_state(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+    fn records(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn into_records(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+    fn into_parts(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+    fn versioned(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn into_versioned(self) -> NoSuchMethod
+    where
+        Self: Sized,
+    {
+        NoSuchMethod
+    }
+}
+
+impl<C: Claim, D> ARecoveredHasNoWayToReadItsStateAlone for Recovered<C, D> {}
+
+fn a_recovery_cannot_be_read_without_its_finisher(recovered: Recovered<ProbeClaim, ProbeDurable>) {
+    let _: NoSuchMethod = recovered.state();
+    let _: NoSuchMethod = recovered.records();
+    let _: NoSuchMethod = recovered.versioned();
+    let _: NoSuchMethod = recovered.into_state();
+}
+
+fn a_recovery_cannot_be_taken_apart(recovered: Recovered<ProbeClaim, ProbeDurable>) {
+    let _: NoSuchMethod = recovered.into_parts();
+}
+
+fn a_recovery_cannot_be_unwrapped_to_its_records(recovered: Recovered<ProbeClaim, ProbeDurable>) {
+    let _: NoSuchMethod = recovered.into_records();
+}
+
+fn a_recovery_cannot_be_unwrapped_to_its_wrapper(recovered: Recovered<ProbeClaim, ProbeDurable>) {
+    let _: NoSuchMethod = recovered.into_versioned();
 }

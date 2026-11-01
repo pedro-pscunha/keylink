@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use keylink::prelude::*;
 use keylink::{
     Allowlist, Applied, CallId, Caller, Context, IdempotencyKey, KeyState, Node, Persist,
-    SecretKey, APPLIED_BOUND, MAX_KEY_LEN,
+    SecretKey, Whole, APPLIED_BOUND, MAX_KEY_LEN,
 };
 use keylink_persist::{Claim, Durable, RestoreError, Seq, Snapshots, StateId, Tail};
 use postcard_schema::Schema;
@@ -258,9 +258,9 @@ impl Drop for BucketClaim {
 async fn reopen(
     store: &Bucket,
     id: &StateId,
-) -> Result<keylink::Opened<Vault, Bucket>, Box<dyn StdError>> {
+) -> Result<keylink::Opened<Vault, Bucket, Whole>, Box<dyn StdError>> {
     for _ in 0..200 {
-        match Persist::<Vault, _>::open(store, id).await {
+        match Persist::<Vault, _, Whole>::open(store, id).await {
             Ok(ready) => return Ok(ready),
             Err(keylink_persist::Error::Busy { .. }) => {
                 n0_future::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -284,7 +284,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  `Node::bind_from_env`.
     let desk_secret = SecretKey::from_bytes(&[7; 32]);
 
-    let opened = Persist::<Vault, _>::open(&store, &id).await?;
+    let opened = Persist::<Vault, _, Whole>::open(&store, &id).await?;
     let (mut state, saver) = opened.start_from(Vault::default);
     state.cents = 10_000;
     println!("the vault opens holding {} cents", state.cents);

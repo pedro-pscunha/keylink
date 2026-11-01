@@ -112,14 +112,14 @@ impl Drop for Scratch {
 async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
     // The claim moves into the wrapper and there is no way back out to it, so
     // nothing below this line can write a snapshot without a version stamp.
-    let mut durable = Versioned::new(files.claim(id).await.expect("claims"));
+    let (restored, mut durable) = Versioned::open::<Ledger>(files.claim(id).await.expect("claims"))
+        .await
+        .expect("opens")
+        .whole()
+        .expect("nothing was appended to this state");
 
     // The first ever run is `None`. No file, no state, no ceremony.
-    let state = durable
-        .load::<Ledger>()
-        .await
-        .expect("loads")
-        .unwrap_or_default();
+    let state = restored.unwrap_or_default();
 
     let ledger = ledger::actor(state);
     for entry in entries {

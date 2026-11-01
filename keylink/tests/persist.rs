@@ -31,6 +31,7 @@ use keylink::prelude::*;
 use keylink::{
     ActorId, Allowlist, Applied, CallId, Caller, Context, Deferred, Ended, Eviction,
     IdempotencyKey, KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
+    Whole,
 };
 use std::time::Duration;
 
@@ -139,7 +140,7 @@ fn state_id() -> StateId {
 /// The snapshot file's path, built the way the adapter's documentation says the
 /// layout is: one file per state, named by the id's segments.
 ///
-/// Read raw, on purpose. Reading it back through `Versioned::load` would need a
+/// Read raw, on purpose. Reading it back through `Versioned::open` would need a
 /// claim, and the claim is exactly what a running actor is holding — so the only
 /// way to look at what is on the disk *while* the actor lives is to look at the
 /// bytes.
@@ -308,7 +309,7 @@ async fn a_state_survives_the_process_that_built_it() {
 
     // ── run one
     {
-        let opened = Persist::<Ledger, _>::open(&files, &id)
+        let opened = Persist::<Ledger, _, Whole>::open(&files, &id)
             .await
             .expect("claims and loads");
         assert!(!opened.was_stored(), "the first run has nothing stored");
@@ -328,7 +329,7 @@ async fn a_state_survives_the_process_that_built_it() {
 
     // ── run two: as far as the store can tell, a new process
     {
-        let opened = Persist::<Ledger, _>::open(&files, &id)
+        let opened = Persist::<Ledger, _, Whole>::open(&files, &id)
             .await
             .expect("claims and loads");
         assert!(opened.was_stored(), "run one stored something");
@@ -344,7 +345,7 @@ async fn a_state_survives_the_process_that_built_it() {
     }
 
     // ── run three, which stores nothing, so what it reads is run two's write
-    let opened = Persist::<Ledger, _>::open(&files, &id)
+    let opened = Persist::<Ledger, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads");
     assert!(opened.was_stored(), "run two stored something");
@@ -360,9 +361,9 @@ async fn a_state_survives_the_process_that_built_it() {
 /// completed, so there is no sleep here and nothing to wait for: the assertion
 /// runs on the next line.
 ///
-/// The frame half is read byte by byte rather than through `Versioned::load`,
-/// which would need the claim the actor is holding. Magic, layout, version and
-/// then the payload — the table in `keylink-persist/src/versioned.rs`.
+/// The frame half is read byte by byte rather than through `Versioned::open`,
+/// which would need the claim the actor is holding. Magic, layout, version, the
+/// log position the snapshot contains, and then the payload — the table in `keylink-persist/src/versioned.rs`.
 ///
 /// Made red by storing `state.snapshot()` through the raw claim instead of a
 /// `Snapshot` — the magic disappears — or by dropping the store, when the file
@@ -370,7 +371,7 @@ async fn a_state_survives_the_process_that_built_it() {
 #[tokio::test]
 async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
     let (scratch, files) = store("answered").await;
-    let (state, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::<_, _, Whole>::open(&files, &state_id())
         .await
         .expect("claims and loads")
         .start_from(Ledger::default);
@@ -384,13 +385,18 @@ async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
     assert_eq!(&framed[..6], b"klsnap", "the magic 4c prepends");
     assert_eq!(
         &framed[6..8],
-        &1u16.to_le_bytes(),
+        &2u16.to_le_bytes(),
         "the header's own layout"
     );
     assert_eq!(
         &framed[8..12],
         &Ledger::VERSION.to_le_bytes(),
         "the version of the type that produced the payload"
+    );
+    assert_eq!(
+        &framed[12..20],
+        &0u64.to_le_bytes(),
+        "a whole-state store contains no log record"
     );
     assert_eq!(framed.len(), FRAME_LEN + 8, "one entry, eight bytes");
     assert_eq!(
@@ -435,7 +441,7 @@ async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
 #[tokio::test]
 async fn a_panicked_turn_is_not_stored_and_ends_the_actor() {
     let (scratch, files) = store("panicked").await;
-    let (state, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::<_, _, Whole>::open(&files, &state_id())
         .await
         .expect("claims and loads")
         .start_from(Ledger::default);
@@ -480,7 +486,7 @@ async fn a_panicked_turn_is_not_stored_and_ends_the_actor() {
 #[tokio::test]
 async fn a_refusal_before_persist_prevents_the_store() {
     let (scratch, files) = store("refused").await;
-    let (state, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::<_, _, Whole>::open(&files, &state_id())
         .await
         .expect("claims and loads")
         .start_from(Ledger::default);
@@ -530,7 +536,7 @@ async fn a_refusal_before_persist_prevents_the_store() {
 #[tokio::test]
 async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
     let store = Flaky::new();
-    let opened = Persist::<Ledger, _>::open(&store, &state_id())
+    let opened = Persist::<Ledger, _, Whole>::open(&store, &state_id())
         .await
         .expect("claims and loads");
     assert!(!opened.was_stored(), "the first run has nothing stored");
@@ -601,7 +607,7 @@ async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
 async fn the_claim_is_free_the_instant_stop_returns() {
     let (_scratch, files) = store("claim").await;
     let id = state_id();
-    let (state, saver) = Persist::open(&files, &id)
+    let (state, saver) = Persist::<_, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads")
         .start_from(Ledger::default);
@@ -637,11 +643,11 @@ async fn a_second_open_on_one_state_busy() {
 
     // Holding the `Opened` holds the claim: the state and the observer are both
     // still inside it, so there is nothing to bind and nothing to drop early.
-    let _held = Persist::<Ledger, _>::open(&files, &id)
+    let _held = Persist::<Ledger, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads");
 
-    let refused = Persist::<Ledger, _>::open(&files, &id)
+    let refused = Persist::<Ledger, _, Whole>::open(&files, &id)
         .await
         .expect_err("a second open on a claimed state must be refused");
     assert!(
@@ -677,7 +683,7 @@ async fn a_keyed_actors_state_survives_its_own_process() {
     let client_node = local_node().await;
 
     for (run, entry, expected) in [(1u8, 10u64, vec![10u64]), (2, 20, vec![10, 20])] {
-        let (state, saver) = Persist::<Ledger, _>::open(&files, &id)
+        let (state, saver) = Persist::<Ledger, _, Whole>::open(&files, &id)
             .await
             .expect("claims and loads")
             .start_from(Ledger::default);
@@ -754,7 +760,7 @@ async fn a_keyed_actors_state_survives_its_own_process() {
         drop(running);
     }
 
-    let opened = Persist::<Ledger, _>::open(&files, &id)
+    let opened = Persist::<Ledger, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads");
     assert!(opened.was_stored(), "the keyed runs stored something");
@@ -910,7 +916,7 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
     let store = Flaky::new();
     let id = StateId::new("vaults/sp-01").expect("valid");
-    let opened = Persist::<Vault, _>::open(&store, &id)
+    let opened = Persist::<Vault, _, Whole>::open(&store, &id)
         .await
         .expect("claims and loads");
     assert!(!opened.was_stored(), "the first run has nothing stored");
@@ -975,7 +981,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
 async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
     let store = Flaky::new();
     let id = StateId::new("vaults/sp-02").expect("valid");
-    let (state, saver) = Persist::<Vault, _>::open(&store, &id)
+    let (state, saver) = Persist::<Vault, _, Whole>::open(&store, &id)
         .await
         .expect("claims and loads")
         .start_from(|| Vault {
@@ -1094,7 +1100,7 @@ async fn a_state_that_is_not_sync_is_still_persisted() {
     let id = StateId::new("counters/hits").expect("valid");
 
     {
-        let (state, saver) = Persist::<Counter, _>::open(&files, &id)
+        let (state, saver) = Persist::<Counter, _, Whole>::open(&files, &id)
             .await
             .expect("claims and loads")
             .start_from(Counter::default);
@@ -1107,7 +1113,7 @@ async fn a_state_that_is_not_sync_is_still_persisted() {
             .expect("a stop from outside the actor's own turn is never refused");
     }
 
-    let opened = Persist::<Counter, _>::open(&files, &id)
+    let opened = Persist::<Counter, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads");
     assert!(opened.was_stored(), "the run above stored something");
@@ -1155,7 +1161,7 @@ async fn the_per_turn_store_cost() {
         .await
         .expect("a stop from outside the actor's own turn is never refused");
 
-    let (state, saver) = Persist::open(&files, &id)
+    let (state, saver) = Persist::<_, _, Whole>::open(&files, &id)
         .await
         .expect("claims and loads")
         .start_from(Counter::default);
@@ -1327,7 +1333,7 @@ struct Serving {
 
 impl Serving {
     async fn start(files: &Files, id: &StateId, actor: &ActorId, node: &keylink::Node) -> Self {
-        let (state, saver) = Persist::<Till, _>::open(files, id)
+        let (state, saver) = Persist::<Till, _, Whole>::open(files, id)
             .await
             .expect("claims and loads")
             .start_from(Till::default);
@@ -1675,7 +1681,7 @@ impl Durable for Booth {
 /// The booth's snapshot, decoded off the disk while the actor still holds the claim.
 ///
 /// Raw, for the reason [`snapshot_path`] gives: reading it back through
-/// `Versioned::load` would need the claim, and the claim is what the running actor
+/// `Versioned::open` would need the claim, and the claim is what the running actor
 /// is holding. This is what lets a test see what one turn stored *without* a
 /// restart, which is the only way to look at the state between a park and its
 /// approval.
@@ -1713,7 +1719,7 @@ struct Booking {
 
 impl Booking {
     async fn start(files: &Files, id: &StateId, actor: &ActorId, node: &keylink::Node) -> Self {
-        let (state, saver) = Persist::<Booth, _>::open(files, id)
+        let (state, saver) = Persist::<Booth, _, Whole>::open(files, id)
             .await
             .expect("claims and loads")
             .start_from(|| Booth {

@@ -8,6 +8,11 @@
 //! Everything here compiles as part of the gate, so it is the shape that
 //! actually works rather than the shape a document remembers.
 //!
+//! The state is journaled: each turn appends the one entry it posted, and the
+//! log is folded into a snapshot now and then, so a turn costs the size of its
+//! change and not the size of the ledger. `tests/persist.rs` covers the
+//! whole-state strategy, `Persist<_, _, Whole>`.
+//!
 //! # What changed in Wave 5
 //!
 //! This file used to carry a commit loop, with a comment reading *"keylink has no
@@ -23,9 +28,9 @@
 use std::error::Error;
 use std::time::Duration;
 
-use keylink::{Allowlist, Caller, Node, Own, Persist, Servable};
+use keylink::{Allowlist, Caller, Deltas, Node, Own, Persist, Servable};
 use keylink_persist::file::Files;
-use keylink_persist::{Durable, RestoreError, StateId};
+use keylink_persist::{Changes, Durable, Journaled, RestoreError, StateId};
 
 keylink::service! {
     service Ledger;
@@ -34,16 +39,58 @@ keylink::service! {
     rpc Total() -> u64;
 }
 
-/// The state. It does not know it is durable — that is the second impl below,
-/// and the actor never mentions it.
+/// One change to the ledger: an entry was posted. This is what a turn appends.
+#[derive(Clone)]
+struct Posted(u64);
+
+impl Durable for Posted {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.0.to_le_bytes().to_vec()
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+            RestoreError::Malformed(format!("a post is 8 bytes, and this is {}", bytes.len()))
+        })?;
+        Ok(Self(u64::from_le_bytes(bytes)))
+    }
+
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+/// The state. It does not know where it is stored — that is the impls below,
+/// and the actor never mentions them. `changes` is the one field that is about
+/// durability: the turn's changes wait there for the store.
 #[derive(Default)]
 struct Ledger {
     entries: Vec<u64>,
+    changes: Changes<Posted>,
+}
+
+impl Journaled for Ledger {
+    type Delta = Posted;
+
+    fn changes(&self) -> &Changes<Posted> {
+        &self.changes
+    }
+
+    /// The one piece of code that changes the entries. A restore runs it for
+    /// every stored change, and so does the handler, so the live path and the
+    /// replay path cannot drift apart.
+    fn apply(&mut self, delta: Posted) {
+        self.entries.push(delta.0);
+    }
 }
 
 impl ledger::Actor for Ledger {
     async fn post(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
-        self.entries.push(entry);
+        let delta = Posted(entry);
+        self.apply(delta.clone());
+        self.changes.record(delta);
         self.entries.len() as u64
     }
 
@@ -76,6 +123,7 @@ impl Durable for Ledger {
                 .iter()
                 .map(|c| u64::from_le_bytes(*c))
                 .collect(),
+            changes: Changes::default(),
         })
     }
 
@@ -89,7 +137,7 @@ impl Durable for Ledger {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let root = std::env::temp_dir().join("keylink-durable-ledger");
+    let root = std::env::temp_dir().join("keylink-durable-ledger-deltas");
     let store = Files::open(&root).await?.limit(1024 * 1024);
     let id = StateId::new("ledgers/sp-01")?;
 
@@ -103,7 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  A snapshot from a *newer* build stops here with `FromTheFuture` rather
     //  than being read as far as this build understands: half a state is worse
     //  than none, and writing the truncation back would be worse still.
-    let opened = match Persist::<Ledger, _>::open(&store, &id).await {
+    let opened = match Persist::<Ledger, _, Deltas>::open(&store, &id).await {
         Ok(opened) => opened,
         Err(keylink_persist::Error::Busy { id }) => {
             // NOT a transient error to retry in a loop. Another process
@@ -114,6 +162,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Err(other) => return Err(other.into()),
     };
+
+    //  A crash in the middle of an append leaves a partly written record. Recovery
+    //  cuts it and says so here. Nothing acknowledged is lost: that append never
+    //  resolved, so no caller was told it had happened.
+    if let Some(torn) = opened.torn_tail() {
+        println!(
+            "recovery cut {} bytes after record {}: an append that never finished",
+            torn.bytes, torn.after
+        );
+    }
 
     //  `was_stored` asks the question without taking the answer, and
     //  `start_from` is the only way to reach the observer — so there is no
@@ -164,12 +222,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ── 5. What this costs, stated rather than hidden.
     //
-    //  Each of those turns paid for an atomic file replace with two `fsync`s in
-    //  it: **~7.6 ms** on the machine named in `keylink/src/persist.rs`, against
-    //  ~18 µs for the same turn unobserved — about 130 turns per second per
-    //  actor. That is the price of "a reply means it is on the disk", and the
-    //  knob that trades it away is a debounce — which nothing here implements,
-    //  because a debounce gives up exactly the property this example is about.
+    //  The first turn of a brand new ledger stored a snapshot (an atomic file
+    //  replace, two `fsync`s). Every later turn appended one record to the journal
+    //  and paid one `fsync` for it, whatever the size of the ledger: 36 bytes for
+    //  an 8-byte entry (the 16-byte frame, the 12-byte record header and the entry).
+    //  `keylink/src/persist.rs` has the measured comparison with
+    //  a whole-state store, which pays the whole ledger's size every turn. That is
+    //  still the price of "a reply means it is on the disk", and the knob that
+    //  trades it away is a debounce — which nothing here implements, because a
+    //  debounce gives up exactly the property this example is about.
+    //
+    //  Every so often the journal is folded into a new snapshot, and that one turn
+    //  costs the size of the ledger. The default policy folds at a megabyte of
+    //  journal, which this example never reaches; `Opened::compaction` sets another.
     //
     //  Nothing in THIS example is uncommitted any more. The window the previous
     //  version demonstrated — a turn the caller's loop had not got around to

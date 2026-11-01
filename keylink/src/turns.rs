@@ -3879,8 +3879,10 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     ///         let store = store.clone();
     ///         let id = id.clone();
     ///         async move {
-    ///             let (restored, saver) = Persist::<Ledger, _>::open(&store, &id).await?;
-    ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
+    ///             let (state, saver) = Persist::<Ledger, _, Whole>::open(&store, &id)
+    ///                 .await?
+    ///                 .start_from(Ledger::default);
+    ///             Ok((state, vec![Box::new(saver) as _], ()))
     ///         }
     ///     },
     ///     limit,

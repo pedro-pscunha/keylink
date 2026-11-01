@@ -30,9 +30,11 @@
 #![cfg(feature = "file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use keylink_persist::file::Files;
+use keylink_persist::file::{FileClaim, Files};
 use keylink_persist::versioned::{FrameFault, Snapshot, Versioned, FRAME_LEN};
-use keylink_persist::{Durable, Error, RestoreError, Snapshots, StateId};
+use keylink_persist::{
+    Changes, Claim, Durable, Error, Journaled, RestoreError, Seq, Snapshots, StateId,
+};
 
 // ────────────────────────────────────────────── three versions of one ledger
 
@@ -268,15 +270,41 @@ async fn open(scratch: &Scratch) -> Files {
 }
 
 /// Build the header this build writes, for a version this build may not
-/// understand. Deliberately spelled out here rather than reached for through
-/// the crate: a test that used the crate's own encoder to build its input would
-/// stay green through a layout change that broke every file on disk.
+/// understand, and a snapshot that contains no log record. Deliberately spelled
+/// out here rather than reached for through the crate: a test that used the
+/// crate's own encoder to build its input would stay green through a layout
+/// change that broke every file on disk.
 fn framed(version: u32, payload: &[u8]) -> Vec<u8> {
+    framed_through(version, 0, payload)
+}
+
+/// The same, for a snapshot that contains the log up to and including `through`.
+fn framed_through(version: u32, through: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = b"klsnap".to_vec();
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&through.to_le_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+/// Claim the state and open it as a plain `D`, the way a whole-state store does.
+async fn open_whole<D: Durable>(
+    files: &Files,
+) -> keylink_persist::Result<(Option<D>, Versioned<FileClaim>)> {
+    let claim = files.claim(&id()).await?;
+    Ok(Versioned::open::<D>(claim).await?.whole()?)
+}
+
+/// Read what is stored and let the claim go.
+async fn load<D: Durable>(files: &Files) -> keylink_persist::Result<Option<D>> {
+    Ok(open_whole::<D>(files).await?.0)
+}
+
+/// A claim, opened to store through. Nothing is stored in these tests before it,
+/// so what it is opened as does not matter.
+async fn writer(files: &Files) -> Versioned<FileClaim> {
+    open_whole::<LedgerV1>(files).await.expect("opens").1
 }
 
 /// Write bytes straight into the adapter's file, the way a previous build left
@@ -295,7 +323,7 @@ async fn what_is_stored_carries_a_header() {
     let scratch = Scratch::new("header");
     let files = open(&scratch).await;
 
-    let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+    let mut state = writer(&files).await;
     let ledger = LedgerV1 {
         entries: vec![1, 2, 3],
     };
@@ -303,9 +331,14 @@ async fn what_is_stored_carries_a_header() {
 
     let on_disk = std::fs::read(scratch.snapshot_path()).expect("reads");
     assert_eq!(&on_disk[..6], b"klsnap", "the magic is the first six bytes");
-    assert_eq!(&on_disk[6..8], &1u16.to_le_bytes(), "the layout version");
+    assert_eq!(&on_disk[6..8], &2u16.to_le_bytes(), "the layout version");
     assert_eq!(&on_disk[8..12], &1u32.to_le_bytes(), "LedgerV1::VERSION");
-    assert_eq!(&on_disk[12..], &ledger.snapshot()[..], "then the payload");
+    assert_eq!(
+        &on_disk[12..20],
+        &0u64.to_le_bytes(),
+        "no log record is contained in a snapshot that nothing was appended to"
+    );
+    assert_eq!(&on_disk[20..], &ledger.snapshot()[..], "then the payload");
     assert_eq!(on_disk.len(), FRAME_LEN + 24);
 }
 
@@ -324,10 +357,9 @@ async fn a_state_survives_the_claim_that_wrote_it() {
     let files = open(&scratch).await;
 
     {
-        let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+        let (loaded, mut state) = open_whole::<LedgerV1>(&files).await.expect("opens");
         assert_eq!(
-            state.load::<LedgerV1>().await.expect("loads"),
-            None,
+            loaded, None,
             "nothing stored yet is the first run, not a failure"
         );
         state
@@ -339,9 +371,8 @@ async fn a_state_survives_the_claim_that_wrote_it() {
     }
 
     // A new claim is a new process, as far as the store can tell.
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
     assert_eq!(
-        state.load::<LedgerV1>().await.expect("loads"),
+        load::<LedgerV1>(&files).await.expect("loads"),
         Some(LedgerV1 {
             entries: vec![4, 5]
         })
@@ -358,7 +389,7 @@ async fn v1_bytes_load_into_a_v2_type_through_one_hop() {
     let files = open(&scratch).await;
 
     {
-        let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+        let mut state = writer(&files).await;
         state
             .store(&Snapshot::of(&LedgerV1 {
                 entries: vec![10, 20, 30],
@@ -367,9 +398,8 @@ async fn v1_bytes_load_into_a_v2_type_through_one_hop() {
             .expect("stores");
     }
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
     assert_eq!(
-        state.load::<LedgerV2>().await.expect("loads"),
+        load::<LedgerV2>(&files).await.expect("loads"),
         Some(LedgerV2 {
             // The total exists only because the hop computed it. A loader that
             // skipped the hop would read 10 as the total and lose an entry.
@@ -382,7 +412,7 @@ async fn v1_bytes_load_into_a_v2_type_through_one_hop() {
 /// Two hops, and the v1 → v2 arm is what produces the total, so a chain that
 /// jumped straight to the last hop could not pass this.
 ///
-/// Made red by `scripts/break-once.sh`, replacing `decode`'s
+/// Made red by `scripts/break-once.sh`, replacing `decode_payload`'s
 /// `for from in stored..D::VERSION {` with `for from in (D::VERSION - 1)..D::VERSION {`
 /// — the jump the sentence above says could not pass. Watched: left
 /// `Some(LedgerV3 { total: 7, entries: [8], count: 1 })` against right
@@ -395,7 +425,7 @@ async fn v1_bytes_load_into_a_v3_type_through_two_hops() {
     let files = open(&scratch).await;
 
     {
-        let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+        let mut state = writer(&files).await;
         state
             .store(&Snapshot::of(&LedgerV1 {
                 entries: vec![7, 8],
@@ -404,9 +434,8 @@ async fn v1_bytes_load_into_a_v3_type_through_two_hops() {
             .expect("stores");
     }
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
     assert_eq!(
-        state.load::<LedgerV3>().await.expect("loads"),
+        load::<LedgerV3>(&files).await.expect("loads"),
         Some(LedgerV3 {
             total: 15, // from the v1 → v2 arm
             entries: vec![7, 8],
@@ -419,7 +448,7 @@ async fn v1_bytes_load_into_a_v3_type_through_two_hops() {
 /// The case people get wrong. A v9 snapshot met by a v1 build is refused, and
 /// what is on the disk is exactly what was there before.
 ///
-/// Made red by dropping the `stored > D::VERSION` comparison in `decode`.
+/// Made red by dropping the `stored > D::VERSION` comparison in `decode_payload`.
 #[tokio::test]
 async fn a_snapshot_from_the_future_is_refused_and_left_alone() {
     let scratch = Scratch::new("future");
@@ -428,9 +457,7 @@ async fn a_snapshot_from_the_future_is_refused_and_left_alone() {
     let from_the_future = framed(9, &[0xab; 40]);
     plant(&scratch, &files, &from_the_future).await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state
-        .load::<LedgerV1>()
+    let error = load::<LedgerV1>(&files)
         .await
         .expect_err("a v9 snapshot is not a v1 one");
 
@@ -463,16 +490,14 @@ async fn a_gap_in_the_chain_names_the_missing_hop() {
     let files = open(&scratch).await;
 
     {
-        let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+        let mut state = writer(&files).await;
         state
             .store(&Snapshot::of(&LedgerV1 { entries: vec![1] }))
             .await
             .expect("stores");
     }
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state
-        .load::<LedgerWithAGap>()
+    let error = load::<LedgerWithAGap>(&files)
         .await
         .expect_err("there is no hop from 1");
 
@@ -489,7 +514,7 @@ async fn a_gap_in_the_chain_names_the_missing_hop() {
 
 /// **The silent-corruption case.** A snapshot written before this crate framed
 /// anything is 24 raw bytes, and `LedgerV1::restore` accepts any multiple of
-/// eight — so a loader without a magic would read the twelve-byte header out of
+/// eight — so a loader without a magic would read the twenty-byte header out of
 /// the payload and hand back a ledger built from the remainder, with no error
 /// anywhere.
 ///
@@ -507,9 +532,7 @@ async fn a_raw_unframed_snapshot_is_refused_rather_than_mis_parsed() {
     assert_eq!(legacy.len(), 24, "a valid payload of a plausible length");
     plant(&scratch, &files, &legacy).await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state
-        .load::<LedgerV1>()
+    let error = load::<LedgerV1>(&files)
         .await
         .expect_err("unframed bytes are not a snapshot this build can read");
 
@@ -538,8 +561,7 @@ async fn a_file_too_short_to_be_a_frame_is_refused() {
     let files = open(&scratch).await;
     plant(&scratch, &files, b"klsna").await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state.load::<LedgerV1>().await.expect_err("five bytes");
+    let error = load::<LedgerV1>(&files).await.expect_err("five bytes");
     assert!(
         matches!(
             error,
@@ -559,7 +581,7 @@ async fn a_file_too_short_to_be_a_frame_is_refused() {
 /// Made red by `scripts/break-once.sh`, replacing `unframe`'s
 /// `match layout.cmp(&LAYOUT) {` with `match Ordering::Equal {` — the layout check
 /// deleted while everything downstream still runs. Watched: this fails at the
-/// `expect_err`, "layout 2: Some(LedgerV1 { entries: [0] })". A build that skipped
+/// `expect_err`, "layout 3: Some(LedgerV1 { entries: [0] })". A build that skipped
 /// this check does not error; it hands back a ledger it decoded from a header it
 /// does not understand.
 #[tokio::test]
@@ -568,16 +590,15 @@ async fn a_frame_layout_from_the_future_is_refused() {
     let files = open(&scratch).await;
 
     let mut newer = framed(1, &[0; 8]);
-    newer[6] = 2;
+    newer[6] = 3;
     plant(&scratch, &files, &newer).await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state.load::<LedgerV1>().await.expect_err("layout 2");
+    let error = load::<LedgerV1>(&files).await.expect_err("layout 3");
     assert!(
         matches!(
             error,
             Error::Restore(RestoreError::NotAFrame {
-                fault: FrameFault::LayoutFromTheFuture { stored: 2, ours: 1 },
+                fault: FrameFault::LayoutFromTheFuture { stored: 3, ours: 2 },
                 ..
             })
         ),
@@ -587,10 +608,10 @@ async fn a_frame_layout_from_the_future_is_refused() {
 
 /// The other side of that comparison, and the side a single `!=` got wrong: a
 /// layout *older* than this build's is not a layout from the future. Which
-/// verdict fires is unobservable while `LAYOUT` is 1 and nothing ever wrote 0 —
-/// and it stops being unobservable on the day `LAYOUT` becomes 2, when every
-/// file already on disk takes this arm and the wrong name would have refused
-/// all of them with a reason that was false about all of them.
+/// verdict fires was unobservable while `LAYOUT` was 1 and nothing ever wrote 0 —
+/// and it stopped being unobservable the day `LAYOUT` became 2, when every
+/// layout-1 file already on disk took this arm and the wrong name would have
+/// refused all of them with a reason that was false about all of them.
 ///
 /// Layout 0 is also what an unframed file reads here. It does not reach this
 /// check in practice — the magic is tested first and
@@ -608,13 +629,12 @@ async fn a_frame_layout_older_than_this_build_is_refused_as_old() {
     older[6] = 0;
     plant(&scratch, &files, &older).await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state.load::<LedgerV1>().await.expect_err("layout 0");
+    let error = load::<LedgerV1>(&files).await.expect_err("layout 0");
     assert!(
         matches!(
             error,
             Error::Restore(RestoreError::NotAFrame {
-                fault: FrameFault::LayoutTooOld { stored: 0, ours: 1 },
+                fault: FrameFault::LayoutTooOld { stored: 0, ours: 2 },
                 ..
             })
         ),
@@ -625,7 +645,7 @@ async fn a_frame_layout_older_than_this_build_is_refused_as_old() {
 /// What a `Durable` reports about its own bytes reaches the caller unchanged,
 /// and is the only variant it can report.
 ///
-/// Made red by `scripts/break-once.sh`, replacing `decode`'s
+/// Made red by `scripts/break-once.sh`, replacing `decode_payload`'s
 /// `return D::restore(payload);` with a `map_err` that rewrites whatever the state
 /// said as `RestoreError::Malformed("bad snapshot")` — this crate substituting its
 /// own summary for the one report that knows the payload's shape. Watched: "got
@@ -637,8 +657,7 @@ async fn what_the_state_says_about_its_own_bytes_is_what_the_caller_sees() {
     let files = open(&scratch).await;
     plant(&scratch, &files, &framed(1, b"seven!!")).await;
 
-    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
-    let error = state.load::<LedgerV1>().await.expect_err("not whole u64s");
+    let error = load::<LedgerV1>(&files).await.expect_err("not whole u64s");
     let Error::Restore(RestoreError::Malformed(said)) = error else {
         panic!("got {error:?}");
     };
@@ -653,7 +672,7 @@ async fn what_the_state_says_about_its_own_bytes_is_what_the_caller_sees() {
 /// refused — is a number nobody can act on.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `FileClaim::store`'s
-/// `let offered = bytes.len() as u64;` with `let offered = (bytes.len() - 12) as u64;`
+/// `let offered = bytes.len() as u64;` with `let offered = (bytes.len() - 20) as u64;`
 /// — the limit measured against the payload while the disk takes the frame, which is
 /// the off-by-a-header this test is named for. Watched: the second store is
 /// **accepted**, so it fails at the `expect_err` with "over the limit: ()". A limit
@@ -664,7 +683,7 @@ async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
     let files = open(&scratch).await;
     let files = files.limit((FRAME_LEN + 16) as u64);
 
-    let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+    let mut state = writer(&files).await;
 
     // Two entries: sixteen bytes of payload, and the frame fills the limit
     // exactly.
@@ -693,8 +712,9 @@ async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
     );
 
     // And the refusal left the previous snapshot alone.
+    drop(state);
     assert_eq!(
-        state.load::<LedgerV1>().await.expect("loads"),
+        load::<LedgerV1>(&files).await.expect("loads"),
         Some(LedgerV1 {
             entries: vec![1, 2]
         })
@@ -709,10 +729,10 @@ async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
 /// It is a store that can never succeed rather than an error at configuration
 /// time, because `limit` is a builder that returns `Self`. So the floor is a
 /// documented number and a test, and the refusal is at least loud: it names
-/// both sides, and `offered` is twelve against a limit below twelve, which is
+/// both sides, and `offered` is twenty against a limit below twenty, which is
 /// the shape of the mistake rather than a puzzle.
 ///
-/// Made red by having `Files::limit` clamp upward — `self.limit = bytes.max(12)`
+/// Made red by having `Files::limit` clamp upward — `self.limit = bytes.max(20)`
 /// — which is the tempting fix and a silent fallback: the store would then
 /// quietly not have the limit it was configured with.
 #[tokio::test]
@@ -721,7 +741,7 @@ async fn a_limit_under_the_frame_refuses_even_an_empty_snapshot() {
     let files = open(&scratch).await;
     let files = files.limit((FRAME_LEN - 1) as u64);
 
-    let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+    let mut state = writer(&files).await;
     let error = state
         .store(&Snapshot::of(&LedgerV1 { entries: vec![] }))
         .await
@@ -734,5 +754,387 @@ async fn a_limit_under_the_frame_refuses_even_an_empty_snapshot() {
                 if offered == FRAME_LEN as u64 && limit == (FRAME_LEN - 1) as u64
         ),
         "got {error:?}"
+    );
+}
+
+// ───────────────────────────────────────────── the log after the snapshot
+
+/// One change to a [`Journal`]: an entry was posted.
+///
+/// Version 2 stores the entry as eight bytes. Version 1 stored four, which is the
+/// hop the migration test needs: a v1 delta is not readable as a v2 one until
+/// `migrate` has widened it.
+#[derive(Debug, PartialEq, Eq)]
+struct Posted(u64);
+
+impl Durable for Posted {
+    const VERSION: u32 = 2;
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.0.to_le_bytes().to_vec()
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+            RestoreError::Malformed(format!("a post is 8 bytes, not {}", bytes.len()))
+        })?;
+        Ok(Self(u64::from_le_bytes(bytes)))
+    }
+
+    fn migrate(from: u32, bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        match from {
+            1 => {
+                let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+                    RestoreError::Malformed(format!("a v1 post is 4 bytes, not {}", bytes.len()))
+                })?;
+                Ok(Some(
+                    u64::from(u32::from_le_bytes(bytes)).to_le_bytes().to_vec(),
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// A journaled ledger: the entries, and the changes the running turn made.
+#[derive(Debug, Default)]
+struct Journal {
+    entries: Vec<u64>,
+    changes: Changes<Posted>,
+}
+
+impl Durable for Journal {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.entries.iter().flat_map(|n| n.to_le_bytes()).collect()
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        let entries = bytes
+            .chunks(8)
+            .map(|chunk| Posted::restore(chunk).map(|post| post.0))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            entries,
+            changes: Changes::default(),
+        })
+    }
+
+    fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+impl Journaled for Journal {
+    type Delta = Posted;
+
+    fn changes(&self) -> &Changes<Posted> {
+        &self.changes
+    }
+
+    fn apply(&mut self, delta: Posted) {
+        self.entries.push(delta.0);
+    }
+}
+
+/// One log record, spelled out byte by byte for the same reason `framed` is: the
+/// delta version, the count, then each delta behind its length.
+fn record(version: u32, deltas: &[&[u8]]) -> Vec<u8> {
+    let mut out = version.to_le_bytes().to_vec();
+    out.extend_from_slice(&(deltas.len() as u32).to_le_bytes());
+    for delta in deltas {
+        out.extend_from_slice(&(delta.len() as u32).to_le_bytes());
+        out.extend_from_slice(delta);
+    }
+    out
+}
+
+/// Store a snapshot of `entries` that contains the log up to `through`, by
+/// planting the frame the way an earlier build left it, then append `records` as
+/// the positions `first`, `first + 1`, and so on.
+async fn plant_journal(
+    scratch: &Scratch,
+    files: &Files,
+    entries: &[u64],
+    through: u64,
+    first: u64,
+    records: &[Vec<u8>],
+) {
+    let payload = Journal {
+        entries: entries.to_vec(),
+        changes: Changes::default(),
+    }
+    .snapshot();
+    plant(scratch, files, &framed_through(1, through, &payload)).await;
+    let mut claim = files.claim(&id()).await.expect("claims");
+    for (n, bytes) in records.iter().enumerate() {
+        claim
+            .append(Seq::new(first + n as u64), bytes)
+            .await
+            .expect("appends");
+    }
+}
+
+async fn replayed(files: &Files) -> keylink_persist::Result<Option<Journal>> {
+    let claim = files.claim(&id()).await?;
+    Ok(Versioned::open::<Journal>(claim).await?.replayed()?.0)
+}
+
+/// Records after a snapshot are applied, in order, to the state it holds.
+///
+/// Made red by `scripts/break-once.sh`, deleting `Recovered::replayed`'s
+/// `state.apply(delta);`. Watched: the entries come back as the snapshot alone.
+#[tokio::test]
+async fn the_records_after_a_snapshot_are_applied_in_order() {
+    let scratch = Scratch::new("replay");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[1],
+        0,
+        1,
+        &[
+            record(2, &[&2u64.to_le_bytes(), &3u64.to_le_bytes()]),
+            record(2, &[&4u64.to_le_bytes()]),
+        ],
+    )
+    .await;
+
+    let ledger = replayed(&files).await.expect("replays").expect("stored");
+    assert_eq!(ledger.entries, vec![1, 2, 3, 4]);
+    assert_eq!(
+        format!("{:?}", ledger.changes),
+        "Changes { pending: 0 }",
+        "a replayed change is already stored, so nothing is waiting to be stored again"
+    );
+}
+
+/// A delta written by an older build goes through its own `migrate`, and the
+/// snapshot's version has nothing to do with it.
+///
+/// Made red by `scripts/break-once.sh`, replacing `replayed`'s
+/// `decode_payload::<D::Delta>(version, bytes)` with `D::Delta::restore(bytes)` —
+/// the stamp ignored. Watched: the replay is `Delta { seq: Seq(1), source:
+/// Malformed("a post is 8 bytes, not 4") }`.
+#[tokio::test]
+async fn a_v1_delta_in_the_log_migrates_on_replay() {
+    let scratch = Scratch::new("delta-migrate");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[],
+        0,
+        1,
+        &[
+            record(1, &[&7u32.to_le_bytes()]),
+            // A log written across an upgrade holds both versions.
+            record(2, &[&9u64.to_le_bytes()]),
+        ],
+    )
+    .await;
+
+    let ledger = replayed(&files).await.expect("replays").expect("stored");
+    assert_eq!(ledger.entries, vec![7, 9]);
+}
+
+/// A delta stamped by a newer build is refused, with the record it was in.
+#[tokio::test]
+async fn a_delta_from_the_future_is_refused_with_its_position() {
+    let scratch = Scratch::new("delta-future");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[],
+        0,
+        1,
+        &[
+            record(2, &[&1u64.to_le_bytes()]),
+            record(9, &[&2u64.to_le_bytes()]),
+        ],
+    )
+    .await;
+
+    let error = replayed(&files).await.expect_err("a v9 delta");
+    assert!(
+        matches!(
+            &error,
+            Error::Restore(RestoreError::Delta { seq, source, .. })
+                if *seq == Seq::new(2)
+                    && matches!(**source, RestoreError::FromTheFuture { stored: 9, ours: 2, .. })
+        ),
+        "got {error:?}"
+    );
+}
+
+/// A whole-state open meets records it cannot replay and refuses them. Read as a
+/// plain snapshot the state would be the one from before every one of them.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Recovered::whole`'s
+/// `if !self.records.is_empty() {` guard with `if false {` (returning the state
+/// regardless). Watched: the open succeeds with the snapshot's `[1]` and the two
+/// records are gone without a word, so `expect_err` panics.
+#[tokio::test]
+async fn a_whole_open_refuses_a_log_it_cannot_replay() {
+    let scratch = Scratch::new("unreplayed");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[1],
+        0,
+        1,
+        &[
+            record(2, &[&2u64.to_le_bytes()]),
+            record(2, &[&3u64.to_le_bytes()]),
+        ],
+    )
+    .await;
+
+    let error = load::<Journal>(&files).await.expect_err("two records");
+    assert!(
+        matches!(
+            error,
+            Error::Restore(RestoreError::UnreplayedLog { records: 2, .. })
+        ),
+        "got {error:?}"
+    );
+}
+
+/// Records are contiguous from the snapshot, or the log is refused.
+///
+/// Made red by `scripts/break-once.sh`, replacing the condition guarding the
+/// `RestoreError::Gap` return in `Versioned::open` with `false`. Watched: the open
+/// succeeds with the third record applied over a missing second, so `expect_err`
+/// panics.
+#[tokio::test]
+async fn a_log_that_skips_a_position_is_refused() {
+    let scratch = Scratch::new("gap-log");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[],
+        0,
+        1,
+        &[record(2, &[&1u64.to_le_bytes()])],
+    )
+    .await;
+    {
+        let mut claim = files.claim(&id()).await.expect("claims");
+        claim
+            .append(Seq::new(3), &record(2, &[&3u64.to_le_bytes()]))
+            .await
+            .expect("appends");
+    }
+
+    let error = replayed(&files).await.expect_err("record 2 is missing");
+    assert!(
+        matches!(
+            error,
+            Error::Restore(RestoreError::Gap { expected, found, .. })
+                if expected == Seq::new(2) && found == Seq::new(3)
+        ),
+        "got {error:?}"
+    );
+}
+
+/// A log with no snapshot has nothing to apply its records to.
+#[tokio::test]
+async fn a_log_without_a_snapshot_is_refused() {
+    let scratch = Scratch::new("headless");
+    let files = open(&scratch).await;
+    {
+        let mut claim = files.claim(&id()).await.expect("claims");
+        claim
+            .append(Seq::new(1), &record(2, &[&1u64.to_le_bytes()]))
+            .await
+            .expect("appends");
+    }
+
+    let error = replayed(&files).await.expect_err("no snapshot");
+    assert!(
+        matches!(
+            error,
+            Error::Restore(RestoreError::LogWithoutSnapshot { records: 1, .. })
+        ),
+        "got {error:?}"
+    );
+}
+
+/// A record whose counts and lengths do not add up to its bytes names its
+/// position. Three shapes: a count that overruns, a length that overruns, and
+/// bytes left over.
+#[tokio::test]
+async fn a_record_that_does_not_add_up_is_refused() {
+    let mut overrun_count = record(2, &[&1u64.to_le_bytes()]);
+    overrun_count[4] = 2;
+    let mut overrun_len = record(2, &[&1u64.to_le_bytes()]);
+    overrun_len[8] = 200;
+    let mut left_over = record(2, &[&1u64.to_le_bytes()]);
+    left_over.push(0);
+    let no_deltas = record(2, &[]);
+
+    for (name, bad) in [
+        ("count", overrun_count),
+        ("length", overrun_len),
+        ("trailing", left_over),
+        ("empty", no_deltas),
+    ] {
+        let scratch = Scratch::new(&format!("bad-record-{name}"));
+        let files = open(&scratch).await;
+        plant_journal(&scratch, &files, &[], 0, 1, &[bad]).await;
+
+        let error = replayed(&files).await.expect_err("not a record");
+        assert!(
+            matches!(
+                error,
+                Error::Restore(RestoreError::BadRecord { seq, .. }) if seq == Seq::new(1)
+            ),
+            "{name}: got {error:?}"
+        );
+    }
+}
+
+/// **The crash between a snapshot and the cut that follows it.** The snapshot
+/// says it contains records 1 and 2, and the journal still holds 1, 2 and 3.
+/// Recovery applies only 3 and finishes the cut, so no record is applied twice.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Versioned::open`'s
+/// `let from = Seq::new(through.get() + 1);` with `let from = Seq::new(1);` —
+/// replaying from the start. Watched: the entries come back with 1 and 2 twice.
+#[tokio::test]
+async fn records_a_snapshot_already_contains_are_skipped_and_cut() {
+    let scratch = Scratch::new("interrupted");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[1, 2],
+        2,
+        1,
+        &[
+            record(2, &[&1u64.to_le_bytes()]),
+            record(2, &[&2u64.to_le_bytes()]),
+            record(2, &[&3u64.to_le_bytes()]),
+        ],
+    )
+    .await;
+
+    let ledger = replayed(&files).await.expect("replays").expect("stored");
+    assert_eq!(ledger.entries, vec![1, 2, 3], "each record applied once");
+
+    let mut claim = files.claim(&id()).await.expect("claims");
+    let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+    assert_eq!(
+        tail.records
+            .iter()
+            .map(|(seq, _)| seq.get())
+            .collect::<Vec<_>>(),
+        vec![3],
+        "the cut that the crash interrupted was finished by the open"
     );
 }

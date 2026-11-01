@@ -28,10 +28,18 @@
 //! ```text
 //! offset  bytes  field     value
 //!      0      6  magic     b"klsnap"
-//!      6      2  layout    u16 little-endian — this header's own version, 1
+//!      6      2  layout    u16 little-endian — this header's own version, 2
 //!      8      4  version   u32 little-endian — Durable::VERSION of the payload
-//!     12      *  payload   Durable::snapshot's bytes, never parsed here
+//!     12      8  through   u64 little-endian — the last log record this snapshot contains
+//!     20      *  payload   Durable::snapshot's bytes, never parsed here
 //! ```
+//!
+//! **`through` is what makes the snapshot and the log one thing.** A journaled
+//! store folds its log into a new snapshot, and between the snapshot reaching the
+//! disk and the old records being cut away a crash can leave both. `through` says
+//! which records the snapshot already contains, so recovery skips them and
+//! finishes the cut, instead of applying them a second time. `0` means none, and
+//! it is what a whole-state store always writes.
 //!
 //! **The magic is the load-bearing field**, and it is load-bearing for one
 //! specific reason. This crate shipped without a frame, so the bytes on disk
@@ -49,7 +57,7 @@
 //! not.
 //!
 //! **A layout that is not this one gets two different verdicts**, and which one
-//! it gets starts mattering on the day `LAYOUT` becomes 2 — which is the entire
+//! it gets started mattering on the day `LAYOUT` became 2 — which is the entire
 //! reason `layout` is a separate field in the first place. A *newer* layout is
 //! [`FrameFault::LayoutFromTheFuture`]; an *older* one is
 //! [`FrameFault::LayoutTooOld`], and that is the arm a layout migration would
@@ -60,17 +68,16 @@
 //!
 //! `version` is a `u32` because that is what [`Durable::VERSION`] is: four
 //! billion revisions of one state is not a second break. `layout` is a `u16`
-//! because this table is expected to change approximately never, and the two
-//! together keep the header at twelve bytes.
+//! because this table is expected to change approximately never.
 //!
-//! **Twelve is load-bearing, and not because it is `u32`-aligned.** It is
+//! **Twenty is load-bearing, and not because it is `u32`-aligned.** It is
 //! load-bearing because it is *not* a multiple of eight. The magic is the first
 //! line against an unframed file and a payload's own length check is the second:
-//! a raw `Vec<u64>` file is `8n` bytes, so on the day its first twelve bytes
-//! happen to spell a valid header the payload handed on is `8n − 12` bytes,
+//! a raw `Vec<u64>` file is `8n` bytes, so on the day its first twenty bytes
+//! happen to spell a valid header the payload handed on is `8n − 20` bytes,
 //! which is `≡ 4 (mod 8)` for every `n` and therefore never a whole number of
 //! `u64`s. Widening `layout` to a `u32` for tidiness would take [`FRAME_LEN`] to
-//! sixteen and close that second line while looking like housekeeping, so the
+//! twenty-four and close that second line while looking like housekeeping, so the
 //! property is asserted at compile time below rather than written down here.
 //!
 //! The magic is ASCII on purpose, so `head -c6` on a snapshot file answers
@@ -88,11 +95,40 @@
 //! the rest, which silently discards a field a newer build wrote and then
 //! writes the truncation back over the original. There is no partial read here:
 //! a snapshot from the future is an error and the stored bytes are not touched.
+//!
+//! # Opening: the snapshot, the records after it, and one finisher
+//!
+//! [`Versioned::open`] is the only way to build a [`Versioned`], and it does
+//! more than load. It reads the snapshot, asks the claim for every record after
+//! the snapshot's `through`, cuts a torn end, finishes a compaction that a crash
+//! interrupted, and checks that the records are contiguous. What it hands back is
+//! a [`Recovered`] holding the state and the records, and exactly one method
+//! takes them: [`Recovered::replayed`] for a [`Journaled`] state, which applies
+//! every record in order, or [`Recovered::whole`] for a plain [`Durable`], which
+//! **refuses records** because it has nothing to replay them with.
+//!
+//! That refusal is why the log lives on the same claim as the snapshot. A state
+//! last written by a journaled store and opened by a whole-state one would read
+//! the snapshot, ignore the log, and lose every record after it, silently.
+//!
+//! `open` writes in exactly two cases, and neither changes the state the claim
+//! holds: it cuts bytes that were never a record, and it finishes a cut that a
+//! snapshot already made redundant.
+//!
+//! # Storing: a snapshot, or the change
+//!
+//! [`Versioned::store`] writes a whole snapshot and drops the records it
+//! contains. For a journaled state, [`Versioned::stage`] drains what a turn
+//! recorded and decides between appending it and folding the log into a new
+//! snapshot by a [`Compaction`] policy; [`Versioned::commit`] does what it decided.
+//! The two are split so that `&D` is borrowed only in the synchronous half and
+//! never held across an await.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 
-use crate::{Claim, Durable, RestoreError, Result};
+use crate::{Claim, Durable, Journaled, RestoreError, Result, Seq};
 
 // ────────────────────────────────────────────────────────────────── the frame
 
@@ -100,14 +136,14 @@ use crate::{Claim, Durable, RestoreError, Result};
 const MAGIC: [u8; 6] = *b"klsnap";
 
 /// The version of the header table itself, not of anybody's state.
-const LAYOUT: u16 = 1;
+const LAYOUT: u16 = 2;
 
 /// The size of the header every framed snapshot carries.
 ///
 /// A caller sizing a store's limit needs this, because a limit applies to what
 /// reaches the adapter and what reaches the adapter is the payload plus this.
 /// See [`Error::TooLarge`](crate::Error::TooLarge).
-pub const FRAME_LEN: usize = 12;
+pub const FRAME_LEN: usize = 20;
 
 /// The header length is not a multiple of eight, and that is a property the
 /// module header argues from rather than a coincidence.
@@ -193,19 +229,22 @@ pub enum FrameFault {
     },
 }
 
-/// Wrap `payload` in a header stamping it as version `version`.
-fn frame(version: u32, payload: &[u8]) -> Vec<u8> {
+/// Wrap `payload` in a header stamping it as version `version`, containing every
+/// log record up to and including `through`.
+fn frame(version: u32, through: Seq, payload: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(FRAME_LEN + payload.len());
     framed.extend_from_slice(&MAGIC);
     framed.extend_from_slice(&LAYOUT.to_le_bytes());
     framed.extend_from_slice(&version.to_le_bytes());
+    framed.extend_from_slice(&through.get().to_le_bytes());
     framed.extend_from_slice(payload);
     framed
 }
 
-/// Check the header and hand back the version it stamps and the payload it
-/// wraps. The payload is not parsed, here or anywhere in this crate.
-fn unframe(bytes: &[u8]) -> std::result::Result<(u32, &[u8]), RestoreError> {
+/// Check the header and hand back the version it stamps, the last log record the
+/// snapshot contains, and the payload it wraps. The payload is not parsed, here
+/// or anywhere in this crate.
+fn unframe(bytes: &[u8]) -> std::result::Result<(u32, Seq, &[u8]), RestoreError> {
     let fault = |fault| RestoreError::NotAFrame { fault };
 
     let header: [u8; FRAME_LEN] = bytes
@@ -235,16 +274,21 @@ fn unframe(bytes: &[u8]) -> std::result::Result<(u32, &[u8]), RestoreError> {
     }
 
     let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-    Ok((version, &bytes[FRAME_LEN..]))
+    let mut through = [0_u8; 8];
+    through.copy_from_slice(&header[12..20]);
+    Ok((
+        version,
+        Seq::new(u64::from_le_bytes(through)),
+        &bytes[FRAME_LEN..],
+    ))
 }
 
-/// Turn framed bytes back into a state, walking the migration chain.
+/// Turn a payload that was stamped `stored` back into a `D`, walking the
+/// migration chain.
 ///
-/// Split out from [`Versioned::load`] so that the decision tree is one
-/// function with no I/O in it.
-fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<D, RestoreError> {
-    let (stored, payload) = unframe(bytes)?;
-
+/// Shared by snapshots and by deltas, so that "older is migrated, newer is
+/// refused" is one function with no I/O in it and not two that can drift.
+fn decode_payload<D: Durable>(stored: u32, payload: &[u8]) -> std::result::Result<D, RestoreError> {
     if stored > D::VERSION {
         return Err(RestoreError::FromTheFuture {
             stored,
@@ -265,6 +309,61 @@ fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<D, RestoreError> {
         current = D::migrate(from, &current)?.ok_or(RestoreError::NoMigration { from })?;
     }
     D::restore(&current)
+}
+
+/// Turn framed bytes back into a state and the position its snapshot reaches in
+/// the log.
+fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<(D, Seq), RestoreError> {
+    let (stored, through, payload) = unframe(bytes)?;
+    Ok((decode_payload::<D>(stored, payload)?, through))
+}
+
+// ──────────────────────────────────────────────────────────────── the records
+
+/// One turn's changes as one log record: the delta version, a count, then each
+/// delta's bytes behind its length.
+///
+/// One record per turn makes a turn all-or-nothing: a torn tail cuts a whole
+/// turn and never half of one. The version is in the record, so a log written
+/// across an upgrade holds mixed versions and each migrates on its own.
+fn encode_record<D: Journaled>(deltas: &[D::Delta]) -> Vec<u8> {
+    let mut record = Vec::new();
+    record.extend_from_slice(&<D::Delta as Durable>::VERSION.to_le_bytes());
+    // `try_from` and not `as`: a count that wrapped would be read back as a
+    // different record. A turn that recorded four billion changes is not a turn.
+    record.extend_from_slice(
+        &u32::try_from(deltas.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    for delta in deltas {
+        let bytes = delta.snapshot();
+        record.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+        record.extend_from_slice(&bytes);
+    }
+    record
+}
+
+/// Split a record into its delta version and each delta's bytes.
+///
+/// `None` when the counts and lengths do not add up to the bytes, or when the
+/// record holds no delta: a turn that changed nothing writes no record.
+fn parse_record(record: &[u8]) -> Option<(u32, Vec<&[u8]>)> {
+    let version = u32::from_le_bytes(record.get(..4)?.try_into().ok()?);
+    let count = u32::from_le_bytes(record.get(4..8)?.try_into().ok()?);
+    if count == 0 {
+        return None;
+    }
+    let mut deltas = Vec::new();
+    let mut at = 8_usize;
+    for _ in 0..count {
+        let len = u32::from_le_bytes(record.get(at..at.checked_add(4)?)?.try_into().ok()?);
+        at += 4;
+        let end = at.checked_add(len as usize)?;
+        deltas.push(record.get(at..end)?);
+        at = end;
+    }
+    (at == record.len()).then_some((version, deltas))
 }
 
 // ──────────────────────────────────────────────────────────────── the payload
@@ -345,6 +444,69 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
     }
 }
 
+// ──────────────────────────────────────────────────────────────── the policy
+
+/// When a journaled state's log is folded into a new snapshot.
+///
+/// The log is cut away when it has grown to `ratio` times the snapshot's bytes,
+/// and never before it holds `floor` bytes. The ratio bounds the work: with a
+/// ratio of one, the bytes written per byte appended stay at most a small
+/// constant however large the state grows, because a fold costs the snapshot's
+/// size and happens once the log has grown to that size. The floor stops a tiny
+/// state from folding on every turn.
+///
+/// **A fold is a turn with the cost of the whole state**: an in-turn encode and
+/// four flushes. That is a spike by construction, and the policy only decides how
+/// rare it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    ratio: NonZeroU32,
+    floor: u64,
+}
+
+impl Compaction {
+    /// Fold once the log holds as many bytes as the snapshot, and at least 1 MiB.
+    pub const DEFAULT: Self = Self {
+        ratio: NonZeroU32::MIN,
+        floor: 1 << 20,
+    };
+
+    /// Fold once the log holds `ratio` times the snapshot's bytes, and at least
+    /// `floor` bytes.
+    #[must_use]
+    pub const fn new(ratio: NonZeroU32, floor: u64) -> Self {
+        Self { ratio, floor }
+    }
+
+    /// Whether a log of `log` bytes, about to grow by `record`, has reached the
+    /// point of folding into a snapshot of `snapshot` bytes.
+    fn due(self, snapshot: u64, log: u64, record: u64) -> bool {
+        let threshold = snapshot
+            .saturating_mul(u64::from(self.ratio.get()))
+            .max(self.floor);
+        log.saturating_add(record) >= threshold
+    }
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The end of the log that recovery cut, reported rather than dropped.
+///
+/// The append that was writing those bytes never resolved, so its caller was
+/// never told it happened and nothing acknowledged is lost. It is still worth a
+/// log line: it is the only trace of a crash during a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TornTail {
+    /// How many bytes were cut.
+    pub bytes: u64,
+    /// The last record that was kept.
+    pub after: Seq,
+}
+
 // ──────────────────────────────────────────────────────────────── the wrapper
 
 /// A claim that only ever sees framed bytes.
@@ -355,6 +517,12 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
 /// `keylink-persist/src/representability.rs` holds the compile-time probes for
 /// that sentence, and records there why the *conversion* direction rests on the
 /// orphan rule instead of on a probe.
+///
+/// **There is no `new`.** [`open`](Self::open) is the only way to build one, and
+/// it reads the log before it returns, so a [`store`](Self::store) can never run
+/// before the code knows how far the log reaches. A `store` that did not know
+/// would write a snapshot claiming to contain no records, and the next restore
+/// would apply them a second time.
 ///
 /// **The claim is a type parameter here and stays one in this example**, which
 /// is the whole shape of the thing: the wrapper is this crate's
@@ -375,8 +543,8 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
 /// #     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
 /// # }
 /// # async fn bump<C: Claim>(claim: C) -> Result<(), Box<dyn std::error::Error>> {
-/// let mut state = Versioned::new(claim);
-/// let mut counter = state.load::<Counter>().await?.unwrap_or(Counter(0));
+/// let (counter, mut state) = Versioned::open::<Counter>(claim).await?.whole()?;
+/// let mut counter = counter.unwrap_or(Counter(0));
 ///
 /// counter.0 += 1;
 /// state.store(&Snapshot::of(&counter)).await?;
@@ -386,30 +554,37 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
 #[derive(Debug)]
 pub struct Versioned<C: Claim> {
     claim: C,
+    /// The last log record the stored snapshot contains.
+    through: Seq,
+    /// The position the next append takes. Always `through + 1` or later.
+    next: Seq,
+    /// The bytes of the stored snapshot, frame included. `None` before the first
+    /// ever store.
+    snapshot_bytes: Option<u64>,
+    /// The bytes of the records appended since the snapshot.
+    log_bytes: u64,
+    /// A cut that should have followed a snapshot did not happen. The next
+    /// snapshot repeats it, and so does `open`.
+    stale: bool,
 }
 
 impl<C: Claim> Versioned<C> {
-    /// Take a claim, and give nothing back.
+    /// Take a claim, read the snapshot and every record after it, and keep the
+    /// claim.
     ///
-    /// The claim moves in. Exclusivity is unchanged — it is still held until
-    /// this value is dropped, and still released by the operating system if the
-    /// process ends first.
-    pub fn new(claim: C) -> Self {
-        Self { claim }
-    }
-
-    /// Read the state, migrating it if what is stored is older.
+    /// `Ok` with no state is the first ever run: nothing has been stored, which
+    /// is not a failure. The claim is exclusive from here until the returned
+    /// [`Recovered`] (or the [`Versioned`] it yields) is dropped.
     ///
-    /// `Ok(None)` is the first ever run: nothing has been stored, which is not
-    /// a failure.
+    /// **Migration does not write.** An old snapshot, and an old delta in the log,
+    /// stay old until the next [`store`](Self::store) replaces them. That is the
+    /// safe order: a crash between the two leaves the bytes that were already
+    /// there, and the chain simply runs again.
     ///
-    /// **Migration does not write.** This takes `&self` and touches nothing on
-    /// the store, so an old snapshot stays old until the caller's next
-    /// [`store`](Self::store) replaces it. That is the safe order — a crash
-    /// between the two leaves the bytes that were already there, and the chain
-    /// simply runs again — and it is why a process that loads and never stores
-    /// pays for the walk on every start. If that cost matters, store once after
-    /// loading; there is deliberately no way to make a read do it silently.
+    /// **Opening writes in exactly two cases, and neither changes the state the
+    /// claim holds.** It cuts a torn tail (bytes that were never a record), and it
+    /// finishes a [`truncate_before`](Claim::truncate_before) that a crash
+    /// interrupted, whose records the stored snapshot already contains.
     ///
     /// # Errors
     ///
@@ -422,15 +597,70 @@ impl<C: Claim> Versioned<C> {
     ///   which is refused and never truncated;
     ///   [`RestoreError::NoMigration`] for a gap in the chain; and whatever
     ///   [`Durable::restore`] or [`Durable::migrate`] reported.
-    pub async fn load<D: Durable>(&self) -> Result<Option<D>> {
-        match self.claim.load().await? {
-            Some(bytes) => Ok(Some(decode::<D>(&bytes)?)),
-            None => Ok(None),
+    /// - [`RestoreError::LogWithoutSnapshot`] when records exist and the snapshot
+    ///   they follow does not, and [`RestoreError::Gap`] when the records skip a
+    ///   position.
+    /// - [`Error::NotAJournal`](crate::Error::NotAJournal) when the stored log is
+    ///   not one this build reads, or is damaged before its end.
+    pub async fn open<D: Durable>(mut claim: C) -> Result<Recovered<C, D>> {
+        let (state, through, snapshot_bytes) = match claim.load().await? {
+            Some(bytes) => {
+                let (state, through) = decode::<D>(&bytes)?;
+                (Some(state), through, Some(bytes.len() as u64))
+            }
+            None => (None, Seq::new(0), None),
+        };
+
+        let from = Seq::new(through.get() + 1);
+        let tail = claim.recover(from).await?;
+        if tail.earlier > 0 {
+            // A snapshot reached the disk and the cut that should have followed
+            // it did not. The snapshot is the commit point, so finish the cut.
+            claim.truncate_before(from).await?;
         }
+
+        if state.is_none() && !tail.records.is_empty() {
+            return Err(RestoreError::LogWithoutSnapshot {
+                records: tail.records.len() as u64,
+            }
+            .into());
+        }
+
+        let mut expected = from;
+        let mut log_bytes = 0_u64;
+        for (found, record) in &tail.records {
+            if *found != expected {
+                return Err(RestoreError::Gap {
+                    expected,
+                    found: *found,
+                }
+                .into());
+            }
+            expected = Seq::new(expected.get() + 1);
+            log_bytes += record.len() as u64;
+        }
+
+        let torn = tail.torn.map(|bytes| TornTail {
+            bytes,
+            after: Seq::new(expected.get() - 1),
+        });
+        Ok(Recovered {
+            versioned: Self {
+                claim,
+                through,
+                next: expected,
+                snapshot_bytes,
+                log_bytes,
+                stale: false,
+            },
+            state,
+            records: tail.records,
+            torn,
+        })
     }
 
-    /// Frame `snapshot` as version [`D::VERSION`](Durable::VERSION) and replace
-    /// what is stored.
+    /// Frame `snapshot` as version [`D::VERSION`](Durable::VERSION), replace what
+    /// is stored, and drop the log records it contains.
     ///
     /// **`D` is inferred from `snapshot` and cannot be told.** That is the whole
     /// reason [`Snapshot`] exists rather than a `&[u8]`: the version stamped
@@ -439,7 +669,11 @@ impl<C: Claim> Versioned<C> {
     /// documents what the `&[u8]` version of this signature allowed.
     ///
     /// Atomic, because [`Claim::store`] is. A crash during this leaves either
-    /// the previous framed snapshot or the new one.
+    /// the previous framed snapshot or the new one. **The snapshot reaching the
+    /// disk is the commit point**: the cut that follows it is cleanup, and a
+    /// failed cut does not fail the store. The turn is on the disk, and an error
+    /// would say it was not. The cut is retried at the next snapshot and by
+    /// [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -449,7 +683,194 @@ impl<C: Claim> Versioned<C> {
     /// - [`Error::Io`](crate::Error::Io) when the write fails. The previous
     ///   snapshot is intact.
     pub async fn store<D: Durable>(&mut self, snapshot: &Snapshot<D>) -> Result<()> {
-        self.claim.store(&frame(D::VERSION, &snapshot.bytes)).await
+        // Everything appended so far is in this snapshot: it was taken in the
+        // turn that appended the last of it.
+        let through = Seq::new(self.next.get() - 1);
+        let framed = frame(D::VERSION, through, &snapshot.bytes);
+        self.claim.store(&framed).await?;
+
+        let records_may_exist = self.next.get() > self.through.get() + 1 || self.stale;
+        self.through = through;
+        self.snapshot_bytes = Some(framed.len() as u64);
+        self.log_bytes = 0;
+        if records_may_exist {
+            // Not `?`: see above.
+            self.stale = self.claim.truncate_before(self.next).await.is_err();
+        }
+        Ok(())
+    }
+
+    /// Drain this turn's changes and decide what to write. Synchronous, so the
+    /// `&D` is never held across an await.
+    ///
+    /// - The first turn ever stores a snapshot, so a record never exists without
+    ///   the snapshot it follows.
+    /// - A turn that recorded nothing writes nothing. A whole-state store pays its
+    ///   full price even for a read.
+    /// - Otherwise the turn appends one record, unless the log has reached
+    ///   `when`'s threshold, in which case it stores a snapshot instead and the
+    ///   changes are dropped because the snapshot contains them.
+    ///
+    /// The result must be handed to [`commit`](Self::commit).
+    pub fn stage<D: Journaled>(&self, state: &D, when: Compaction) -> Staged<D> {
+        let deltas = state.changes().take();
+        let Some(snapshot_bytes) = self.snapshot_bytes else {
+            return Staged(Step::Compact(Snapshot::of(state)));
+        };
+        if deltas.is_empty() {
+            return Staged(Step::Nothing);
+        }
+        let record = encode_record::<D>(&deltas);
+        if when.due(snapshot_bytes, self.log_bytes, record.len() as u64) {
+            Staged(Step::Compact(Snapshot::of(state)))
+        } else {
+            Staged(Step::Append(record))
+        }
+    }
+
+    /// Write what [`stage`](Self::stage) decided.
+    ///
+    /// # Errors
+    ///
+    /// As [`store`](Self::store) for a snapshot, and for an append
+    /// [`Error::TooLarge`](crate::Error::TooLarge) or
+    /// [`Error::Io`](crate::Error::Io). A failed append leaves the log as it was,
+    /// so the turn is refused cleanly.
+    pub async fn commit<D: Durable>(&mut self, staged: Staged<D>) -> Result<()> {
+        match staged.0 {
+            Step::Nothing => Ok(()),
+            Step::Append(record) => {
+                self.claim.append(self.next, &record).await?;
+                self.next = Seq::new(self.next.get() + 1);
+                self.log_bytes += record.len() as u64;
+                Ok(())
+            }
+            Step::Compact(snapshot) => self.store(&snapshot).await,
+        }
+    }
+
+    /// Drain this turn's changes and write nothing: the turn is not being
+    /// stored.
+    ///
+    /// For a turn that panicked. Its changes are half of a turn, and they must
+    /// not be carried into the next one.
+    pub fn discard<D: Journaled>(&self, state: &D) {
+        drop(state.changes().take());
+    }
+}
+
+/// What one turn will write. Built only by [`Versioned::stage`].
+#[must_use = "a staged turn that is never committed is a turn that is not stored"]
+pub struct Staged<D: Durable>(Step<D>);
+
+enum Step<D: Durable> {
+    Nothing,
+    Append(Vec<u8>),
+    Compact(Snapshot<D>),
+}
+
+impl<D: Durable> std::fmt::Debug for Staged<D> {
+    /// What it will do, and nothing else: the bytes are the state's own.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            Step::Nothing => "Staged(Nothing)",
+            Step::Append(_) => "Staged(Append)",
+            Step::Compact(_) => "Staged(Compact)",
+        })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────── the recovery
+
+/// A claim read back, holding the state and the records after it until one
+/// finisher takes them.
+///
+/// The records are not an accessor and have no reader: [`replayed`](Self::replayed)
+/// applies them and [`whole`](Self::whole) refuses them. A type that could be
+/// asked for its state without being asked about its records is the type that
+/// reads a journaled state as a whole one and loses the log.
+#[must_use = "this holds the state that was read; dropping it starts from nothing"]
+pub struct Recovered<C: Claim, D> {
+    versioned: Versioned<C>,
+    state: Option<D>,
+    records: Vec<(Seq, Vec<u8>)>,
+    torn: Option<TornTail>,
+}
+
+impl<C: Claim, D: Durable> Recovered<C, D> {
+    /// What recovery cut from the end of the log, if anything. Log it.
+    #[must_use]
+    pub fn torn(&self) -> Option<TornTail> {
+        self.torn
+    }
+
+    /// The snapshot alone, with the wrapper that will keep writing it.
+    ///
+    /// **Refuses records**, because this type has nothing to replay them with.
+    /// The state is `None` on the first ever run.
+    ///
+    /// # Errors
+    ///
+    /// [`RestoreError::UnreplayedLog`] when the log holds records after the
+    /// snapshot. The claim is released.
+    pub fn whole(self) -> std::result::Result<(Option<D>, Versioned<C>), RestoreError> {
+        if !self.records.is_empty() {
+            return Err(RestoreError::UnreplayedLog {
+                records: self.records.len() as u64,
+            });
+        }
+        Ok((self.state, self.versioned))
+    }
+}
+
+impl<C: Claim, D: Journaled> Recovered<C, D> {
+    /// The snapshot with every later record applied in order, and its change
+    /// buffer cleared.
+    ///
+    /// The buffer is cleared because [`Journaled::apply`] may have recorded, and
+    /// a replayed change is already stored.
+    ///
+    /// # Errors
+    ///
+    /// [`RestoreError::BadRecord`] for a record whose counts and lengths do not
+    /// add up, and [`RestoreError::Delta`] for a delta that did not decode, with
+    /// the position of the record it was in.
+    pub fn replayed(self) -> std::result::Result<(Option<D>, Versioned<C>), RestoreError> {
+        let Self {
+            versioned,
+            state,
+            records,
+            ..
+        } = self;
+        let Some(mut state) = state else {
+            return Ok((None, versioned));
+        };
+        for (seq, record) in &records {
+            let (version, deltas) =
+                parse_record(record).ok_or(RestoreError::BadRecord { seq: *seq })?;
+            for bytes in deltas {
+                let delta = decode_payload::<D::Delta>(version, bytes).map_err(|source| {
+                    RestoreError::Delta {
+                        seq: *seq,
+                        source: Box::new(source),
+                    }
+                })?;
+                state.apply(delta);
+            }
+        }
+        drop(state.changes().take());
+        Ok((Some(state), versioned))
+    }
+}
+
+impl<C: Claim, D> std::fmt::Debug for Recovered<C, D> {
+    /// Whether there is a state and how many records wait, and nothing else.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recovered")
+            .field("state", &self.state.is_some())
+            .field("records", &self.records.len())
+            .field("torn", &self.torn)
+            .finish_non_exhaustive()
     }
 }
 
@@ -499,17 +920,17 @@ mod tests {
     /// Made red by `scripts/break-once.sh`, replacing `frame`'s
     /// `framed.extend_from_slice(&version.to_le_bytes());` with the `u64` widening
     /// `&u64::from(version).to_le_bytes()` — a header that grew by four bytes while
-    /// [`FRAME_LEN`] went on saying twelve. Watched: left `23` against right `19`,
-    /// at the length assertion, which is the one that notices a header nobody
-    /// re-measured.
+    /// [`FRAME_LEN`] went on saying twenty. Watched at the length assertion, which is
+    /// the one that notices a header nobody re-measured.
     #[test]
-    fn the_header_is_the_documented_twelve_bytes() {
-        let framed = frame(7, b"payload");
+    fn the_header_is_the_documented_twenty_bytes() {
+        let framed = frame(7, Seq::new(3), b"payload");
         assert_eq!(framed.len(), FRAME_LEN + 7);
         assert_eq!(&framed[..6], b"klsnap");
-        assert_eq!(&framed[6..8], &1u16.to_le_bytes());
+        assert_eq!(&framed[6..8], &2u16.to_le_bytes());
         assert_eq!(&framed[8..12], &7u32.to_le_bytes());
-        assert_eq!(&framed[12..], b"payload");
+        assert_eq!(&framed[12..20], &3u64.to_le_bytes());
+        assert_eq!(&framed[20..], b"payload");
     }
 
     /// Made red by `scripts/break-once.sh`, replacing `unframe`'s
@@ -521,8 +942,11 @@ mod tests {
     /// stamp.
     #[test]
     fn a_frame_round_trips_through_unframe() {
-        let framed = frame(4, b"whatever");
-        assert_eq!(unframe(&framed).expect("a frame"), (4, &b"whatever"[..]));
+        let framed = frame(4, Seq::new(9), b"whatever");
+        assert_eq!(
+            unframe(&framed).expect("a frame"),
+            (4, Seq::new(9), &b"whatever"[..])
+        );
     }
 
     /// The silent-corruption case, at the smallest scale it can be shown.
@@ -578,12 +1002,12 @@ mod tests {
     /// deletes the read, and the two failures are the two ways this check dies.
     #[test]
     fn a_header_layout_this_build_does_not_write_is_refused() {
-        let mut framed = frame(1, b"12345678");
-        framed[6] = 2;
+        let mut framed = frame(1, Seq::new(0), b"12345678");
+        framed[6] = 3;
         assert!(matches!(
             unframe(&framed),
             Err(RestoreError::NotAFrame {
-                fault: FrameFault::LayoutFromTheFuture { stored: 2, ours: 1 }
+                fault: FrameFault::LayoutFromTheFuture { stored: 3, ours: 2 }
             })
         ));
     }
@@ -593,12 +1017,21 @@ mod tests {
     /// refuses one if the magic ever stops being the first thing tested.
     #[test]
     fn a_header_layout_older_than_this_build_is_refused_as_old() {
-        let mut framed = frame(1, b"12345678");
+        let mut framed = frame(1, Seq::new(0), b"12345678");
         framed[6] = 0;
         assert!(matches!(
             unframe(&framed),
             Err(RestoreError::NotAFrame {
-                fault: FrameFault::LayoutTooOld { stored: 0, ours: 1 }
+                fault: FrameFault::LayoutTooOld { stored: 0, ours: 2 }
+            })
+        ));
+        // The layout this crate wrote before `through` existed: twelve bytes of
+        // header, so its first bytes spell a layout of 1.
+        framed[6] = 1;
+        assert!(matches!(
+            unframe(&framed),
+            Err(RestoreError::NotAFrame {
+                fault: FrameFault::LayoutTooOld { stored: 1, ours: 2 }
             })
         ));
     }
@@ -607,12 +1040,123 @@ mod tests {
     /// to `unframe`'s `bytes.get(..FRAME_LEN)` — a frame required to carry at least
     /// one byte, which is the plausible reading of "too short" and the one that
     /// makes an empty state unloadable. Watched: "a frame: NotAFrame { fault:
-    /// TooShort { len: 12 } }". The break is isolating rather than broad: every
+    /// TooShort { len: 20 } }". The break is isolating rather than broad: every
     /// other test in this module has a payload, so this is the only one it reddens.
     #[test]
     fn an_empty_payload_is_a_payload_and_not_a_fault() {
-        let framed = frame(1, b"");
-        assert_eq!(unframe(&framed).expect("a frame"), (1, &b""[..]));
-        assert_eq!(decode::<Ledger>(&framed).expect("restores").0, Vec::new());
+        let framed = frame(1, Seq::new(0), b"");
+        assert_eq!(
+            unframe(&framed).expect("a frame"),
+            (1, Seq::new(0), &b""[..])
+        );
+        assert_eq!(
+            decode::<Ledger>(&framed).expect("restores").0 .0,
+            Vec::new()
+        );
+    }
+
+    // ───────────────────────────────────────────────────── the log's records
+
+    /// A delta that remembers its bytes, so the record codec can be exercised
+    /// without a state around it.
+    struct Bytes(Vec<u8>);
+
+    impl Durable for Bytes {
+        const VERSION: u32 = 5;
+        fn snapshot(&self) -> Vec<u8> {
+            self.0.clone()
+        }
+        fn restore(bytes: &[u8]) -> std::result::Result<Self, RestoreError> {
+            Ok(Self(bytes.to_vec()))
+        }
+        fn migrate(_: u32, _: &[u8]) -> std::result::Result<Option<Vec<u8>>, RestoreError> {
+            Ok(None)
+        }
+    }
+
+    /// A state around [`Bytes`], only so `encode_record` has a `Journaled` to name.
+    struct Holder(crate::Changes<Bytes>);
+
+    impl Durable for Holder {
+        const VERSION: u32 = 1;
+        fn snapshot(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn restore(_: &[u8]) -> std::result::Result<Self, RestoreError> {
+            Ok(Self(crate::Changes::default()))
+        }
+        fn migrate(_: u32, _: &[u8]) -> std::result::Result<Option<Vec<u8>>, RestoreError> {
+            Ok(None)
+        }
+    }
+
+    impl Journaled for Holder {
+        type Delta = Bytes;
+        fn changes(&self) -> &crate::Changes<Bytes> {
+            &self.0
+        }
+        fn apply(&mut self, _: Bytes) {}
+    }
+
+    /// One turn is one record, carrying its delta version and every delta behind
+    /// its length.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `encode_record`'s
+    /// `record.extend_from_slice(&bytes);` with nothing — the length written and the
+    /// bytes left out. Watched: the parse gives `None` where it should give the two
+    /// deltas.
+    #[test]
+    fn a_record_round_trips() {
+        let record = encode_record::<Holder>(&[Bytes(b"one".to_vec()), Bytes(Vec::new())]);
+        assert_eq!(&record[..4], &5u32.to_le_bytes(), "the delta's version");
+        assert_eq!(&record[4..8], &2u32.to_le_bytes(), "the count");
+        assert_eq!(
+            parse_record(&record),
+            Some((5, vec![&b"one"[..], &b""[..]]))
+        );
+    }
+
+    #[test]
+    fn a_record_that_does_not_add_up_does_not_parse() {
+        let good = encode_record::<Holder>(&[Bytes(b"one".to_vec())]);
+        // Cut anywhere short, or padded: neither is a record.
+        for cut in 0..good.len() {
+            assert_eq!(parse_record(&good[..cut]), None, "cut at {cut}");
+        }
+        let mut padded = good.clone();
+        padded.push(0);
+        assert_eq!(parse_record(&padded), None);
+        // And a record of no deltas is not one: a turn that changed nothing
+        // writes nothing.
+        assert_eq!(parse_record(&encode_record::<Holder>(&[])), None);
+    }
+
+    /// The policy: fold once the log reaches `ratio` times the snapshot, and never
+    /// before the floor.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `Compaction::due`'s
+    /// `.max(self.floor)` with `.min(self.floor)`. Watched: with a floor of zero the
+    /// threshold collapses to zero and the first assertion fails, "99 of 100
+    /// bytes".
+    #[test]
+    fn the_policy_folds_at_the_ratio_and_not_below_the_floor() {
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).expect("nonzero");
+
+        let by_size = Compaction::new(one, 0);
+        assert!(!by_size.due(100, 50, 49), "99 of 100 bytes");
+        assert!(by_size.due(100, 50, 50), "100 of 100 bytes");
+        assert!(!Compaction::new(two, 0).due(100, 50, 50));
+        assert!(Compaction::new(two, 0).due(100, 100, 100));
+
+        let floored = Compaction::new(one, 1000);
+        assert!(
+            !floored.due(10, 500, 499),
+            "past the ratio, under the floor"
+        );
+        assert!(floored.due(10, 500, 500));
+
+        // A log that overflows the arithmetic is due, not a panic.
+        assert!(Compaction::new(two, 0).due(u64::MAX, u64::MAX, u64::MAX));
     }
 }

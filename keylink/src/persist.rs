@@ -66,10 +66,79 @@
 //! `lib.rs` refuses it on that target beside the same refusal for `blocking`,
 //! `fs` and `env`.
 //!
+//! # Two strategies, one model
+//!
+//! A persisted actor is **a snapshot plus the log of what changed after it, under
+//! one exclusive claim.** [`Persist`] has a third type parameter that picks how a
+//! turn reaches it:
+//!
+//! | `Persist<D, S, _>` | what a completed turn stores | the state is |
+//! |---|---|---|
+//! | [`Whole`] | the whole state, replacing the snapshot | a plain [`Durable`](keylink_persist::Durable) |
+//! | [`Deltas`] | what the turn changed, appended to the log | a [`Journaled`](keylink_persist::Journaled) |
+//!
+//! Both open through the same restore, so a log left by one is **refused** by the
+//! other rather than silently ignored: opening a journaled state under [`Whole`]
+//! is `RestoreError::UnreplayedLog`, because the snapshot alone is the state from
+//! before every record that follows it.
+//!
+//! `Whole` is today's behaviour. Its cost grows with the state, because every turn
+//! re-encodes and rewrites all of it; the 7.6 ms table below is that cost.
+//! `Deltas` is for a state that grows: a turn costs the size of its change, and
+//! every so often a [`Compaction`](keylink_persist::versioned::Compaction) policy folds the
+//! log into a snapshot.
+//!
+//! | what is flushed, per turn | `Whole` | `Deltas` |
+//! |---|---|---|
+//! | the turn changed something | the temp file, the rename, the directory (two flushes) | one `sync_data` on the journal |
+//! | the turn changed nothing | two flushes | **no I/O** |
+//! | a compaction turn | n/a | four flushes (snapshot two, journal rewrite two), and an in-turn encode of the whole state |
+//!
+//! **Bytes per turn are computed from the format, and
+//! `tests/journal.rs::deltas_keep_the_bytes_per_turn_constant_while_the_state_grows`
+//! measures them**: a `Deltas` turn writes 16 (the frame) plus 12 (the record's
+//! version, count and the delta's length) plus the delta; a `Whole` turn writes 20
+//! plus the whole state.
+//!
+//! **Time per turn, `Whole` against `Deltas`, measured back to back.** Same
+//! machine as the figures below (Apple M5 Max, `Mac17,6`, APFS on the internal
+//! SSD, macOS build 26B118), 2026-10-31, over `Files`. 200 timed turns after a
+//! warm-up turn, three runs per cell, **alternating which strategy goes first**.
+//! The shelf is pre-filled to the stated number of 32-byte items and grows by 200
+//! during the run, which is why `Whole`'s bytes per turn are a little over
+//! `20 + 32 * items`.
+//!
+//! | items | `Whole`, µs per turn (3 runs) | `Deltas`, µs per turn (3 runs) | median ratio | bytes per turn |
+//! |---|---|---|---|---|
+//! | 1 | 9,698 / 10,613 / 13,090 | 4,324 / 5,102 / 6,656 | 0.48 | 6,484 against 60 |
+//! | 1,000 | 10,180 / 13,422 / 13,895 | 4,466 / 6,459 / 7,858 | 0.48 | 38,452 against 60 |
+//! | 100,000 | 22,310 / 23,123 / 30,308 | 6,409 / 7,051 / 7,112 | 0.30 | 3,206,452 against 60 |
+//!
+//! **What these figures do not cover.** The machine was heavily loaded by other
+//! sessions' builds while they ran (load average about 130), so the `Whole`
+//! figures are slower than the 7.6 ms below, and the spread inside a cell is the
+//! noise. Read the ratio, not the microseconds. They are macOS, where `sync_data`
+//! is `F_FULLFSYNC`; **nothing was run on Linux**. A fold turn is not in them by
+//! construction: 200 turns of 44 bytes never reach the threshold at these sizes.
+//! And a mean says nothing about the tail. `tests/journal.rs::
+//! the_per_turn_cost_whole_against_deltas` reproduces the table.
+//!
+//! The saving is not 2x at a small state, because the `Whole` turn is already
+//! less than two full flushes. It grows with the state, because `Whole` pays for
+//! the encode and the write of all of it and `Deltas` does not.
+//!
+//! **A compaction turn is a latency spike by construction**: it encodes the whole
+//! state inside the turn and flushes four times. Bounding it would need a
+//! consistent copy of the state outside the turn, which means `Clone`,
+//! copy-on-write or `A: Sync`, and this design keeps all three out.
+//!
 //! # What it costs per turn — measured, on a named machine, on a stated day
 //!
 //! RFC-06 §7 asked for this number and never got one. It is much larger than
 //! anybody guessed, so it is the first thing in this file after the placement.
+//!
+//! **This section is `Whole`'s cost.** `Deltas` appears in the two-strategies
+//! section above and in the A/B table below it.
 //!
 //! **7.6 ms per turn**, against **18 µs** for the same turn with no observer.
 //! The store is essentially all of it: **~7.6 ms**, or **about 130 turns per
@@ -121,13 +190,19 @@
 
 use std::marker::PhantomData;
 
-use keylink_persist::versioned::{Snapshot, Versioned};
-use keylink_persist::{Durable, Snapshots, StateId};
+use keylink_persist::versioned::{Compaction, Snapshot, TornTail, Versioned};
+use keylink_persist::{Durable, Journaled, Snapshots, StateId};
 
 use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 
 /// Stores the state after every turn it accepts, and refuses a turn that
 /// panicked.
+///
+/// The third parameter, `M`, is the strategy: [`Whole`] stores the whole state
+/// every turn, [`Deltas`] appends what the turn changed. It has no default, on
+/// purpose: in expression position a defaulted type parameter is inferred and
+/// not defaulted, so `Persist::<Ledger, _>::open` would be ambiguous between the
+/// two `open`s, and every call site names the decision it is making.
 ///
 /// One of these owns one [`Claim`](keylink_persist::Claim) — the actor owns the
 /// observer, so the claim dies with the actor and is free before
@@ -163,7 +238,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// // because nothing in the arguments says which state is being claimed — see
 /// // `open`. `start_from` is the only way to reach the observer, and it hands
 /// // over the restored state in the same expression.
-/// let (state, saver) = Persist::<Ledger, _>::open(&store, &id)
+/// let (state, saver) = Persist::<Ledger, _, Whole>::open(&store, &id)
 ///     .await?
 ///     .start_from(Ledger::default);
 /// let ledger = ledger::setup(state).observe(saver).actor();
@@ -176,6 +251,67 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # The same ledger, journaled
+///
+/// A state that grows pays for its whole size on every `Whole` turn. A
+/// [`Journaled`] one pays for its change. The handler changes the state through
+/// [`apply`](Journaled::apply), the code a restore runs, and records the change:
+///
+/// ```no_run
+/// # use keylink::{Caller, Deltas, Persist};
+/// # use keylink_persist::{Changes, Durable, Journaled, RestoreError, StateId};
+/// # use keylink_persist::file::Files;
+/// # keylink::service! { service Ledger; rpc Post(entry: u64) -> u64; }
+/// #[derive(Clone)]
+/// struct Posted(u64);
+/// # impl Durable for Posted {
+/// #     const VERSION: u32 = 1;
+/// #     fn snapshot(&self) -> Vec<u8> { self.0.to_le_bytes().to_vec() }
+/// #     fn restore(_: &[u8]) -> Result<Self, RestoreError> { Ok(Self(0)) }
+/// #     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
+/// # }
+/// #[derive(Default)]
+/// struct Ledger { entries: Vec<u64>, changes: Changes<Posted> }
+/// # impl Durable for Ledger {
+/// #     const VERSION: u32 = 1;
+/// #     fn snapshot(&self) -> Vec<u8> { Vec::new() }
+/// #     fn restore(_: &[u8]) -> Result<Self, RestoreError> { Ok(Self::default()) }
+/// #     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
+/// # }
+/// impl Journaled for Ledger {
+///     type Delta = Posted;
+///     fn changes(&self) -> &Changes<Posted> { &self.changes }
+///     fn apply(&mut self, delta: Posted) { self.entries.push(delta.0); }
+/// }
+///
+/// impl ledger::Actor for Ledger {
+///     async fn post(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
+///         let delta = Posted(entry);
+///         self.apply(delta.clone());
+///         self.changes.record(delta);
+///         self.entries.len() as u64
+///     }
+/// }
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let store = Files::open("/var/lib/keylink").await?;
+/// let id = StateId::new("ledgers/sp-01")?;
+///
+/// let opened = Persist::<Ledger, _, Deltas>::open(&store, &id).await?;
+/// if let Some(torn) = opened.torn_tail() {
+///     eprintln!("recovery cut {} bytes after record {}", torn.bytes, torn.after);
+/// }
+/// let (state, saver) = opened.start_from(Ledger::default);
+/// let ledger = ledger::setup(state).observe(saver).actor();
+/// ledger.post(1).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// **An unrecorded mutation is lost on restart, silently.** Nothing can check
+/// that a delta matches what the turn changed. The guard is a test that reopens
+/// the state and compares its `snapshot()` with the live one, as
+/// `tests/journal.rs` does.
 ///
 /// # What is stored is exactly what was answered — **both** directions
 ///
@@ -257,9 +393,9 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// chain's, not this type's — but "last" is the position in which it means what
 /// a reader expects, so it is written here rather than left to be discovered.
 ///
-/// # Two parameters, and why the second one is the **store**
+/// # Three parameters, and why the second one is the **store**
 ///
-/// `D` is the state and `S` is where its snapshots live. The claim type would be
+/// `D` is the state, `S` is where its snapshots live and `M` is the strategy. The claim type would be
 /// the narrower parameter, and it is deliberately not the one here:
 /// `Versioned<C>` demands `C: Claim`, a bound this file would have to name, and
 /// `keylink_persist::Claim` is the trait whose one method writes **unframed**
@@ -269,7 +405,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// about this file: it has no route to an unframed write at all.
 /// `Versioned<S::Claim>` needs no bound, because [`Snapshots`] already promises
 /// one.
-pub struct Persist<D, S: Snapshots> {
+pub struct Persist<D, S: Snapshots, M> {
     /// The claim, wrapped so that everything written through it is framed.
     /// Owned, with no way back out to the raw claim.
     ///
@@ -290,9 +426,25 @@ pub struct Persist<D, S: Snapshots> {
     /// different states would write two shapes into one claim under one version
     /// number.
     state: PhantomData<fn() -> D>,
+    /// How a completed turn reaches the claim: [`Whole`] or [`Deltas`].
+    strategy: M,
 }
 
-impl<D: Durable, S: Snapshots> Persist<D, S> {
+/// Store the whole state after every completed turn.
+///
+/// A [`Persist`] strategy and nothing else: it has no value to construct. See
+/// the module header for what each strategy costs.
+#[derive(Debug)]
+pub struct Whole(());
+
+/// Store what each turn changed, and fold the log into a snapshot by a
+/// [`Compaction`] policy.
+///
+/// Reached through [`Opened::compaction`] when the default is not wanted.
+#[derive(Debug)]
+pub struct Deltas(Compaction);
+
+impl<D: Durable, S: Snapshots> Persist<D, S, Whole> {
     /// Claim the state, read whatever is stored, and keep the claim.
     ///
     /// **This is the only way to build one, and it does not hand one over on its
@@ -313,7 +465,7 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
     ///
     /// # `D` appears only in the return, so it usually has to be named
     ///
-    /// `Persist::<Ledger, _>::open(&store, &id)`. Nothing in the arguments says
+    /// `Persist::<Ledger, _, Whole>::open(&store, &id)`. Nothing in the arguments says
     /// which state is being claimed, and inference reaches the observer end but
     /// not always the state end: handing the restored value to a generic
     /// `setup<A: Actor>` leaves `D` ambiguous even where exactly one type
@@ -332,14 +484,49 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
     ///   bytes are not a frame this build can read, are from a newer build, or
     ///   [`Durable::restore`] refused them. Loud, and the stored bytes are left
     ///   alone.
-    pub async fn open(store: &S, id: &StateId) -> keylink_persist::Result<Opened<D, S>> {
-        let durable = Versioned::new(store.claim(id).await?);
-        let restored = durable.load::<D>().await?;
+    pub async fn open(store: &S, id: &StateId) -> keylink_persist::Result<Opened<D, S, Whole>> {
+        let recovered = Versioned::open::<D>(store.claim(id).await?).await?;
+        let torn = recovered.torn();
+        let (restored, durable) = recovered.whole()?;
         Ok(Opened {
             restored,
+            torn,
             saver: Self {
                 durable,
                 state: PhantomData,
+                strategy: Whole(()),
+            },
+        })
+    }
+}
+
+impl<D: Journaled, S: Snapshots> Persist<D, S, Deltas> {
+    /// Claim the state, read its snapshot, and replay every delta after it.
+    ///
+    /// The same claim, restore and exclusivity as the [`Whole`] `open`, and the
+    /// same turbofish for the same reason. What differs is the log: it is applied
+    /// here, in order, through [`Journaled::apply`]. A cut that a crash
+    /// interrupted is finished, and a torn end is cut and reported by
+    /// [`Opened::torn_tail`]; neither changes the state the claim holds.
+    ///
+    /// # Errors
+    ///
+    /// As the [`Whole`] `open`, plus whatever the log reports:
+    /// [`Error::NotAJournal`](keylink_persist::Error::NotAJournal) for a journal
+    /// this build cannot read or one that is damaged before its end, and, through
+    /// [`Error::Restore`](keylink_persist::Error::Restore), `Gap`, `BadRecord`
+    /// and `Delta` for a log that does not replay.
+    pub async fn open(store: &S, id: &StateId) -> keylink_persist::Result<Opened<D, S, Deltas>> {
+        let recovered = Versioned::open::<D>(store.claim(id).await?).await?;
+        let torn = recovered.torn();
+        let (restored, durable) = recovered.replayed()?;
+        Ok(Opened {
+            restored,
+            torn,
+            saver: Self {
+                durable,
+                state: PhantomData,
+                strategy: Deltas(Compaction::DEFAULT),
             },
         })
     }
@@ -357,12 +544,13 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
 /// `tests/persist.rs::a_second_open_on_one_state_busy` leans on.
 #[must_use = "this holds the claim AND the state that was read back; dropping it \
               starts the next run from nothing"]
-pub struct Opened<D, S: Snapshots> {
+pub struct Opened<D, S: Snapshots, M> {
     restored: Option<D>,
-    saver: Persist<D, S>,
+    torn: Option<TornTail>,
+    saver: Persist<D, S, M>,
 }
 
-impl<D: Durable, S: Snapshots> Opened<D, S> {
+impl<D, S: Snapshots, M> Opened<D, S, M> {
     /// Whether anything was stored. `false` is the first ever run, which is not
     /// a failure.
     ///
@@ -371,6 +559,16 @@ impl<D: Durable, S: Snapshots> Opened<D, S> {
     #[must_use]
     pub fn was_stored(&self) -> bool {
         self.restored.is_some()
+    }
+
+    /// What recovery cut from the end of the log, if anything. Log it.
+    ///
+    /// A crash during an append leaves a partly written record. It is removed
+    /// and its size reported here. Nothing acknowledged is lost: the append never
+    /// resolved, so its caller was never told it had happened.
+    #[must_use]
+    pub fn torn_tail(&self) -> Option<TornTail> {
+        self.torn
     }
 
     /// The state to start the actor from, and the observer that will keep it
@@ -382,25 +580,34 @@ impl<D: Durable, S: Snapshots> Opened<D, S> {
     /// it then throws away.
     ///
     /// ```ignore
-    /// let (state, saver) = Persist::<Ledger, _>::open(&store, &id).await?.start_from(Ledger::default);
+    /// let (state, saver) = Persist::<Ledger, _, Whole>::open(&store, &id).await?.start_from(Ledger::default);
     /// let ledger = ledger::setup(state).observe(saver).actor();
     /// ```
-    pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S>) {
+    pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S, M>) {
         (self.restored.unwrap_or_else(first), self.saver)
     }
 }
 
-impl<D, S: Snapshots> std::fmt::Debug for Opened<D, S> {
+impl<D, S: Snapshots> Opened<D, S, Deltas> {
+    /// Fold the log by this policy rather than [`Compaction::DEFAULT`].
+    pub fn compaction(mut self, when: Compaction) -> Self {
+        self.saver.strategy = Deltas(when);
+        self
+    }
+}
+
+impl<D, S: Snapshots, M> std::fmt::Debug for Opened<D, S, M> {
     /// Whether there was anything to restore, and nothing else. The state is the
     /// state's business.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Opened")
             .field("was_stored", &self.restored.is_some())
+            .field("torn", &self.torn)
             .finish_non_exhaustive()
     }
 }
 
-impl<D, S> Observer<D> for Persist<D, S>
+impl<D, S> Observer<D> for Persist<D, S, Whole>
 where
     D: Durable + 'static,
     S: Snapshots,
@@ -470,7 +677,50 @@ where
     // could only be a state some caller was told was refused.
 }
 
-impl<D, S: Snapshots> std::fmt::Debug for Persist<D, S> {
+impl<D, S> Observer<D> for Persist<D, S, Deltas>
+where
+    D: Journaled + 'static,
+    S: Snapshots,
+{
+    fn name(&self) -> &'static str {
+        "persist"
+    }
+
+    /// Drain what the turn changed synchronously, then append it before the reply.
+    ///
+    /// Everything [`Persist<D, S, Whole>`]'s `after_turn` says about the snapshot
+    /// being taken outside the future holds here for the same reason:
+    /// [`Versioned::stage`] borrows the state, and the future it leaves behind
+    /// holds only the bytes to write.
+    ///
+    /// # A panicked turn appends nothing, and drops what it recorded
+    ///
+    /// A handler that recorded a change and then panicked left the state
+    /// half-applied. Its changes are drained and thrown away, so a restart
+    /// reproduces the state from before the turn and not the half of it.
+    fn after_turn<'a>(&'a mut self, state: &'a D, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let staged = match turn.outcome {
+            TurnOutcome::Completed => self.durable.stage(state, self.strategy.0),
+            TurnOutcome::Panicked { .. } => {
+                self.durable.discard(state);
+                return Box::pin(async {
+                    Err(Stop::new(
+                        "a panicked turn is not stored: the state may be half-applied",
+                    ))
+                });
+            }
+        };
+
+        Box::pin(async move {
+            self.durable.commit(staged).await?;
+            Ok(())
+        })
+    }
+
+    // No `finish`, for the reason the `Whole` observer gives.
+}
+
+impl<D, S: Snapshots, M> std::fmt::Debug for Persist<D, S, M> {
     /// The name and nothing else, because there is nothing else. The claim is
     /// an adapter's business, the snapshot bytes are the state's, and this type
     /// deliberately remembers nothing between turns.

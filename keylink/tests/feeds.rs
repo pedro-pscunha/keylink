@@ -39,9 +39,9 @@
 use keylink::prelude::*;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "persist-file")]
-use keylink::Persist;
 use keylink::{Caller, Ended, Observer, Stream, TurnFut, TurnInfo, TurnOutcome};
+#[cfg(feature = "persist-file")]
+use keylink::{Persist, Whole};
 #[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
 #[cfg(feature = "persist-file")]
@@ -771,7 +771,7 @@ async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     marks.send(22).await.expect("the feed accepts");
     drop(marks);
     {
-        let opened = Persist::<Tape, _>::open(&files, &id)
+        let opened = Persist::<Tape, _, Whole>::open(&files, &id)
             .await
             .expect("claims and loads");
         assert!(!opened.was_stored(), "nothing has been stored yet");
@@ -790,7 +790,7 @@ async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     }
 
     // The claim is released with the actor, so a new "process" can open it.
-    let opened = Persist::<Tape, _>::open(&files, &id)
+    let opened = Persist::<Tape, _, Whole>::open(&files, &id)
         .await
         .expect("the claim was released with the actor");
     assert!(opened.was_stored(), "something was stored");

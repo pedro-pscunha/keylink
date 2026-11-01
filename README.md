@@ -80,7 +80,7 @@ deep inside a dependency, and `persist-file` stops earlier still, inside tokio.
 | [`reliable_call`](keylink/examples/reliable_call.rs) | effectively-once, composed from a key, a `Peer` and `attaching_for` |
 | [`payment_approval`](keylink/examples/payment_approval.rs) | `#[defer]`, `Allowlist::only`, and both durability ports of one store |
 | [`replay_guard`](keylink/examples/replay_guard.rs) | the retry a memory ledger cannot see, and `Applied` inside the state |
-| [`durable_ledger`](keylink/examples/durable_ledger.rs) | `Persist` as an observer, storing inside every turn |
+| [`durable_ledger`](keylink/examples/durable_ledger.rs) | `Persist` as an observer, storing what each turn changed inside the turn |
 | [`firmware_depot`](keylink/examples/firmware_depot.rs) | `blob`, `send` and `tell` in one service |
 | [`cold_store`](keylink/examples/cold_store.rs) | a blob store on a disk, and the flush that commits it |
 | [`match_room`](keylink/examples/match_room.rs) | a keyed registry, two callers on one parked reply, and a `feed` clock |
@@ -279,6 +279,22 @@ Two costs, both structural. A turn is not cancellable: dropping the call does
 not stop the handler, and a layer such as `Timeout` refuses the caller without
 ending the turn. And an actor must not call itself: keylink detects a re-entrant
 local call by actor identity and refuses it instead of relying on mailbox depth.
+
+**Durable state.** An actor's state survives its process when a `Persist`
+observer stores it inside every turn, before the reply. A persisted state is a
+snapshot plus the log of what changed after it, under one exclusive claim, and
+`Persist<D, S, M>` takes the strategy as `M`. `Whole` stores the whole state
+every turn, so a turn costs the size of the state. `Deltas` stores what the turn
+changed: the state holds a `Changes` buffer, the handler changes the state
+through `Journaled::apply` (the code a restore runs too) and records the change,
+and the observer appends it. Every so often a `Compaction` policy folds the log
+into a new snapshot, and that one turn costs the size of the state. A state
+written by `Deltas` and opened by `Whole` is refused rather than read without its
+log. On this machine, back to back, a `Deltas` turn took 0.3 to 0.5 times as long
+as a `Whole` one and wrote 60 bytes against the whole state; the table, and what
+it does not cover, is in `Persist`'s rustdoc. An unrecorded change is lost on
+restart without a word, so a test should reopen the state and compare its
+encoding with the live one, as `keylink/tests/journal.rs` does.
 
 ### Local mailbox policy
 
@@ -637,13 +653,16 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    in this file is pessimistic there. Measure on the platform you will run on.
 
    **And the set is a term in that turn rate, so measure at the bound you mean to
-   run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
+   run.** `Persist<_, _, Whole>` re-encodes the whole state every completed turn, so an `Applied`
    costs its entries on every turn whether one changed or not — 4096 entries is
    ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one**. That
    ratio divides by 14.0 µs, not by the ~13 µs above: both halves come from one
    run, and dividing by the tabled figure instead gives 7.2×. `APPLIED_BOUND`'s
    rustdoc has the measured table and says why the two differ. Raise the bound for
-   slow callers; lower it for cheap turns.
+   slow callers; lower it for cheap turns. **That cost is
+   `Whole`'s.** A `Journaled` state can record an `Applied` insertion, and an
+   eviction, as changes instead of re-encoding the set every turn. Nothing here
+   builds that or measures it, so it is a way out and not a figure.
 
    The busiest window is the one right after the restart, which *concentrates*
    arrivals — every peer's backoff fires at once. What drains the set, though, is

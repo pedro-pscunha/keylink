@@ -37,6 +37,7 @@ gate_modules! {
     feeds => "../tests/feeds.rs",
     idempotency => "../tests/idempotency.rs",
     inspect => "../tests/inspect.rs",
+    journal => "../tests/journal.rs",
     observe => "../tests/observe.rs",
     peer => "../tests/peer.rs",
     persist => "../tests/persist.rs",

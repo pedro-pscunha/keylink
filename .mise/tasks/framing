@@ -33,6 +33,14 @@
 # with a named allowlist. This one now catches the import route only where
 # nothing in the file defines the trait's other side.
 #
+# `Claim::append` and `Claim::truncate_before` are raw-byte (or raw-position)
+# methods of the same trait, so the first check guards them too: they are callable
+# only where the trait is in scope. A record appended outside `Versioned` would
+# carry no delta version and no count, which `Recovered::replayed` would refuse as
+# a `BadRecord` at the next open. The second check below is about `.store(` only
+# and needs no sibling for them: `keylink/src/persist.rs` calls `Versioned` and
+# nothing else.
+#
 # The second is the ordinary grep. It used to look for `.store(&` and
 # `.store(b"`, which is what a raw write looked like at the time; thirteen
 # lines of `claim.store(payload.as_slice())` walked through it. So it now

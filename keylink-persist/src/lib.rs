@@ -446,7 +446,7 @@ pub trait Durable: Sized {
     ///
     /// Stamped into the frame by
     /// [`Versioned::store`](versioned::Versioned::store) and read back by
-    /// [`Versioned::load`](versioned::Versioned::load), which is what decides
+    /// [`Versioned::open`](versioned::Versioned::open), which is what decides
     /// whether [`migrate`](Self::migrate) runs.
     ///
     /// # The failure nobody can type against
@@ -535,9 +535,183 @@ pub trait Durable: Sized {
     fn migrate(from: u32, bytes: &[u8]) -> std::result::Result<Option<Vec<u8>>, RestoreError>;
 }
 
+/// A state whose turns are stored as what they changed, rather than as the
+/// whole.
+///
+/// The second way to persist a [`Durable`]. A whole-state store re-encodes and
+/// rewrites everything on every turn, so a turn costs the size of the state; a
+/// journaled state appends one small record per turn that changed something, and
+/// every so often folds the log into a new snapshot. What one turn costs is then
+/// the size of its change.
+///
+/// # The shape
+///
+/// The state owns a [`Changes`] buffer. A handler that mutates the state applies
+/// the change **through [`apply`](Self::apply)** and
+/// [`record`](Changes::record) it; the observer drains the buffer after the
+/// turn and appends it. On restore the stored records go through the same
+/// [`apply`](Self::apply), so there is one piece of code that changes the state
+/// and the live path and the replay path cannot drift apart.
+///
+/// ```
+/// # use keylink_persist::{Changes, Durable, Journaled, RestoreError};
+/// /// One change: an entry was posted.
+/// #[derive(Clone)]
+/// struct Posted(u64);
+///
+/// impl Durable for Posted {
+///     const VERSION: u32 = 1;
+///     fn snapshot(&self) -> Vec<u8> { self.0.to_le_bytes().to_vec() }
+///     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+///         let bytes: [u8; 8] = bytes
+///             .try_into()
+///             .map_err(|_| RestoreError::Malformed("a post is 8 bytes".into()))?;
+///         Ok(Self(u64::from_le_bytes(bytes)))
+///     }
+///     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
+/// }
+///
+/// #[derive(Default)]
+/// struct Ledger { entries: Vec<u64>, changes: Changes<Posted> }
+///
+/// impl Durable for Ledger {
+///     const VERSION: u32 = 1;
+///     fn snapshot(&self) -> Vec<u8> {
+///         self.entries.iter().flat_map(|n| n.to_le_bytes()).collect()
+///     }
+///     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+///         let entries = bytes.chunks(8).map(|c| Posted::restore(c).map(|p| p.0)).collect::<Result<_, _>>()?;
+///         Ok(Self { entries, changes: Changes::default() })
+///     }
+///     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
+/// }
+///
+/// impl Journaled for Ledger {
+///     type Delta = Posted;
+///     fn changes(&self) -> &Changes<Posted> { &self.changes }
+///     fn apply(&mut self, delta: Posted) { self.entries.push(delta.0); }
+/// }
+///
+/// impl Ledger {
+///     /// What a handler does: change the state the way a replay would, then say so.
+///     fn post(&mut self, entry: u64) -> u64 {
+///         let delta = Posted(entry);
+///         self.apply(delta.clone());
+///         self.changes.record(delta);
+///         self.entries.len() as u64
+///     }
+/// }
+/// ```
+///
+/// # What nothing here can check
+///
+/// **An unrecorded mutation is lost on restart, silently.** The library cannot
+/// compare a delta with what the turn changed. It is the same class of hazard as
+/// an unbumped [`Durable::VERSION`]. The guard is a test that reopens the state
+/// and compares its [`snapshot`](Durable::snapshot) with the live one; the
+/// `keylink` tests for this feature do exactly that, and the pattern is meant to
+/// be copied.
+///
+/// # Deltas migrate exactly as states do
+///
+/// [`Delta`](Self::Delta) is a [`Durable`], so its [`VERSION`](Durable::VERSION),
+/// [`migrate`](Durable::migrate) and [`restore`](Durable::restore) are the whole
+/// story, with no second rule. Each stored record carries its delta version, so a
+/// log written across an upgrade can hold several versions and each migrates on
+/// its own. `migrate` sees one delta's bytes; a hop that needs the state is
+/// [`RestoreError::NoMigration`], and the way through it is to compact under the
+/// old build before upgrading.
+pub trait Journaled: Durable {
+    /// One change. Versioned, framed and migrated exactly as a state is.
+    type Delta: Durable + Send + 'static;
+
+    /// The buffer turns record into: return the field, `&self.changes`.
+    fn changes(&self) -> &Changes<Self::Delta>;
+
+    /// Re-do one stored change on restore.
+    ///
+    /// Must not [`record`](Changes::record): a replayed change is already
+    /// stored. A restore drops whatever this call recorded rather than storing it
+    /// a second time.
+    fn apply(&mut self, delta: Self::Delta);
+}
+
+/// The changes the running turn has made, waiting for the store.
+///
+/// A [`Journaled`] state holds one. [`record`](Self::record) takes `&mut self`,
+/// so only a turn, which holds the state exclusively, can record: a
+/// `with_state` read gets `&State` and cannot.
+///
+/// There is no public way to take the changes out. The owner of the state's
+/// claim drains them through
+/// [`Versioned::stage`](versioned::Versioned::stage), and nothing else holds
+/// that. From outside this crate, no name drains one (made red by making `take`
+/// public, whereupon this fence compiles and rustdoc fails it):
+///
+/// ```compile_fail
+/// use keylink_persist::Changes;
+///
+/// let changes: Changes<u8> = Changes::default();
+/// let _ = changes.take();
+/// ```
+///
+/// A mutex holds them, and not a `Cell`, so that a journaled state stays `Sync`.
+/// It is never contended: one actor task owns the state, and a recording turn
+/// goes through `&mut` and takes no lock at all.
+///
+/// **Not `Clone`, on purpose.** A clone that carried pending changes would store
+/// them twice. A state that derives `Clone` implements it by hand, or leaves this
+/// field out and builds a fresh one with [`Default`].
+///
+/// **A journaled state that is run without a store that drains this buffer** (the
+/// actor spawned bare, or under a whole-state store) never empties it, and it
+/// grows with every recorded change.
+pub struct Changes<T>(std::sync::Mutex<Vec<T>>);
+
+impl<T> Default for Changes<T> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+}
+
+impl<T> Changes<T> {
+    /// Record one change, in the turn that made it.
+    pub fn record(&mut self, delta: T) {
+        self.0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(delta);
+    }
+
+    /// Everything recorded since the last call, oldest first.
+    pub(crate) fn take(&self) -> Vec<T> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+impl<T> fmt::Debug for Changes<T> {
+    /// How many changes are waiting, and nothing else: they are the state's own
+    /// encoding and this crate never looks inside.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        f.debug_struct("Changes")
+            .field("pending", &pending)
+            .finish()
+    }
+}
+
 /// Why a stored snapshot did not become a state.
 ///
-/// Three of these are the **loader's** verdicts about provenance, and their
+/// Several of these are the **loader's** verdicts about provenance, and their
 /// variants are `#[non_exhaustive]` so that only this crate can construct them.
 /// A [`Durable::restore`] that could return `FromTheFuture` could claim a
 /// version comparison it never made. [`Malformed`](Self::Malformed) stays
@@ -550,10 +724,10 @@ pub trait Durable: Sized {
 /// `keylink-persist/tests/versioned.rs` cannot either — a test that only ever
 /// *matches* a variant, always with `..`, matches an ordinary variant exactly
 /// as happily. Construction is the one thing the attribute forbids, so the
-/// guard is a `compile_fail` doctest on each of the three variants: a doctest
+/// guard is a `compile_fail` doctest on each of the loader's variants: a doctest
 /// compiles as its own crate, which is where the attribute is in force.
 ///
-/// Those three blocks are the reason this decision is not a comment. Delete an
+/// Those blocks are the reason this decision is not a comment. Delete an
 /// attribute and its block starts compiling, and rustdoc fails a `compile_fail`
 /// test that compiled — watched, not assumed.
 ///
@@ -572,7 +746,7 @@ pub trait Durable: Sized {
 /// the shape of every guard this project has caught being satisfiable without
 /// proving its claim. `keylink-persist/src/representability.rs` objects to
 /// `trybuild` for matching full rustc stderr, and that objection stands; the
-/// answer is not a code on a fence but the narrower claim these three blocks can
+/// answer is not a code on a fence but the narrower claim these blocks can
 /// actually make — this does not compile — plus
 /// `keylink-persist/tests/versioned.rs` naming the variants from outside the
 /// crate, so a rename cannot pass here by making the name vanish.
@@ -642,6 +816,97 @@ pub enum RestoreError {
     NoMigration {
         /// The missing hop's starting version.
         from: u32,
+    },
+
+    /// Records follow the snapshot, and this type has nothing to replay them
+    /// with.
+    ///
+    /// What a whole-state store reports when the state it is asked to open was
+    /// last written by a journaled one. Refused rather than read: the snapshot
+    /// alone is a state from before those records, and every one of them would be
+    /// lost without a word.
+    ///
+    /// The loader's verdict, not a [`Durable`]'s:
+    ///
+    /// ```compile_fail
+    /// use keylink_persist::RestoreError;
+    ///
+    /// let _ = RestoreError::UnreplayedLog { records: 3 };
+    /// ```
+    #[error("{records} records follow the snapshot and this type cannot replay them")]
+    #[non_exhaustive]
+    UnreplayedLog {
+        /// How many records follow it.
+        records: u64,
+    },
+
+    /// The log holds records and no snapshot exists to apply them to.
+    ///
+    /// Cannot happen in normal use, because a journaled store writes a snapshot
+    /// before its first record. It means the snapshot was removed.
+    ///
+    /// ```compile_fail
+    /// use keylink_persist::RestoreError;
+    ///
+    /// let _ = RestoreError::LogWithoutSnapshot { records: 3 };
+    /// ```
+    #[error("the log holds {records} records and there is no snapshot to apply them to")]
+    #[non_exhaustive]
+    LogWithoutSnapshot {
+        /// How many records there are.
+        records: u64,
+    },
+
+    /// The log skips from one turn to a later one.
+    ///
+    /// ```compile_fail
+    /// use keylink_persist::{RestoreError, Seq};
+    ///
+    /// let _ = RestoreError::Gap { expected: Seq::new(2), found: Seq::new(4) };
+    /// ```
+    #[error("the log has record {found} where record {expected} should be")]
+    #[non_exhaustive]
+    Gap {
+        /// The record that should have come next.
+        expected: Seq,
+        /// The one that did.
+        found: Seq,
+    },
+
+    /// A record's counts and lengths do not add up to its bytes.
+    ///
+    /// ```compile_fail
+    /// use keylink_persist::{RestoreError, Seq};
+    ///
+    /// let _ = RestoreError::BadRecord { seq: Seq::new(2) };
+    /// ```
+    #[error("record {seq} of the log is not a record this build can read")]
+    #[non_exhaustive]
+    BadRecord {
+        /// Which record.
+        seq: Seq,
+    },
+
+    /// One delta in the log did not decode.
+    ///
+    /// `source` is what the frame or the delta's own [`Durable`] reported, so a
+    /// delta from a newer build is `FromTheFuture` inside this.
+    ///
+    /// ```compile_fail
+    /// use keylink_persist::{RestoreError, Seq};
+    ///
+    /// let _ = RestoreError::Delta {
+    ///     seq: Seq::new(2),
+    ///     source: Box::new(RestoreError::Malformed(String::new())),
+    /// };
+    /// ```
+    #[error("a change in record {seq} of the log could not be restored: {source}")]
+    #[non_exhaustive]
+    Delta {
+        /// Which record it was in.
+        seq: Seq,
+        /// Why it did not decode.
+        source: Box<RestoreError>,
     },
 
     /// What a [`Durable`] reports about bytes it cannot read.
@@ -860,7 +1125,7 @@ pub enum Error {
     /// reaches the adapter through
     /// [`Versioned::store`](versioned::Versioned::store) is the payload **plus**
     /// [`versioned::FRAME_LEN`] bytes of header. So a caller who handed over
-    /// exactly `limit` bytes of snapshot is refused with a number twelve larger
+    /// exactly `limit` bytes of snapshot is refused with a number [`FRAME_LEN`](versioned::FRAME_LEN) larger
     /// than the one they passed, and the alternative — reporting the payload
     /// length against a limit that includes the header — would print
     /// `120 bytes, limit 128` beside a refusal.

@@ -79,7 +79,7 @@
 //!
 //! # End to end
 //!
-//! Store, claim, wrap, load, store. This example lives here rather than on
+//! Store, claim, open, store. This example lives here rather than on
 //! [`Versioned`](crate::versioned::Versioned) because it names `Files`, and a
 //! doctest on the crate's feature-independent core that cannot compile without
 //! the `file` feature is a coupling `.mise/tasks/features` exists to prevent —
@@ -100,8 +100,10 @@
 //! let files = Files::open("/var/lib/keylink").await?;
 //! let id = StateId::new("counters/hits")?;
 //!
-//! let mut state = Versioned::new(files.claim(&id).await?);
-//! let mut counter = state.load::<Counter>().await?.unwrap_or(Counter(0));
+//! let (counter, mut state) = Versioned::open::<Counter>(files.claim(&id).await?)
+//!     .await?
+//!     .whole()?;
+//! let mut counter = counter.unwrap_or(Counter(0));
 //!
 //! counter.0 += 1;
 //! state.store(&Snapshot::of(&counter)).await?;
@@ -150,7 +152,10 @@ impl Files {
     /// Counted on what reaches this adapter, which for anything written through
     /// [`Versioned`](crate::versioned::Versioned) is the payload plus
     /// [`FRAME_LEN`](crate::versioned::FRAME_LEN). Headroom for one snapshot is
-    /// therefore `bytes - FRAME_LEN`.
+    /// therefore `bytes - FRAME_LEN`. A journal record is counted as the record
+    /// alone, without the sixteen bytes the adapter frames it in: that framing is
+    /// this adapter's, and a limit that counted it would be a number the caller
+    /// cannot see.
     ///
     /// # The floor
     ///
