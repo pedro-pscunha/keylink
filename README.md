@@ -176,8 +176,10 @@ because a request can name an offset near `u64::MAX` in a few bytes.
 A grant lasts until it is revoked. `Blobs::revoke(peer, root)` and
 `Blobs::revoke_everywhere(root)` refuse the next request; a request already
 admitted finishes. `Blobs::revoke_peer(peer)` also closes the peer's live
-blobs connections, so a transfer in flight stops. Bytes already delivered stay
-with the fetcher. Remove a peer from admission first, then call `revoke_peer`:
+blobs connections, so a transfer in flight stops, and it refuses the grant of a
+call whose handler was already running when it landed
+(`RemoteError::GrantsWithdrawn`). Bytes already delivered stay with the
+fetcher. Remove a peer from admission first, then call `revoke_peer`:
 removing it from an allowlist does not touch its blob grants.
 
 The ledger is bounded in bytes, not in grants: `GRANT_BUDGET` is 64 MiB by

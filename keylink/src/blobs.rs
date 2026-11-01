@@ -1190,7 +1190,10 @@ impl Blobs {
     /// Returns how many grants.
     ///
     /// Its in-flight transfers stop at once and the fetcher reads
-    /// [`Error::BlobRefused`], and a new connection is refused at accept.
+    /// [`Error::BlobRefused`], and a new connection is refused at accept. A call
+    /// whose handler was already running when this lands is fenced too: the
+    /// content it returns is not granted, and the caller reads
+    /// [`RemoteError::GrantsWithdrawn`].
     /// Removing a peer from an [`Allowlist`](crate::Allowlist) or a
     /// [`DynamicAdmission`](crate::DynamicAdmission) does not touch its blob
     /// grants, because the ledger is per node and does not record which service
