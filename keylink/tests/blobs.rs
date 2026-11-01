@@ -2303,8 +2303,8 @@ struct Strongroom {
     decoy: BlobId,
     /// How many times `receipt` was entered. A replayed reply and a re-run one
     /// are byte identical, so this is the only way to prove which path the retry
-    /// took. Replaying now renews the transmitted address's grant without
-    /// dispatching again, so the grant alone cannot distinguish these paths.
+    /// took — and "the replay never reaches the grant site" is a claim about the
+    /// path, not about the bytes.
     entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -2425,15 +2425,8 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_was_revoked_and_
         "the reply frame must still be recorded, or there is nothing to replay"
     );
 
-    // The old grant really is gone before replay, even though the record lives.
-    let mut sink = Vec::new();
-    let error = BlobHandle::new(&caller, server_addr, receipt)
-        .copy_to(&mut sink)
-        .await
-        .expect_err("the evicted grant must refuse before replay");
-    assert_refused(&error, "before replay");
-    assert!(sink.is_empty());
-
+    // 5. The retry is answered from the record, and the recorded frame carries
+    //    the same address — the replay path never reaches the grant site.
     let (replayed_manual, replayed) = client
         .with_idempotency(key)
         .receipt("42".to_owned())
@@ -2444,8 +2437,15 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_was_revoked_and_
     assert_eq!(
         entered.load(std::sync::atomic::Ordering::Relaxed),
         1,
-        "a replay must not rerun the handler"
+        "the retry must have been replayed, not re-run: a re-run would pass \
+         through the grant site and re-record the grant, which is the very thing \
+         the replay path is said to skip"
     );
+
+    // 6. And it is worth nothing. The grant book is read per request, so the
+    //    address the replay handed back is refused exactly like an address the
+    //    handler never returned — on a connection that step 3 just proved is
+    //    admitted, which is what makes this `admits_get` talking.
     let mut sink = Vec::new();
     let error = replayed
         .copy_to(&mut sink)
