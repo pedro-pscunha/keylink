@@ -85,7 +85,10 @@ impl setup::Handler for Setup {
     }
     async fn revoke(&self, _cx: &Context, record: Vec<u8>) -> bool {
         match Revocation::from_bytes(&record) {
-            Ok(revocation) => !self.trust.apply(Change::Revoke(revocation)).is_empty(),
+            Ok(revocation) => self
+                .trust
+                .apply(Change::Revoke(revocation))
+                .is_ok_and(|closed| !closed.is_empty()),
             Err(_) => false,
         }
     }

@@ -58,7 +58,7 @@
 //!
 //! - **Nothing about a peer already inside a stream.** LiveConnection closes the
 //!   connection; a call already dispatched runs to completion.
-//! - **Each node has its own view.** Nodes fed the same signed records converge;
+//! - **Each node has its own view.** Feeders must handle explicit capacity refusals;
 //!   revocation latency is the feeder's delivery latency.
 //! - **No history.** There is no audit trail of past decisions; that is a
 //!   different port with different operations.
@@ -217,10 +217,12 @@ pub trait Admission: Send + Sync + 'static {
 pub trait Revocable: Admission {
     /// The change this adapter applies before rechecking live connections.
     type Change;
+    /// A typed refusal to apply the change. An infallible adapter uses `Infallible`.
+    type Error;
 
     /// Apply the change before closing connections no longer admitted.
     #[must_use = "a revocation that closed nothing is usually a mistake"]
-    fn apply(&self, next: Self::Change) -> Vec<EndpointId>;
+    fn apply(&self, next: Self::Change) -> Result<Vec<EndpointId>, Self::Error>;
 }
 
 /// A mutable allowlist snapshot behind a lock.
@@ -297,8 +299,9 @@ impl Admission for DynamicAdmission {
 
 impl Revocable for DynamicAdmission {
     type Change = Allowlist;
+    type Error = std::convert::Infallible;
 
-    fn apply(&self, next: Self::Change) -> Vec<EndpointId> {
+    fn apply(&self, next: Self::Change) -> Result<Vec<EndpointId>, Self::Error> {
         // The swap happens FIRST, and under the lock, so a peer that reconnects
         // during the sweep below meets the new policy rather than the old one.
         // Closing first would leave exactly that window open.
@@ -313,7 +316,7 @@ impl Revocable for DynamicAdmission {
                 closed.push(id);
             }
         }
-        closed
+        Ok(closed)
     }
 }
 

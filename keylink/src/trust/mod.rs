@@ -50,6 +50,22 @@ pub const MAX_PATTERN_LEN: usize = 255;
 pub const MAX_SIGNED: usize = 1 << 16;
 /// Maximum stored chains per holder.
 pub const MAX_CHAINS_PER_HOLDER: usize = 16;
+/// Total retained chains; at the cap, new entries are refused rather than silently evicted.
+pub const MAX_RETAINED_CHAINS: usize = 1024;
+/// Total pending signed revocation records whose authority is not yet established.
+pub const MAX_PENDING_REVOCATIONS: usize = 1024;
+
+/// Why a signed change could not be retained. Refusal leaves the prior view intact.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChangeError {
+    /// The budget for not-yet-authoritative revocation records is full.
+    #[error("the pending revocation budget of {max} records is full")]
+    PendingRevocationsFull {
+        /// Maximum retained pending records.
+        max: usize,
+    },
+}
 
 /// Seconds since the Unix epoch. Verifiers take an explicit time.
 #[derive(
@@ -173,6 +189,27 @@ impl Trust {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
         store.standing(&chain, Timestamp::now())?;
+        let held = store.chains.get(&credential.holder());
+        let duplicate = held.is_some_and(|chains| {
+            chains.iter().any(|c| {
+                c.chain()
+                    .links()
+                    .iter()
+                    .map(Certificate::id)
+                    .eq(chain.links().iter().map(Certificate::id))
+            })
+        });
+        if duplicate {
+            return Ok(());
+        }
+        let total: usize = store.chains.values().map(Vec::len).sum();
+        if total >= MAX_RETAINED_CHAINS
+            && held.is_none_or(|chains| chains.len() < MAX_CHAINS_PER_HOLDER)
+        {
+            return Err(ChainError::StoreFull {
+                max: MAX_RETAINED_CHAINS as u32,
+            });
+        }
         let chains = store.chains.entry(credential.holder()).or_default();
         if chains.iter().any(|c| {
             c.chain()
@@ -296,13 +333,23 @@ impl Admission for Trust {
 }
 impl Revocable for Trust {
     type Change = Change;
-    fn apply(&self, change: Change) -> Vec<PublicKey> {
+    type Error = ChangeError;
+    fn apply(&self, change: Change) -> Result<Vec<PublicKey>, ChangeError> {
         {
             let mut store = self.store();
             match change {
                 Change::Revoke(revocation) => {
                     let roots = store.roots.clone();
-                    store.revoked.add(&revocation, &roots);
+                    let authoritative = roots.contains(&revocation.revoker())
+                        || store.chains.values().flatten().any(|credential| {
+                            let mut upstream = BTreeSet::new();
+                            credential.chain().links().iter().any(|link| {
+                                upstream.insert(link.issuer());
+                                link.id() == revocation.certificate()
+                                    && upstream.contains(&revocation.revoker())
+                            })
+                        });
+                    store.revoked.add(&revocation, authoritative)?;
                     let chains: Vec<_> = store
                         .chains
                         .values()
@@ -339,7 +386,7 @@ impl Revocable for Trust {
         // TODO: wire the separate Blobs::revoke_peer capability for every
         // affected holder, including inactive ones. `closed` names only live
         // connections; closing RPC alone does not retract prior blob grants.
-        closed.into_iter().collect()
+        Ok(closed.into_iter().collect())
     }
 }
 

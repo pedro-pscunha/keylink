@@ -806,7 +806,9 @@ async fn a_newly_added_peer_is_admitted_without_a_restart() {
         "a peer not on the list must not be answered"
     );
 
-    let closed = policy.apply(Allowlist::only([welcome.id(), latecomer.id()]));
+    let closed = policy
+        .apply(Allowlist::only([welcome.id(), latecomer.id()]))
+        .unwrap();
     assert!(
         closed.is_empty(),
         "widening a policy closes nobody: {closed:?}"
@@ -857,7 +859,7 @@ async fn revoking_a_peer_closes_its_connection() {
     assert_eq!(revoked.knock().await.expect("answers"), 1);
     assert_eq!(kept.knock().await.expect("answers"), 1);
 
-    let closed = policy.apply(Allowlist::only([keeper.id()]));
+    let closed = policy.apply(Allowlist::only([keeper.id()])).unwrap();
     assert_eq!(closed, vec![peer.id()], "exactly one peer was revoked");
 
     let error = revoked
@@ -901,7 +903,7 @@ async fn a_revoked_peer_cannot_reconnect_during_the_revocation() {
         .expect("dials");
     assert_eq!(first.knock().await.expect("answers"), 1);
 
-    let closed = policy.apply(Allowlist::only([node.id()]));
+    let closed = policy.apply(Allowlist::only([node.id()])).unwrap();
     assert_eq!(closed, vec![peer.id()]);
 
     let again = gate::Client::connect(&peer, node.endpoint().addr())
@@ -979,7 +981,10 @@ async fn a_departed_peer_is_not_reported_as_revoked() {
     assert_eq!(policy.live(), 0, "a departed peer must be forgotten");
 
     assert!(
-        policy.apply(Allowlist::only([node.id()])).is_empty(),
+        policy
+            .apply(Allowlist::only([node.id()]))
+            .unwrap()
+            .is_empty(),
         "revoking a peer that already left closes nothing"
     );
 }

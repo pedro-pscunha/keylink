@@ -157,8 +157,9 @@ impl Admission for Doorman {
 
 impl Revocable for Doorman {
     type Change = Allowlist;
+    type Error = std::convert::Infallible;
 
-    fn apply(&self, next: Self::Change) -> Vec<keylink::EndpointId> {
+    fn apply(&self, next: Self::Change) -> Result<Vec<keylink::EndpointId>, Self::Error> {
         self.inner.apply(next)
     }
 }
@@ -297,7 +298,7 @@ async fn run() -> Result<(), Box<dyn StdError>> {
     //  so taking one after the close would have nothing left to register on.
     let watch: Watch = leaving.watch();
 
-    let closed = policy.apply(Allowlist::only([auditor_node.id()]));
+    let closed = policy.apply(Allowlist::only([auditor_node.id()]))?;
     assert_eq!(
         closed,
         vec![clerk_node.id()],

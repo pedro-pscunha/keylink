@@ -94,7 +94,10 @@ async fn a_revoked_certificate_is_refused_and_its_live_connection_closed() {
     let revocation =
         Revocation::from_bytes(&Revocation::issue(&root, chain.links()[0].id()).to_bytes())
             .unwrap();
-    assert_eq!(trust.apply(Change::Revoke(revocation)), vec![peer.id()]);
+    assert_eq!(
+        trust.apply(Change::Revoke(revocation)).unwrap(),
+        vec![peer.id()]
+    );
     let _ = watch.await;
     assert_eq!(
         client.read().await.unwrap_err().refusal(),
@@ -386,10 +389,12 @@ async fn revocation_closes_every_connection_across_two_alpns() {
     let wa = a.watch();
     let wb = b.watch();
     assert_eq!(
-        trust.apply(Change::Revoke(Revocation::issue(
-            &root,
-            chain.links()[0].id()
-        ))),
+        trust
+            .apply(Change::Revoke(Revocation::issue(
+                &root,
+                chain.links()[0].id()
+            )))
+            .unwrap(),
         vec![peer.id()]
     );
     let _ = tokio::join!(wa, wb);
@@ -451,6 +456,7 @@ async fn revoking_the_selected_chain_during_access_refuses_dispatch() {
             &root,
             selected.links()[0].id()
         )))
+        .unwrap()
         .is_empty());
     assert_eq!(trust.live(), 1);
     release.notify_one();

@@ -1641,7 +1641,7 @@ where
     ///     .admission(policy.clone())
     ///     .build();
     /// // ... later, without a restart, and closing whoever is no longer welcome
-    /// let closed = policy.apply(Allowlist::only([second]));
+    /// let closed = policy.apply(Allowlist::only([second]))?;
     /// ```
     #[must_use]
     pub fn admission(mut self, admission: Arc<dyn Admission>) -> Self {

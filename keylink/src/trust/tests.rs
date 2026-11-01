@@ -150,10 +150,12 @@ fn a_signed_claim_verifies_for_a_third_party_and_not_under_another_purpose() {
     );
     let trust = Trust::new(roots);
     trust.insert(chain.clone()).unwrap();
-    let _closed = trust.apply(Change::Revoke(Revocation::issue(
-        &root,
-        chain.links()[0].id(),
-    )));
+    let _closed = trust
+        .apply(Change::Revoke(Revocation::issue(
+            &root,
+            chain.links()[0].id(),
+        )))
+        .unwrap();
     assert_eq!(
         trust
             .open(&forwarded, &purpose, Timestamp::from_unix_secs(1))
@@ -185,15 +187,17 @@ fn revocations_are_authorized_at_evaluation_even_when_received_first() {
     let (root, _, chain, roots) = fixture();
     let trust = Trust::new(roots);
     let unrelated = SecretKey::from_bytes(&[9; 32]);
-    let _ = trust.apply(Change::Revoke(Revocation::issue(
-        &unrelated,
-        chain.links()[0].id(),
-    )));
+    let _ = trust
+        .apply(Change::Revoke(Revocation::issue(
+            &unrelated,
+            chain.links()[0].id(),
+        )))
+        .unwrap();
     assert!(trust.verify(&chain, Timestamp::from_unix_secs(1)).is_ok());
     let revocation =
         Revocation::from_bytes(&Revocation::issue(&root, chain.links()[0].id()).to_bytes())
             .unwrap();
-    let _ = trust.apply(Change::Revoke(revocation));
+    let _ = trust.apply(Change::Revoke(revocation)).unwrap();
     assert_eq!(
         trust
             .verify(&chain, Timestamp::from_unix_secs(1))
@@ -224,10 +228,12 @@ async fn a_connection_admitted_during_a_revocation_is_still_closed() {
     let dialed = dialed.unwrap();
     let proven = ProvenPeer::on(&accepted);
     assert_eq!(trust.admits(&proven), Admittance::Admitted);
-    let _ = trust.apply(Change::Revoke(Revocation::issue(
-        &root,
-        chain.links()[0].id(),
-    )));
+    let _ = trust
+        .apply(Change::Revoke(Revocation::issue(
+            &root,
+            chain.links()[0].id(),
+        )))
+        .unwrap();
     trust.admitted(
         &AdmittedPeer::mint(proven),
         LiveConnection::new(accepted, proven),
@@ -246,17 +252,21 @@ fn removing_a_root_never_resurrects_an_accepted_revocation() {
     let revoker = SecretKey::from_bytes(&[8; 32]);
     let trust = Trust::new(Roots::only([root.public(), revoker.public()]).unwrap());
     trust.insert(chain.clone()).unwrap();
-    let _ = trust.apply(Change::Revoke(Revocation::issue(
-        &revoker,
-        chain.links()[0].id(),
-    )));
+    let _ = trust
+        .apply(Change::Revoke(Revocation::issue(
+            &revoker,
+            chain.links()[0].id(),
+        )))
+        .unwrap();
     assert_eq!(
         trust
             .verify(&chain, Timestamp::from_unix_secs(1))
             .unwrap_err(),
         ChainError::Revoked { at: 0 }
     );
-    let _ = trust.apply(Change::Roots(Roots::only([root.public()]).unwrap()));
+    let _ = trust
+        .apply(Change::Roots(Roots::only([root.public()]).unwrap()))
+        .unwrap();
     assert_eq!(
         trust
             .verify(&chain, Timestamp::from_unix_secs(1))
@@ -265,11 +275,15 @@ fn removing_a_root_never_resurrects_an_accepted_revocation() {
     );
     // Root-authorized revocations are accepted even before their certificate arrives.
     let early = Trust::new(Roots::only([root.public(), revoker.public()]).unwrap());
-    let _ = early.apply(Change::Revoke(Revocation::issue(
-        &revoker,
-        chain.links()[0].id(),
-    )));
-    let _ = early.apply(Change::Roots(Roots::only([root.public()]).unwrap()));
+    let _ = early
+        .apply(Change::Revoke(Revocation::issue(
+            &revoker,
+            chain.links()[0].id(),
+        )))
+        .unwrap();
+    let _ = early
+        .apply(Change::Roots(Roots::only([root.public()]).unwrap()))
+        .unwrap();
     assert_eq!(
         early.insert(chain).unwrap_err(),
         ChainError::Revoked { at: 0 }
@@ -303,4 +317,80 @@ fn equal_expiry_retention_is_independent_of_feed_order() {
     };
     assert_eq!(ids(&a), ids(&b));
     assert_eq!(ids(&a).len(), MAX_CHAINS_PER_HOLDER);
+}
+
+fn budget_key(index: usize) -> SecretKey {
+    let mut bytes = [9; 32];
+    bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+    SecretKey::from_bytes(&bytes)
+}
+#[test]
+fn trust_store_budgets_bound_retained_chains() {
+    let (root, _, _, roots) = fixture();
+    let trust = Trust::new(roots);
+    let chain = |index| {
+        Chain::new(vec![Certificate::issue(
+            &root,
+            grant(budget_key(index).public(), "repo", 0),
+        )
+        .unwrap()])
+    };
+    let first = chain(0);
+    for index in 0..MAX_RETAINED_CHAINS {
+        trust.insert(chain(index)).unwrap();
+    }
+    trust.insert(first).unwrap(); // an identical retained record costs no place
+    assert_eq!(
+        trust.insert(chain(MAX_RETAINED_CHAINS)).unwrap_err(),
+        ChainError::StoreFull {
+            max: MAX_RETAINED_CHAINS as u32
+        }
+    );
+    assert_eq!(
+        trust.store().chains.values().map(Vec::len).sum::<usize>(),
+        MAX_RETAINED_CHAINS
+    );
+}
+#[test]
+fn trust_store_budgets_bound_pending_records_and_never_drop_tombstones() {
+    let (root, _, chain, roots) = fixture();
+    let trust = Trust::new(roots);
+    let id = chain.links()[0].id();
+    for index in 0..MAX_PENDING_REVOCATIONS {
+        trust
+            .apply(Change::Revoke(Revocation::issue(&budget_key(index), id)))
+            .unwrap();
+    }
+    trust
+        .apply(Change::Revoke(Revocation::issue(&budget_key(0), id)))
+        .unwrap();
+    assert_eq!(
+        trust
+            .apply(Change::Revoke(Revocation::issue(
+                &budget_key(MAX_PENDING_REVOCATIONS),
+                id
+            )))
+            .unwrap_err(),
+        ChangeError::PendingRevocationsFull {
+            max: MAX_PENDING_REVOCATIONS
+        }
+    );
+    assert_eq!(
+        trust
+            .store()
+            .revoked
+            .pending
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum::<usize>(),
+        MAX_PENDING_REVOCATIONS
+    );
+    trust
+        .apply(Change::Revoke(Revocation::issue(&root, id)))
+        .unwrap();
+    assert!(trust.store().revoked.pending.is_empty());
+    assert_eq!(
+        trust.insert(chain).unwrap_err(),
+        ChainError::Revoked { at: 0 }
+    );
 }

@@ -19,20 +19,37 @@ impl Revoked {
     pub(super) fn new() -> Self {
         Self::default()
     }
-    pub(super) fn add(&mut self, revocation: &super::Revocation, roots: &Roots) {
+    pub(super) fn add(
+        &mut self,
+        revocation: &super::Revocation,
+        authoritative: bool,
+    ) -> Result<(), super::ChangeError> {
         let id = revocation.certificate();
         if self.accepted.contains(&id) {
-            return;
+            return Ok(());
         }
-        if roots.contains(&revocation.revoker()) {
+        if authoritative {
             self.accepted.insert(id);
             self.pending.remove(&id);
         } else {
+            let duplicate = self
+                .pending
+                .get(&id)
+                .is_some_and(|keys| keys.contains(&revocation.revoker()));
+            if !duplicate
+                && self.pending.values().map(BTreeSet::len).sum::<usize>()
+                    >= super::MAX_PENDING_REVOCATIONS
+            {
+                return Err(super::ChangeError::PendingRevocationsFull {
+                    max: super::MAX_PENDING_REVOCATIONS,
+                });
+            }
             self.pending
                 .entry(id)
                 .or_default()
                 .insert(revocation.revoker());
         }
+        Ok(())
     }
     pub(super) fn trust_roots(&mut self, roots: &Roots) {
         self.pending.retain(|id, revokers| {
@@ -304,6 +321,12 @@ pub enum Widening {
     Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, postcard_schema::Schema,
 )]
 pub enum ChainError {
+    /// The total retained-chain budget is full.
+    #[error("the retained chain budget of {max} chains is full")]
+    StoreFull {
+        /// Maximum retained chains.
+        max: u32,
+    },
     /// The offered chain lost the per-holder retention comparison.
     #[error("the offered chain was not retained")]
     NotRetained,
