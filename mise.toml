@@ -303,6 +303,11 @@ run = [
     # `tests/blobs.rs` under `mod on_disk`, compiled out of the commands above,
     # and this one turns the feature on and runs exactly them.
     "cargo test -p keylink --features blobs-fs --test blobs on_disk_ --no-fail-fast",
+    # The library's own `blobs` unit tests at the same feature: some exist only
+    # with a file store (`a_store_that_has_shut_down_is_not_alive` among them), and
+    # the first command above compiles the library without it, so without this
+    # line no gate step would run them.
+    "cargo test -p keylink --features blobs-fs --lib blobs:: --no-fail-fast",
     "cargo test --workspace --doc --no-fail-fast",
 ]
 
