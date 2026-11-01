@@ -96,23 +96,29 @@ impl Store {
         standing(chain, &self.roots, &mut self.revoked, now)
     }
 
-    fn credential(
+    fn credentials(
         &mut self,
         peer: PublicKey,
         now: Timestamp,
         permits: impl Fn(&Credential) -> bool,
-    ) -> Option<Arc<Credential>> {
+    ) -> Vec<Arc<Credential>> {
+        let mut candidates = Vec::new();
         if self.roots.contains(&peer) {
             let credential = Credential::root(peer);
-            return permits(&credential).then(|| Arc::new(credential));
+            if permits(&credential) {
+                candidates.push(Arc::new(credential));
+            }
         }
-        self.chains
-            .get(&peer)?
-            .iter()
-            .find(|c| {
-                standing(c.chain(), &self.roots, &mut self.revoked, now).is_ok() && permits(c)
-            })
-            .cloned()
+        if let Some(chains) = self.chains.get(&peer) {
+            for credential in chains {
+                if standing(credential.chain(), &self.roots, &mut self.revoked, now).is_ok()
+                    && permits(credential)
+                {
+                    candidates.push(credential.clone());
+                }
+            }
+        }
+        candidates
     }
 }
 #[derive(Debug)]
@@ -221,9 +227,10 @@ impl Trust {
         }
     }
     fn admitting(&self, peer: PublicKey) -> bool {
-        self.store()
-            .credential(peer, Timestamp::now(), |_| true)
-            .is_some()
+        !self
+            .store()
+            .credentials(peer, Timestamp::now(), |_| true)
+            .is_empty()
     }
     fn permitting(
         &self,
@@ -231,9 +238,9 @@ impl Trust {
         now: Timestamp,
         resource: Option<&str>,
         operation: &str,
-    ) -> Option<Arc<Credential>> {
+    ) -> Vec<Arc<Credential>> {
         self.store()
-            .credential(peer, now, |c| c.permits(resource, operation))
+            .credentials(peer, now, |c| c.permits(resource, operation))
     }
 }
 

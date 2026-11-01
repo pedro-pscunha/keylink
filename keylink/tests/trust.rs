@@ -456,3 +456,49 @@ async fn revoking_the_selected_chain_during_access_refuses_dispatch() {
     release.notify_one();
     denied(pending.await.unwrap().unwrap_err());
 }
+
+#[tokio::test]
+async fn a_forbidden_principal_does_not_mask_an_authorized_candidate() {
+    struct PrincipalAccess(keylink::EndpointId);
+    impl Access for PrincipalAccess {
+        async fn authorize(&self, call: Call<'_>) -> Result<(), AccessError> {
+            if call.credential.principal() == self.0 {
+                Ok(())
+            } else {
+                Err(AccessError::Forbidden)
+            }
+        }
+    }
+    struct PrincipalMethods(keylink::EndpointId);
+    impl methods::Handler for PrincipalMethods {
+        async fn read(&self, cx: &Context) -> u64 {
+            assert_eq!(cx.credential().unwrap().principal(), self.0);
+            7
+        }
+    }
+    let a = SecretKey::from_bytes(&[10; 32]);
+    let b = SecretKey::from_bytes(&[11; 32]);
+    let device = SecretKey::from_bytes(&[12; 32]);
+    let trust = Trust::new(Roots::only([a.public(), b.public()]).unwrap());
+    for root in [&a, &b] {
+        trust
+            .insert(Chain::new(vec![Certificate::issue(
+                root,
+                grant(device.public(), "repo/a", 0),
+            )
+            .unwrap()]))
+            .unwrap();
+    }
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<methods::Request, _>(PrincipalAccess(b.public()))
+        .resource(resource)
+        .install(|allow| methods::service(PrincipalMethods(b.public()), allow))
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    assert_eq!(client.read().await.unwrap(), 7);
+}

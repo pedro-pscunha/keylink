@@ -29,7 +29,9 @@ pub enum AccessError {
     Unavailable,
 }
 /// Application policy after caveats and before idempotency and every layer.
-/// No panic recovery is provided.
+/// Qualifying credentials are tried until one is authorized. `Forbidden` tries
+/// the next candidate; `Unavailable` stops immediately, never disguising an
+/// outage as another principal's decision. No panic recovery is provided.
 pub trait Access: Send + Sync + 'static {
     /// Authorize one call. A refusal prevents all dispatch and layer execution.
     fn authorize(&self, call: Call<'_>) -> impl Future<Output = Result<(), AccessError>> + Send;
@@ -94,24 +96,29 @@ impl<Req: Rpc + 'static, W: Carries<Req> + Sync, A: Access> Preflight<W> for Gua
             };
             let method = request.method();
             let operation = format!("{}/{method}", Req::SERVICE);
-            let credential = self
-                .trust
-                .permitting(peer, Timestamp::now(), resource.as_deref(), &operation)
-                .ok_or_else(|| RemoteError::Unauthorized(method.to_owned()))?;
-            self.access
-                .authorize(Call {
-                    credential: &credential,
-                    service: Req::SERVICE,
-                    method,
-                    resource: resource.as_deref(),
-                })
-                .await
-                .map_err(|error| match error {
-                    AccessError::Forbidden => RemoteError::Unauthorized(method.to_owned()),
-                    AccessError::Unavailable => RemoteError::AccessUnavailable,
-                })?;
-            self.recheck(peer, request, Some(&credential))?;
-            Ok(Some(credential))
+            let candidates =
+                self.trust
+                    .permitting(peer, Timestamp::now(), resource.as_deref(), &operation);
+            for credential in candidates {
+                match self
+                    .access
+                    .authorize(Call {
+                        credential: &credential,
+                        service: Req::SERVICE,
+                        method,
+                        resource: resource.as_deref(),
+                    })
+                    .await
+                {
+                    Err(AccessError::Forbidden) => continue,
+                    Err(AccessError::Unavailable) => return Err(RemoteError::AccessUnavailable),
+                    Ok(()) => {
+                        self.recheck(peer, request, Some(&credential))?;
+                        return Ok(Some(credential));
+                    }
+                }
+            }
+            Err(RemoteError::Unauthorized(method.to_owned()))
         })
     }
     fn recheck(
