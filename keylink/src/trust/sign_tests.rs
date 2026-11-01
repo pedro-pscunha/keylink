@@ -7,7 +7,7 @@ fn a_signed_noncanonical_value_is_not_returned() {
     let purpose = Purpose::new("claim/number").unwrap();
     let roots = Roots::only([key.public()]).unwrap();
     let body = vec![0x80, 0]; // postcard accepts this overlong encoding of zero.
-    let signature = key.sign(&signing_input(Kind::Application, purpose.0, &body));
+    let signature = key.sign(&application_input(&purpose, &Chain::default(), &body));
     let signed = Signed::<u64> {
         signer: key.public(),
         chain: Chain::default(),
@@ -59,4 +59,42 @@ fn signed_envelopes_and_chains_refuse_noncanonical_outer_lengths() {
             .value,
         1
     );
+}
+
+#[test]
+fn a_forwarder_cannot_substitute_another_authority_chain() {
+    use super::super::{Caveats, Certificate, Delegation};
+    let root = SecretKey::from_bytes(&[1; 32]);
+    let other_root = SecretKey::from_bytes(&[2; 32]);
+    let holder = SecretKey::from_bytes(&[3; 32]);
+    let grant = |serial| Delegation {
+        subject: holder.public(),
+        serial,
+        delegate: 0,
+        caveats: Caveats::unlimited(),
+    };
+    let original = Chain::new(vec![Certificate::issue(&root, grant(0)).unwrap()]);
+    let renewed = Chain::new(vec![Certificate::issue(&root, grant(1)).unwrap()]);
+    let another_principal = Chain::new(vec![Certificate::issue(&other_root, grant(0)).unwrap()]);
+    let purpose = Purpose::new("claim/read").unwrap();
+    let roots = Roots::only([root.public(), other_root.public(), holder.public()]).unwrap();
+    let signed = Signed::sign(&holder, &purpose, &7u64, original).unwrap();
+    assert_eq!(
+        signed
+            .open(&purpose, &roots, Timestamp::from_unix_secs(1))
+            .unwrap()
+            .value,
+        7
+    );
+    for chain in [renewed, another_principal, Chain::default()] {
+        let mut substituted = signed.clone();
+        substituted.chain = chain;
+        let forwarded = Signed::<u64>::from_bytes(&substituted.to_bytes()).unwrap();
+        assert_eq!(
+            forwarded
+                .open(&purpose, &roots, Timestamp::from_unix_secs(1))
+                .unwrap_err(),
+            SignedError::BadSignature
+        );
+    }
 }

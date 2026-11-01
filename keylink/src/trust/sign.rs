@@ -68,6 +68,18 @@ impl Purpose {
     }
 }
 
+// Application signatures commit to the selected authority, not just its holder.
+// The chain cap makes a single-byte count unambiguous, followed by ordered ids.
+fn application_input(purpose: &Purpose, chain: &Chain, body: &[u8]) -> Vec<u8> {
+    let mut committed = Vec::with_capacity(1 + chain.links().len() * 32 + body.len());
+    committed.push(chain.links().len() as u8);
+    for certificate in chain.links() {
+        committed.extend_from_slice(certificate.id().as_bytes());
+    }
+    committed.extend_from_slice(body);
+    signing_input(Kind::Application, purpose.0, &committed)
+}
+
 #[derive(Serialize, Deserialize)]
 struct SignedWire {
     signer: PublicKey,
@@ -81,6 +93,7 @@ struct SignedWire {
 /// `open` checks the signature before decoding the value. Values must round-trip
 /// through postcard byte for byte; a nondeterministically ordered `HashMap` may
 /// be refused as `NonCanonical`. The value's schema is not in a contract hash.
+/// The signature commits to the ordered certificate IDs of the carried chain.
 /// Freshness and replay prevention belong in the application value.
 #[derive(Debug, Clone)]
 pub struct Signed<T> {
@@ -131,7 +144,7 @@ impl<T: Serialize + DeserializeOwned> Signed<T> {
                 max: MAX_SIGNED as u32,
             });
         }
-        let signature = signer.sign(&signing_input(Kind::Application, purpose.0, &body));
+        let signature = signer.sign(&application_input(purpose, &chain, &body));
         Ok(Self {
             signer: signer.public(),
             chain,
@@ -182,7 +195,7 @@ impl<T: Serialize + DeserializeOwned> Signed<T> {
     ) -> Result<Opened<T>, SignedError> {
         self.signer
             .verify(
-                &signing_input(Kind::Application, purpose.0, &self.body),
+                &application_input(purpose, &self.chain, &self.body),
                 &self.signature,
             )
             .map_err(|_| SignedError::BadSignature)?;
