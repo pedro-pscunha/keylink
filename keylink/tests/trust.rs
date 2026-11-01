@@ -962,3 +962,98 @@ async fn revoker_exhaustion_closes_its_live_subtree_and_keeps_a_sibling_open() {
         assert_eq!(kept.read().await.unwrap(), 7);
     }
 }
+
+#[tokio::test]
+// Search `        hasher.update(&binding);`.
+// Made red with scripts/break-once.sh replacing it with `        let _ = binding;`.
+// Watched: principal B received A's applied answer (11 instead of 22) after the
+// transport ledger reported the original key Fresh.
+async fn applied_replies_keep_authority_after_the_ledger_forgets_the_key() {
+    struct PrincipalState {
+        a: keylink::EndpointId,
+        b: keylink::EndpointId,
+        applied: std::sync::Mutex<keylink::Applied<u64>>,
+    }
+    impl methods::Handler for PrincipalState {
+        async fn read(&self, cx: &Context) -> u64 {
+            let principal = cx.credential().unwrap().principal();
+            let mut applied = self.applied.lock().unwrap();
+            if let Some(&answer) = applied.get(cx.call()) {
+                return answer;
+            }
+            let answer = if principal == self.a {
+                11
+            } else {
+                assert_eq!(principal, self.b);
+                22
+            };
+            applied.insert(cx.call(), answer);
+            answer
+        }
+    }
+    let root_a = SecretKey::from_bytes(&[24; 32]);
+    let root_b = SecretKey::from_bytes(&[25; 32]);
+    let device = SecretKey::from_bytes(&[26; 32]);
+    let ca = Certificate::issue(&root_a, grant(device.public(), "repo/a", 0)).unwrap();
+    let cb = Certificate::issue(&root_b, grant(device.public(), "repo/a", 0)).unwrap();
+    let (first, selected, other) = if ca.id() < cb.id() {
+        (root_a.clone(), ca.clone(), root_b.public())
+    } else {
+        (root_b.clone(), cb.clone(), root_a.public())
+    };
+    let trust = Trust::new(Roots::only([root_a.public(), root_b.public()]).unwrap());
+    trust.insert(Chain::new(vec![ca])).unwrap();
+    trust.insert(Chain::new(vec![cb])).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<methods::Request, _>(WithinCaveats)
+        .resource(resource)
+        .install(|allow| {
+            methods::service(
+                PrincipalState {
+                    a: first.public(),
+                    b: other,
+                    applied: std::sync::Mutex::new(keylink::Applied::new()),
+                },
+                allow,
+            )
+        })
+        .limits(
+            keylink::Limits::default()
+                .pool_records(std::num::NonZeroUsize::new(1).unwrap())
+                .tombstones(std::num::NonZeroUsize::new(1).unwrap()),
+        )
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let key = keylink::IdempotencyKey::new("applied-principal").unwrap();
+    let keyed = client.with_idempotency(key.clone());
+    assert_eq!(keyed.read().await.unwrap(), 11);
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(&first, selected.id())))
+        .unwrap()
+        .is_empty());
+    for next in ["churn-one", "churn-two"] {
+        assert_eq!(
+            client
+                .with_idempotency(keylink::IdempotencyKey::new(next).unwrap())
+                .read()
+                .await
+                .unwrap(),
+            22
+        );
+    }
+    assert_eq!(
+        client.key_state(key).await.unwrap(),
+        keylink::KeyState::Fresh
+    );
+    assert_eq!(client.read().await.unwrap(), 22);
+    assert_eq!(
+        keyed.read().await.unwrap(),
+        22,
+        "the new principal runs rather than receiving A's applied answer"
+    );
+}

@@ -337,9 +337,10 @@ impl Trust {
                 closed.insert(id);
             }
         }
-        // TODO: wire the separate Blobs::revoke_peer capability for every
-        // affected holder, including inactive ones. `closed` names only live
-        // connections; closing RPC alone does not retract prior blob grants.
+        // TODO: wire Blobs::revoke_peer on every mutation/promotion/exhaustion,
+        // including an apply that returns Err. Revoke grants for every affected
+        // holder, including still-admitted holders with narrowed authority and
+        // disconnected holders. `closed` alone is not that complete set.
         closed.into_iter().collect()
     }
     fn current(&self, credential: &Credential, now: Timestamp) -> bool {

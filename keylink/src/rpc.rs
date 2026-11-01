@@ -721,9 +721,17 @@ where
         Err(error) => return refuse::<Resp>(&mut send, error).await,
     };
 
-    // Named BEFORE the key is consumed below, and by reference rather than by
-    // clone: this is the one place both halves of the digest exist, exactly as it
-    // is the one place both halves of a blob grant do.
+    // One commitment drives both replay stores: the transport ledger and the
+    // application's Applied state reached through Context::call.
+    let fingerprint = if request.control.idempotency.is_some() {
+        replay_binding(received_fingerprint, credential.as_deref())
+    } else {
+        [0; 32]
+    };
+
+    // Name the bound call BEFORE consuming the key below. Peer, key and the
+    // shared request/authority commitment are all available here, so handlers
+    // never have to reconstruct either replay store's identity rules.
     //
     // Computed for a key that has not been validated yet, which is harmless and
     // worth saying: `claim_key` refuses a malformed key before the chain is
@@ -735,7 +743,7 @@ where
                 .control
                 .idempotency
                 .as_ref()
-                .map(|idem| CallId::of(peer, idem.key())),
+                .map(|idem| CallId::of(peer, idem.key(), fingerprint)),
         )
         .with_credential(credential);
     // Kept while the chain runs, because the chain's own `Outcome` cannot say
@@ -750,11 +758,6 @@ where
     // and a key on any other is refused here rather than quietly dropped. An
     // UNKEYED call still costs nothing: `request.control.idempotency` is `None`, which is
     // the first thing `claim_key` reads and the only thing it needs.
-    let fingerprint = if request.control.idempotency.is_some() {
-        replay_binding(received_fingerprint, cx.credential())
-    } else {
-        [0; 32]
-    };
     let keyed = match claim_key(
         &keys,
         message.method(),

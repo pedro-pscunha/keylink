@@ -537,6 +537,8 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ("CA1", "keylink/tests/trust.rs", "keylink/src/call.rs",
+     "        hasher.update(&binding);"),
     ('RR1', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '            hash.update(credential.principal().as_bytes());'),
     ('RR2', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
     ('RR3', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
@@ -865,7 +867,7 @@ ANCHORS = [
     # description still locates the edit. So the choice is not fragile-vs-durable, it
     # is loud-vs-silent, and the record now says so in those terms.
     ("C13", "keylink/tests/persist.rs", "keylink/src/rpc.rs",
-     "                .map(|idem| CallId::of(peer, idem.key())),"),
+     "                .map(|idem| CallId::of(peer, idem.key(), fingerprint)),"),
     # ── three more rows that were DESCRIBED, converted after MEASURING instead of
     # re-reading. All three reasons were property-shaped and none survived a count.
     #

@@ -1358,25 +1358,21 @@ impl Serving {
 /// Made red at both ends, because two facts have to hold at once:
 ///
 /// - in `keylink/src/rpc.rs`, inside `serve_one`: make the `.map` that
-///   `.with_call(..)` wraps hash a **constant** key instead of the caller's, so
-///   every one of a peer's calls shares one id. Search
-///   `                .map(|idem| CallId::of(peer, idem.key())),`
+///   `.with_call(..)` wraps hash a **constant** key instead of the caller's.
+///   Identical messages and authority then share an id for that peer. Search
+///   `                .map(|idem| CallId::of(peer, idem.key(), fingerprint)),`
 ///   and replace it — the replacement quoted because `break-once.sh` never searches
 ///   it — with
-///   `.map(|idem| { let _ = idem; CallId::of(peer, &IdempotencyKey::new("x").expect("valid")) }),`
+///   `.map(|idem| { let _ = idem; CallId::of(peer, &IdempotencyKey::new("x").expect("valid"), fingerprint) }),`
 ///   Watched: `a different key from the same peer must be applied, not recognised`,
-///   `left: 50`, `right: 57`. The sentence is recorded beside the values because the
+///   The bound-call revision uses identical 50-credit messages to isolate the
+///   key contribution; its replayed break observed `left: 50`, `right: 100`. The sentence is recorded beside the values because the
 ///   values alone cannot tell this assertion from a new one added above it.
 ///
-///   **Quoted rather than described, and the reason is which failure shape you get,
-///   not how durable the anchor is.** That `.map` sits inside a five-line chain
-///   `rustfmt` owns the wrapping of; giving `CallId::of` a third argument — the
-///   likeliest future edit there — reflows it and the one-line anchor stops
-///   existing. That is **count 0, which `mise run anchors` reports loudly** and
-///   sends the reader to re-quote it. Describing it survives the reflow and
-///   **removes the row from the gate**, after which nothing checks that the
-///   description still locates the edit. A loud failure that gets followed beats a
-///   silent survival nobody verifies.
+///   The binding argument is now present. The guard deliberately uses identical
+///   request bytes for the two keys, so removing the key cannot be masked by a
+///   different request commitment. Its single-line anchor remains quoted and is
+///   re-checked after formatting rather than silently becoming a description.
 /// - in `keylink/src/middleware.rs`, make `Context::call`'s body answer nothing —
 ///   search for `        self.call` **with its indentation AND its trailing
 ///   newline** — the newline is load-bearing and no other record in this repo
@@ -1461,10 +1457,10 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
         client
             .with_idempotency(another)
             .at(actor.clone())
-            .credit(7)
+            .credit(50)
             .await
             .expect("the keyed actor answers"),
-        57,
+        100,
         "a different key from the same peer must be applied, not recognised",
     );
     assert_eq!(client.at(actor.clone()).runs().await.expect("answers"), 2,);
@@ -1482,7 +1478,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
             .credit(50)
             .await
             .expect("the keyed actor answers"),
-        107,
+        150,
         "a peer that reconnected on a new keypair is not recognised, and the \
          work runs again — silently, which is the limit and not a defect",
     );
