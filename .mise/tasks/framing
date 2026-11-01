@@ -197,63 +197,81 @@ fi
 # found at merge review, in a comment of this task that claimed the import check
 # was enough.
 #
-# This is the call-site check for those. It matches the call by its arguments
-# (`Seq::..` or a variable named `seq`, `from`) rather than by name alone, so an
-# unrelated `Vec::append` or `.recover(` of something else is not caught, and it
-# runs multi-line because rustfmt puts a long call's arguments on the next line.
-# Watched failing twice: a raw `.append(` in a new file under `keylink/tests` is
-# reported with its line, and a pattern edited to match nothing fails the self-check
-# below instead of passing.
+# This is the call-site check for those. Watched failing: a raw `.append(` in a new
+# file under `keylink/tests` is reported with its line, and a pattern edited to
+# match nothing fails the self-check below instead of passing.
+#
+# **It matches the call's SHAPE, not the names of its arguments.** An earlier
+# version recognised a first argument spelled `Seq::..`, `seq` or `from`, and
+# `claim.append(position, bytes)` walked past it. Now: any `.truncate_before(` or
+# `.recover(`, and any `.append(` with two arguments (a claim's, and not a `Vec`'s,
+# which takes one). It runs multi-line, because rustfmt puts a long call's
+# arguments on the next line.
+#
+# `HeaderMap::append(name, value)` also has two arguments, so the scan is limited
+# to files that mention `keylink_persist` at all: a file that has never heard of
+# the port cannot be calling it. A file that uses both and trips this takes the
+# allowlist below, with a reason.
+#
 # The files that may call are the ones that ARE the framing, or test it:
 #
 #   versioned.rs        the one framed writer of records
 #   file.rs             the adapter; its tests drive the raw port on purpose
 #   representability.rs the compile-time probes
 #   tests/versioned.rs  the frame and the log, from outside
-journal_call='\.(append|truncate_before|recover)\(\s*(Seq::|seq\b|from\b)'
+journal_call='\.(truncate_before|recover)\(|\.append\((?:[^(),;]|\([^()]*\))+,'
 
-# `journal_calls <path> [rg flags...]`: the pattern is passed with `-e` so that the
-# path, which comes first here, is not read as the pattern.
+# `journal_calls <path> [rg flags...]`
 journal_calls() {
     local target="$1"
     shift
-    scan -U --line-number --glob '*.rs' "$@" -e "$journal_call" "$target" \
-        | uncommented
+    local files list=() file
+    files="$(scan --files-with-matches --glob '*.rs' "$@" -e 'keylink_persist' "$target")"
+    [[ -z "$files" ]] && return 0
+    while IFS= read -r file; do
+        list+=("$file")
+    done <<<"$files"
+    scan -U --line-number -e "$journal_call" "${list[@]}" | uncommented
 }
 
 # **The detector is tried on a known-bad file every run**, because a guard that has
 # not been watched failing is not a guard, and this one is a regular expression
-# over text. An implementor file with a raw append and a raw cut must be caught,
-# and a file that only DEFINES the methods must not be.
+# over text. An implementor file with raw calls spelled with ordinary names must be
+# caught, and a file that only DEFINES the methods (and uses `Vec::append`) must
+# not be.
 selfcheck="$(mktemp -d)"
 trap 'rm -rf "$selfcheck"' EXIT
 cat >"$selfcheck/bad.rs" <<'RS'
+use keylink_persist::Claim;
 struct Mine;
 impl Claim for Mine {
     async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> { Ok(()) }
 }
-async fn unframed(claim: &mut Mine) {
-    claim.append(Seq::new(1), b"x").await.ok();
+async fn unframed(claim: &mut Mine, position: Seq, cutoff: Seq, next: Seq) {
+    claim.append(position, b"x").await.ok();
     claim
         .truncate_before(
-            Seq::new(1),
+            cutoff,
         )
         .await
         .ok();
+    claim.recover(next).await.ok();
 }
 RS
 cat >"$selfcheck/clean.rs" <<'RS'
+use keylink_persist::Claim;
 struct Mine;
 impl Claim for Mine {
     async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> { Ok(()) }
     async fn recover(&mut self, from: Seq) -> Result<Tail> { Ok(Tail::default()) }
 }
+fn unrelated(mut a: Vec<u8>, mut b: Vec<u8>) { a.append(&mut b); }
 RS
 caught="$(journal_calls "$selfcheck/bad.rs" | wc -l | tr -d ' ')"
 missed="$(journal_calls "$selfcheck/clean.rs" | wc -l | tr -d ' ')"
-if [[ "$caught" -lt 2 || "$missed" -ne 0 ]]; then
+if [[ "$caught" -lt 3 || "$missed" -ne 0 ]]; then
     fail=1
-    echo "── the journal-call check's own self-test failed: it caught $caught of 2 raw calls" >&2
+    echo "── the journal-call check's own self-test failed: it caught $caught of 3 raw calls" >&2
     echo "   in a file built to contain them, and flagged $missed lines in a file that only" >&2
     echo "   defines the methods. The pattern or the scan is broken." >&2
 fi
@@ -263,8 +281,7 @@ raw_journal="$(
         --glob '!keylink-persist/src/versioned.rs' \
         --glob '!keylink-persist/src/file.rs' \
         --glob '!keylink-persist/src/representability.rs' \
-        --glob '!keylink-persist/tests/versioned.rs' \
-        || true
+        --glob '!keylink-persist/tests/versioned.rs'
 )"
 
 if [[ -n "$raw_journal" ]]; then
