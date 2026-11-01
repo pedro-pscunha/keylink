@@ -15,6 +15,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use keylink::{
     Allowlist, Backpressure, Body, BodyReader, Caller, Context, Middleware, Next, Observer,
@@ -60,12 +61,25 @@ struct Ledger {
     /// Set on entry to a turn and cleared on exit. If two turns ever overlap,
     /// the second one sees it set.
     inside: bool,
+    /// `None` for every test that does not hold a turn open. A `post` waits for
+    /// a permit here before it holds, so a test keeps the actor busy for exactly
+    /// as long as it needs: the tests that queue a message behind a turn used to
+    /// hold it for a fixed time, and a loaded machine spent that time before
+    /// the message was even sent.
+    release: Option<Arc<Semaphore>>,
 }
 
 impl ledger::Actor for Ledger {
     async fn post(&mut self, _cx: Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
         assert!(!self.inside, "two turns overlapped");
         self.inside = true;
+        if let Some(release) = &self.release {
+            release
+                .acquire()
+                .await
+                .expect("the test never closes the semaphore")
+                .forget();
+        }
         // `&mut self` is held across an await. Under the concurrent model this
         // is where `clippy::await_holding_lock` would stop the build.
         n0_future::time::sleep(Duration::from_millis(hold_ms)).await;
@@ -128,6 +142,46 @@ async fn served() -> (Server, ledger::Handle<Ledger>, ledger::Client) {
         .await
         .expect("dials");
     (server, actor, client)
+}
+
+/// Wait until the actor is inside a turn.
+///
+/// Asked of the actor, never assumed from a sleep: a message sent before this
+/// returns can race the turn it means to queue behind. Bounded, so a turn that
+/// never starts is a red test and not a hung one.
+async fn until_busy(actor: &ledger::Handle<Ledger>) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !actor.status().busy {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the held turn entered the actor within 30 s");
+}
+
+/// Let the held turn go, but only once a message is queued behind it and its
+/// budget has provably run out.
+///
+/// The budget is measured from the message's arrival, which is before it sits in
+/// the mailbox, so waiting `2 * budget` after the mailbox holds it is a lower
+/// bound that load can only lengthen. Nothing here asserts a duration; the clock
+/// decides only *when* the turn is let go, and the order (queued, expired,
+/// released) is what the tests below read their answers from.
+async fn release_after_the_queued_budget(
+    actor: &ledger::Handle<Ledger>,
+    release: &Semaphore,
+    budget: Duration,
+) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while actor.status().queued != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second message reached the mailbox within 30 s");
+    tokio::time::sleep(budget * 2).await;
+    // Every turn after the held one passes too.
+    release.add_permits(16);
 }
 
 // ────────────────────────────────────────────────────────── the local handle
@@ -578,8 +632,9 @@ async fn local_and_remote_messages_share_one_mailbox() {
         })
     };
 
-    // Give the remote call time to be the one in the mailbox.
-    n0_future::time::sleep(Duration::from_millis(20)).await;
+    // The remote call must be the one inside the turn, or there is no order to
+    // read: asked of the actor, not slept for.
+    until_busy(&actor).await;
     let local = actor.post(2, 0).await.expect("running");
     let (remote_answer, client) = remote.await.expect("no panic");
 
@@ -680,21 +735,29 @@ async fn a_concurrent_service_refuses_status_by_name() {
 /// ten turns producing replies nobody wants. This one refuses before the work
 /// starts, so the load is genuinely shed.
 ///
-/// The proof is the run counter: one turn was held for 400 ms, the second
-/// message waited behind it with a 100 ms budget and was refused, and the
+/// The proof is the run counter: one turn was held while the second message
+/// waited behind it past its budget, the second message was refused, and the
 /// actor's own count says it ran once.
+///
+/// The turn is held by a semaphore and let go only after the second message sits
+/// in the mailbox and twice its budget has passed, so "still queued when its
+/// budget expires" is an order the test makes and not a race between a 400 ms
+/// hold and the time a loaded machine takes to send the second call.
 #[tokio::test]
 async fn a_queue_timeout_refuses_before_the_mailbox() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor(Ledger::default());
+    let release = Arc::new(Semaphore::new(0));
+    let actor = ledger::actor(Ledger {
+        release: Some(release.clone()),
+        ..Ledger::default()
+    });
     let server = Server::builder(&node)
         .service(
             actor
                 .service(Allowlist::anyone())
                 .layer(
-                    keylink::QueueTimeout::try_after(Duration::from_millis(100))
-                        .expect("valid queue timeout budget"),
+                    keylink::QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"),
                 )
                 .build(),
         )
@@ -706,16 +769,15 @@ async fn a_queue_timeout_refuses_before_the_mailbox() {
 
     let held = {
         let client = client.clone();
-        tokio::spawn(async move { client.post(1, 400).await })
+        tokio::spawn(async move { client.post(1, 0).await })
     };
-    // Long enough that the first message is IN its turn, so the second one is
-    // queued behind it rather than racing it for the permit.
-    n0_future::time::sleep(Duration::from_millis(80)).await;
+    until_busy(&actor).await;
 
-    let refused = client
-        .post(2, 0)
-        .await
-        .expect_err("the second message is still queued when its budget expires");
+    let (refused, ()) = tokio::join!(
+        client.post(2, 0),
+        release_after_the_queued_budget(&actor, &release, BUDGET)
+    );
+    let refused = refused.expect_err("the second message is still queued when its budget expires");
     assert!(
         matches!(
             refused,
@@ -741,14 +803,17 @@ async fn a_queue_timeout_refuses_before_the_mailbox() {
 async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor(Ledger::default());
+    let release = Arc::new(Semaphore::new(0));
+    let actor = ledger::actor(Ledger {
+        release: Some(release.clone()),
+        ..Ledger::default()
+    });
     let server = Server::builder(&node)
         .service(
             actor
                 .service(Allowlist::anyone())
                 .layer(
-                    keylink::QueueTimeout::try_after(Duration::from_millis(100))
-                        .expect("valid queue timeout budget"),
+                    keylink::QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"),
                 )
                 .build(),
         )
@@ -761,15 +826,16 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
 
     let held = {
         let client = client.clone();
-        tokio::spawn(async move { client.post(1, 400).await })
+        tokio::spawn(async move { client.post(1, 0).await })
     };
-    n0_future::time::sleep(Duration::from_millis(80)).await;
+    until_busy(&actor).await;
 
-    let _refused = client
-        .with_idempotency(key.clone())
-        .post(2, 0)
-        .await
-        .expect_err("refused while queued");
+    let keyed = client.with_idempotency(key.clone());
+    let (refused, ()) = tokio::join!(
+        keyed.post(2, 0),
+        release_after_the_queued_budget(&actor, &release, BUDGET)
+    );
+    let _refused = refused.expect_err("refused while queued");
     assert_eq!(held.await.expect("no panic").expect("answers"), 1);
 
     assert_eq!(
@@ -784,11 +850,11 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
     server.shutdown().await.expect("stops");
 }
 
-/// The budget both bounds below are given, and a hold that outlasts it several
-/// times over. A message queued behind that hold has provably run out of budget
-/// before the actor is free again, whichever bound is in front of it.
+/// The budget the queue bounds in this section are given. The turn they queue a
+/// message behind is held until twice this has passed with the message in the
+/// mailbox, so a message queued behind it has provably run out of budget before
+/// the actor is free again, whichever bound is in front of it.
 const BUDGET: Duration = Duration::from_millis(100);
-const HOLD: u64 = 400;
 
 /// The three facts one keyed message behind a held turn leaves behind.
 ///
@@ -831,7 +897,11 @@ async fn entries_behind_a_held_turn(
 ) -> BehindAHeldTurn {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor(Ledger::default());
+    let release = Arc::new(Semaphore::new(0));
+    let actor = ledger::actor(Ledger {
+        release: Some(release.clone()),
+        ..Ledger::default()
+    });
     let server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).layer(bound).build())
         .spawn()
@@ -843,17 +913,22 @@ async fn entries_behind_a_held_turn(
 
     let held = {
         let actor = actor.clone();
-        tokio::spawn(async move { actor.post(1, HOLD).await })
+        tokio::spawn(async move { actor.post(1, 0).await })
     };
-    // Long enough that the held message is IN its turn, so the next one queues
-    // behind it rather than racing it for the permit.
-    n0_future::time::sleep(Duration::from_millis(80)).await;
+    // The held message is IN its turn, so the next one queues behind it rather
+    // than racing it for the permit.
+    until_busy(&actor).await;
 
-    let refused = client
-        .with_idempotency(key.clone())
-        .post(2, 0)
-        .await
-        .expect_err("the queued message outlives its budget behind the held turn");
+    // The turn is let go only once the second message is in the mailbox and
+    // twice `BUDGET` has passed, so both bounds' budgets have run out while it
+    // was still queued: `Timeout` has answered its caller, `QueueTimeout` has a
+    // deadline the actor will find behind it.
+    let keyed = client.with_idempotency(key.clone());
+    let (refused, ()) = tokio::join!(
+        keyed.post(2, 0),
+        release_after_the_queued_budget(&actor, &release, BUDGET)
+    );
+    let refused = refused.expect_err("the queued message outlives its budget behind the held turn");
     assert!(
         matches!(
             refused,
