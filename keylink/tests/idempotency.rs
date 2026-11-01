@@ -1894,6 +1894,14 @@ async fn a_key_state_query_cannot_read_another_peers_key() {
 /// A second caller under a live key takes the running call's answer instead of
 /// being turned away. The two replies are the same run number, and a third,
 /// keyless call reports that the handler was entered exactly twice.
+///
+/// The first call is parked on a semaphore and released only once an attacher is
+/// provably waiting (`one_attacher_waiting`). Made red by `scripts/break-once.sh`
+/// on `keylink/src/rpc.rs`, replacing `if n0_future::time::timeout(budget,
+/// notified).await.is_err() {` with `if true {` — an attach that does not wait.
+/// Watched: `the first attacher to answer must be turned away by the room for one
+/// waiter, which is what proves the other is parked`; the recordless test below
+/// goes red on the same edit.
 #[tokio::test]
 async fn a_second_caller_attaches_to_a_live_key() {
     let (fixture, release) = start_held(None).await;

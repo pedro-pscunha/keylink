@@ -1312,7 +1312,9 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// `rustfmt` wraps the struct expression and a one-line anchor inside it leaves
 /// two dangling lines. Watched: `round 1: a lost reply on a restarting actor must
 /// say so`, `left: Turn(Gone)`,
-/// `right: Turn(Restarting { reason: Panicked { .. } })`.
+/// `right: Turn(Restarting { reason: Panicked { .. } })`. Replayed on the
+/// `until_placed` rewrite of the three tests: the served twins read `round 1:
+/// expected restarting, got Remote(Withheld(Gone))`.
 ///
 /// The arm was `answered`'s copy, at sixteen spaces, and the served twin above had
 /// its own at eight. One function performs the mapping for both doors now, so this
@@ -1686,6 +1688,12 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 /// `error[E0425]: cannot find value `floor``. That is the compiler catching it,
 /// not the test, and a record that quotes a build failure is not evidence the
 /// guard works.
+///
+/// Replayed against the version that asks the mailbox (`status().queued == 1`)
+/// before it lets the factory unwind: the same disarm, `floor.disarm();` added
+/// after `let mut floor = Floor::armed(fate);` in `supervise`. Watched: `a peer
+/// whose actor died in its own factory must not be told it is serving:
+/// Remote(Withheld(Dropped))`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
     let server_node = local_node().await;

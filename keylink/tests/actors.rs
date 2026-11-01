@@ -1147,6 +1147,10 @@ async fn until_empty(system: &journal::Registry) {
 /// destroyed — is `an_eviction_whose_budget_expires_destroys_the_actor` below,
 /// and the two together are the whole of what an eviction budget means.
 ///
+/// Made red by the same `Duration::ZERO` edit to `drain` as the shutdown test
+/// below, which the sweeper also goes through. Watched: the final `unwrap` on the
+/// call's answer, on an error where the turn's 5 was expected.
+///
 /// # What decides that the turn is in flight, and what does not
 ///
 /// It was a 250 ms turn against a 30 ms `after`, with the actor mounted before
@@ -1241,6 +1245,12 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// both turns together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
 ///
+/// Made red by `scripts/break-once.sh` on `keylink/src/actor/registry.rs`,
+/// replacing `drain`'s `n0_future::time::timeout(budget, &mut task)` with the same
+/// call at `Duration::ZERO` — a shutdown that destroys the turn at once, which is
+/// what an `abort` would do. Watched: `a shutdown that drained inside its budget
+/// is Stopped, got Some(Vanished)`.
+///
 /// # Three facts observed, and no clock
 ///
 /// What must hold is an ORDER, and each step of it is a fact the test waits for
@@ -1331,8 +1341,12 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
 }
 
 /// `abort` cancels: the task's future is dropped at its await point, the state
-/// goes with it, and the mutation never happened. Made red by making `abort` an
-/// alias of a `shutdown` whose budget covers the turn.
+/// goes with it, and the mutation never happened.
+///
+/// Made red by `scripts/break-once.sh` on `keylink/src/actor/registry.rs`,
+/// deleting `Registry::abort`'s `entry.task.abort();` line, so it awaits a task
+/// nothing cancels. Watched: `abort destroyed the parked turn instead of waiting
+/// for it: Elapsed(())`, after the 120 s the call is bounded at.
 #[tokio::test]
 async fn abort_destroys_the_message_in_flight() {
     let applied = Arc::new(Mutex::new(Vec::new()));

@@ -360,7 +360,8 @@ impl AsyncRead for FailsWhenReleased {
 /// with `is_some`, so the reset fires for the one case that does not need it and
 /// never for the case that does. The exact test terminated with
 /// `Stored { bytes: 4, checksum: 14793735007222968981 }` — the handler counting a
-/// failed upload as a whole one.
+/// failed upload as a whole one. Replayed against the loop that skips repeated
+/// `Chunk` events: the same `Stored { bytes: 4, checksum: 14793735007222968981 }`.
 #[tokio::test]
 async fn an_unknown_length_source_error_resets_the_receivers_body() {
     let (report, mut progress) = tokio::sync::mpsc::unbounded_channel();

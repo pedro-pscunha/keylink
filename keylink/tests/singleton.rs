@@ -623,6 +623,12 @@ async fn an_upload_goes_to_a_second_service_beside_the_actor() {
 
 /// One mailbox, two doors. A local call and a remote call to the same actor are
 /// serialized against each other, not merely against their own kind.
+///
+/// The remote turn is parked on `Ledger::release` until the local call sits in the
+/// mailbox, so the order is the test's and not a window's. Its guard is
+/// `Ledger::post`'s `two turns overlapped` assertion, and no one-line edit of
+/// `keylink/src` splits the mailbox while leaving an actor, so no break is
+/// recorded for it.
 #[tokio::test]
 async fn local_and_remote_messages_share_one_mailbox() {
     let node = local_node().await;
@@ -762,6 +768,14 @@ async fn a_concurrent_service_refuses_status_by_name() {
 /// waited behind it past its budget, the second message was refused, and the
 /// actor's own count says it ran once.
 ///
+/// Made red by `scripts/break-once.sh` on `keylink/src/turns.rs`, replacing the
+/// expiry test in `began`, `.is_some_and(Queueing::expired);`, with
+/// `.is_some_and(|_| false);` — a queue budget nothing reads. Watched:
+/// `the second message is still queued when its budget expires: 2`. The next
+/// test and `a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it_claimable`
+/// go red on the same edit (`refused while queued: 2`, `the queued message
+/// outlives its budget behind the held turn: 2`).
+///
 /// The turn is held by a semaphore and let go only after the second message sits
 /// in the mailbox and twice its budget has passed, so "still queued when its
 /// budget expires" is an order the test makes and not a race between a 400 ms
@@ -822,6 +836,9 @@ async fn a_queue_timeout_refuses_before_the_mailbox() {
 /// The other half, and the one that makes `QueueTimeout` safe to combine with
 /// an idempotency key: a message it refuses never ran, so the key is still
 /// claimable. `Timeout` cannot promise that, because it cannot tell.
+///
+/// Made red by the `began` edit recorded on the test above. Watched:
+/// `refused while queued: 2`.
 #[tokio::test]
 async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
     let node = local_node().await;
@@ -1009,6 +1026,13 @@ async fn entries_behind_a_held_turn(
 /// nothing about the difference between the two bounds, and that difference is
 /// the whole of what `Timeout`'s and `QueueTimeout`'s rustdoc promise a reader.
 /// It is now a difference in the key and not in the work.
+///
+/// The `Timeout` half is made red by `scripts/break-once.sh` on
+/// `keylink/src/middleware.rs`, replacing `Timeout::handle`'s
+/// `n0_future::time::timeout(budget, next(cx, req, body))` with the same call at
+/// `Duration::from_secs(3600)` — a bound that never fires. Watched: `the queued
+/// message outlives its budget behind the held turn: 2`. The `QueueTimeout` half
+/// goes red on the `began` edit recorded above.
 #[tokio::test]
 async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it_claimable() {
     let timed_out = entries_behind_a_held_turn(keylink::Timeout::after(BUDGET)).await;
