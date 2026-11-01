@@ -10,6 +10,9 @@ rust-version = "1.91"
 description = "Typed peer-to-peer RPC over iroh, with a schema-derived ALPN and fail-closed authorization."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedro-pscunha/keylink"
+readme = "../README.md"
+keywords = ["p2p", "rpc", "iroh", "quic", "actor"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 default = ["blocking", "fs", "env", "persist-file"]

@@ -6,6 +6,8 @@ rust-version = "1.91"
 description = "Bounded authenticated HTTP/JSON gateway for generated Keylink services."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedro-pscunha/keylink"
+keywords = ["http", "gateway", "rpc", "keylink", "axum"]
+categories = ["network-programming", "web-programming::http-server"]
 readme = "README.md"
 
 [dependencies]

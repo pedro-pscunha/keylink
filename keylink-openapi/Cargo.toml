@@ -7,6 +7,8 @@ edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedro-pscunha/keylink"
+keywords = ["openapi", "json-schema", "keylink", "http"]
+categories = ["web-programming", "development-tools"]
 readme = "README.md"
 description = "OpenAPI 3.1 and JSON Schema documents for a keylink-http surface"
 
