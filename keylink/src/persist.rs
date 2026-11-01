@@ -212,7 +212,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// the situation the claim exists to make impossible.
 ///
 /// ```no_run
-/// # use keylink::{Caller, Persist};
+/// # use keylink::{Caller, Persist, Whole};
 /// # use keylink_persist::{Durable, RestoreError, StateId};
 /// # use keylink_persist::file::Files;
 /// # keylink::service! { service Ledger; rpc Post(entry: u64) -> u64; }
