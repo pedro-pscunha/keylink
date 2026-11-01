@@ -256,6 +256,17 @@ enum StoredSlot {
     },
 }
 
+impl StoredSlot {
+    fn recover(self, upgrade: &crate::version::UpgradeRecord) -> Slot {
+        match self {
+            Self::Plain(slot) => slot,
+            Self::Done { version, frame } => {
+                upgrade(version, &frame).map_or(Slot::Forgotten, Slot::Done)
+            }
+        }
+    }
+}
+
 /// What a stored record becomes when the process comes back.
 fn decode_slot(stored: &[u8]) -> Result<([u8; 32], StoredSlot), RecordFault> {
     let Some((version, rest)) = stored.split_first() else {
@@ -424,7 +435,7 @@ impl DurableRecords {
     /// this value is how the first one is told what it already knows.
     pub(crate) fn take_recovered(
         &self,
-        upgrade: &(dyn Fn(crate::Version, &[u8]) -> Option<Bytes> + Send + Sync),
+        upgrade: &crate::version::UpgradeRecord,
     ) -> Vec<Recovered> {
         let mut held = self
             .store
@@ -433,15 +444,7 @@ impl DurableRecords {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *held)
             .into_iter()
-            .map(|(peer, key, fingerprint, stored)| {
-                let slot = match stored {
-                    StoredSlot::Plain(slot) => slot,
-                    StoredSlot::Done { version, frame } => {
-                        upgrade(version, &frame).map_or(Slot::Forgotten, Slot::Done)
-                    }
-                };
-                (peer, key, fingerprint, slot)
-            })
+            .map(|(peer, key, fingerprint, stored)| (peer, key, fingerprint, stored.recover(upgrade)))
             .collect()
     }
 
@@ -632,6 +635,49 @@ mod versioned_records {
             decode_state(&[TAG_LEGACY_DONE, 0, 0]),
             Ok(StoredSlot::Plain(Slot::Forgotten))
         ));
+    }
+    /// Watched red by restoring unchecked current-frame reuse before decoding.
+    /// A full identity followed by zero frame bytes recovered as Done instead
+    /// of Forgotten (0 passed, 1 failed). Restored framing and payload validation.
+    #[test]
+    fn malformed_current_records_are_forgotten_before_replay() {
+        let version = crate::Version::__new(1, crate::__schema_hash::<u8>("stored/frame"));
+        let lineage = Box::leak(Box::new(crate::Lineage::new::<crate::Here<u8, u8>>(
+            "stored/frame",
+            version,
+        )));
+        let codec = lineage.records();
+        let restore = |frame: Bytes| {
+            let encoded = encode_slot(&Slot::Done(frame), version);
+            decode_slot(&encoded)
+                .expect("valid full version identity")
+                .recover(codec.upgrade.as_ref())
+        };
+        for len in 0..4 {
+            assert!(
+                matches!(restore(vec![0; len].into()), Slot::Forgotten),
+                "a valid identity followed by {len} frame bytes must be Forgotten"
+            );
+        }
+        let valid = crate::wire::encode_header(
+            Some(0),
+            None,
+            &crate::WireResponse::Call(crate::Outcome::Ok(7_u8)),
+        )
+        .expect("encodes");
+        assert!(matches!(restore(valid.clone()), Slot::Done(frame) if frame == valid));
+        let mut wrong_length = valid.to_vec();
+        wrong_length[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(restore(wrong_length.into()), Slot::Forgotten));
+        assert!(matches!(
+            restore(Bytes::from_static(&[1, 0, 0, 0, 255])),
+            Slot::Forgotten
+        ));
+        let mut trailing = valid.to_vec();
+        trailing.push(0);
+        let len = u32::try_from(trailing.len() - 4).expect("short frame");
+        trailing[..4].copy_from_slice(&len.to_le_bytes());
+        assert!(matches!(restore(trailing.into()), Slot::Forgotten));
     }
 }
 

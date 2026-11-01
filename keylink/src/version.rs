@@ -312,6 +312,13 @@ fn response_map<A, B>(
         WireResponse::KeyState(k) => WireResponse::KeyState(k),
     })
 }
+/// Only complete, bounded header frames can enter the reply ledger.
+fn frame_payload(frame: &[u8]) -> Option<&[u8]> {
+    let (prefix, payload) = frame.split_first_chunk::<4>()?;
+    let len = u32::from_le_bytes(*prefix);
+    (len <= wire::MAX_HEADER && len as usize == payload.len()).then_some(payload)
+}
+
 fn response_grant<T: crate::Granting>(response: &WireResponse<T>) -> Option<crate::BlobId> {
     match response {
         WireResponse::Call(Outcome::Ok(value)) => value.granted(),
@@ -381,7 +388,8 @@ where
                 grant: current_grant,
             });
         }
-        let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
+        let payload = frame_payload(&frame).ok_or(postcard::Error::DeserializeBadEncoding)?;
+        let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(payload)?;
         let original_grant = response_grant(&r.message);
         let (message, len, carry_body) = match response_map(r.message, P::down_response) {
             Ok(m) if response_grant(&m) == original_grant => (m, r.body_len, true),
@@ -411,8 +419,18 @@ where
     }
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes> {
-        let r = self.decode_response(frame.get(4..)?).ok()?;
-        wire::encode_header(r.body_len, r.idempotency.as_ref(), &r.message).ok()
+        let (recorded, trailing) =
+            postcard::take_from_bytes::<Envelope<WireResponse<P::Response>>>(frame_payload(frame)?)
+                .ok()?;
+        if !trailing.is_empty() {
+            return None;
+        }
+        let message = response_map(recorded.message, P::up_response).ok()?;
+        // Even the identity path must validate persisted bytes before reusing them.
+        if P::CURRENT {
+            return Some(Bytes::copy_from_slice(frame));
+        }
+        wire::encode_header(recorded.body_len, recorded.idempotency.as_ref(), &message).ok()
     }
 }
 
@@ -503,9 +521,6 @@ impl<Req: 'static, Resp: 'static> Lineage<Req, Resp> {
             current,
             #[cfg(feature = "persist")]
             upgrade: Arc::new(move |version, frame| {
-                if version == current {
-                    return Some(Bytes::copy_from_slice(frame));
-                }
                 self.entries
                     .iter()
                     .find(|entry| entry.version == version)?
@@ -703,6 +718,10 @@ mod tests {
     /// Watched red: compare only hashes in the current-version recovery fast
     /// path. The isolated test read 7 instead of the required converted 700;
     /// 0 passed, 1 failed. Restored the full identity comparison.
+    ///
+    /// That shortcut was removed for recorded-frame validation. Re-watched red
+    /// by comparing only hashes in the lineage entry lookup: 0 passed, 1 failed.
+    /// Restored full Version equality before selecting the validating codec.
     #[cfg(feature = "persist")]
     #[test]
     fn recovery_selects_the_label_even_when_shapes_have_equal_hashes() {
