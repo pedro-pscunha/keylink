@@ -368,7 +368,7 @@ impl<Req: Rpc + 'static> Compiled<Req> {
         build: impl FnOnce(Allowlist) -> ServiceBuilder<WireReq, Resp>,
     ) -> ServiceBuilder<WireReq, Resp>
     where
-        WireReq: Carries<Req> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        WireReq: Carries<Req> + DeserializeOwned + Send + Sync + 'static,
         Resp: Serialize + Granting + Send + Sync + 'static,
     {
         build(self.allow.clone())

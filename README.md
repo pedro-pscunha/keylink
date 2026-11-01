@@ -248,7 +248,7 @@ peer at runtime.
 A call that fails mid-flight leaves the caller unable to say whether it ran.
 `client.with_idempotency(key)` removes the choice between a double booking and
 no booking: the serving side records the reply under `(peer, key)` and answers
-a repeat from that record, byte for byte, without entering the handler again. Each record also binds a blake3 fingerprint of the encoded request message, including method, actor and arguments, plus the selected principal and holder. Reusing the key for different request bytes or authority returns `IdempotencyRefusal::RequestMismatch`, even if the new request is otherwise authorized. Durable records retain the same binding.
+a repeat from that record, byte for byte, without entering the handler again. Each record also binds a blake3 fingerprint of the received request-message bytes, excluding transport and retry controls, including method, actor and arguments, plus the selected principal and holder. Reusing the key for different request bytes or authority returns `IdempotencyRefusal::RequestMismatch`, even if the new request is otherwise authorized. Durable records retain the same binding.
 
 The word that does the work is *ran*. A layer that refuses a call before it
 reaches the handler leaves the key claimable, because nothing happened; one that

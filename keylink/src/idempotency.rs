@@ -2056,8 +2056,11 @@ pub(crate) enum Claim {
 /// information leak before it is a collision. It is also what makes `attach`
 /// safe for free: one peer can never wait on another peer's call.
 /// Each entry additionally commits to its request and selected authority
-/// (principal and holder). A different binding is refused before attachment or
-/// replay; the same commitment is retained by durable records.
+/// (principal and holder). Message bytes are the received encoding, excluding
+/// retry-control metadata. A different encoding, including across contract
+/// versions, is a typed mismatch even when it expresses the same logical call.
+/// A different binding is refused before attachment or replay; the same
+/// commitment is retained by durable records.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     inner: Mutex<Inner>,

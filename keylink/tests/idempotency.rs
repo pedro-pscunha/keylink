@@ -2689,3 +2689,84 @@ mod stored {
         assert_eq!(first, 1);
     }
 }
+
+keylink::service! {
+    service MapCounter;
+    rpc Observe(values: std::collections::HashMap<u32, u32>) -> u64;
+}
+struct MapCounter(Arc<AtomicU64>);
+impl map_counter::Handler for MapCounter {
+    async fn observe(&self, _cx: &Context, _values: std::collections::HashMap<u32, u32>) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+#[tokio::test]
+async fn identical_received_map_bytes_replay_despite_fresh_hashers_and_retry_controls() {
+    #[derive(Deserialize)]
+    struct Reply {
+        body_len: Option<u64>,
+        idempotency: Option<keylink::Idempotency>,
+        message: keylink::WireResponse<map_counter::Response>,
+    }
+    async fn call(
+        connection: &iroh::endpoint::Connection,
+        message: &[u8],
+        retry: keylink::Idempotency,
+    ) -> keylink::WireResponse<map_counter::Response> {
+        let mut header = postcard::to_stdvec(&(Some(0u64), Some(retry))).unwrap();
+        header.extend_from_slice(message);
+        let mut frame = (header.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&header);
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&frame).await.unwrap();
+        send.finish().unwrap();
+        let bytes = recv
+            .read_to_end(keylink::MAX_HEADER as usize + 4)
+            .await
+            .unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len(), len + 4);
+        let reply: Reply = postcard::from_bytes(&bytes[4..]).unwrap();
+        assert_eq!(reply.body_len, Some(0));
+        assert!(reply.idempotency.is_none());
+        reply.message
+    }
+    let node = local_node().await;
+    let peer = local_node().await;
+    let runs = Arc::new(AtomicU64::new(0));
+    let _running =
+        map_counter::serve(&node, MapCounter(runs.clone()), Allowlist::anyone()).unwrap();
+    let connection = peer
+        .endpoint()
+        .connect(node.endpoint().addr(), map_counter::alpn())
+        .await
+        .unwrap();
+    let values = (0..16u32).map(|n| (n, n + 1)).collect();
+    let message = postcard::to_stdvec(&keylink::WireRequest::Call(map_counter::Request::Observe {
+        values,
+    }))
+    .unwrap();
+    let key = IdempotencyKey::new("same-map-bytes").unwrap();
+    for attempt in 0..16 {
+        let retry = if attempt == 0 {
+            key.clone().into()
+        } else {
+            keylink::Idempotency::attaching_for(key.clone(), Duration::from_secs(1))
+        };
+        assert!(matches!(
+            call(&connection, &message, retry).await,
+            keylink::WireResponse::Call(Outcome::Ok(map_counter::Response::Observe(1)))
+        ));
+    }
+    // Alter the last scalar value, not transport/retry metadata. Those are
+    // different received message bytes and must never replay the first answer.
+    let mut changed = message.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        call(&connection, &changed, key.into()).await,
+        keylink::WireResponse::Call(Outcome::Err(RemoteError::Idempotency(
+            IdempotencyRefusal::RequestMismatch
+        )))
+    ));
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}

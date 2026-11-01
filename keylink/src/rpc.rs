@@ -648,7 +648,7 @@ async fn serve_one_tell<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + Serialize + DeserializeOwned + 'static,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
@@ -673,7 +673,12 @@ where
     // The body reader is handed over for symmetry with `serve_one`: a `tell`
     // carries no body today, and a future kind that does will find the seam
     // already here rather than needing the signature changed.
-    let (_outcome, _body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
+    let (_outcome, _body) = next(
+        cx,
+        message,
+        BodyReader::new(frames, request.control.body_len),
+    )
+    .await;
     let _ = blobs;
     Ok(())
 }
@@ -689,14 +694,15 @@ async fn serve_one<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + Serialize + DeserializeOwned + 'static,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
     let peer = admitted.id();
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some(request) = frames.read_header::<WireRequest<Req>>().await? else {
+    let Some((request, received_fingerprint)) = frames.read_request::<WireRequest<Req>>().await?
+    else {
         return Ok(());
     };
 
@@ -726,6 +732,7 @@ where
         .with_actor(message.actor().cloned())
         .with_call(
             request
+                .control
                 .idempotency
                 .as_ref()
                 .map(|idem| CallId::of(peer, idem.key())),
@@ -741,13 +748,10 @@ where
     //
     // `keys` is also where this service says which methods accept a key at all,
     // and a key on any other is refused here rather than quietly dropped. An
-    // UNKEYED call still costs nothing: `request.idempotency` is `None`, which is
+    // UNKEYED call still costs nothing: `request.control.idempotency` is `None`, which is
     // the first thing `claim_key` reads and the only thing it needs.
-    let fingerprint = if request.idempotency.is_some() {
-        replay_binding(
-            *blake3::hash(&postcard::to_stdvec(&message)?).as_bytes(),
-            cx.credential(),
-        )
+    let fingerprint = if request.control.idempotency.is_some() {
+        replay_binding(received_fingerprint, cx.credential())
     } else {
         [0; 32]
     };
@@ -755,7 +759,7 @@ where
         &keys,
         message.method(),
         peer,
-        request.idempotency,
+        request.control.idempotency,
         fingerprint,
     )
     .await
@@ -772,7 +776,12 @@ where
     // The fence in `grants` was taken when this stream was accepted, before the
     // request was read or the key claimed, so a revoke that lands at any point
     // after that reaches the grant this call is about to make.
-    let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
+    let (outcome, body) = next(
+        cx,
+        message,
+        BodyReader::new(frames, request.control.body_len),
+    )
+    .await;
 
     // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
     // is written, and that order is the whole property: the address reaches the
@@ -915,7 +924,7 @@ pub(crate) fn is_clean_close(error: &ConnectionError) -> bool {
 
 impl<Req, Resp> ProtocolHandler for RpcService<Req, Resp>
 where
-    Req: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
@@ -1589,7 +1598,7 @@ pub struct ServiceBuilder<Req, Resp> {
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
 where
-    Req: Rpc + Serialize + DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     /// Called by generated code. `dispatch` is the call into the user's handler.
@@ -2257,8 +2266,10 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// meant for one. A second, DIFFERENT call through the same handle is
     /// refused as [`IdempotencyRefusal::RequestMismatch`] before any recorded
     /// reply is returned. The binding covers the encoded request message,
-    /// including method, actor and arguments, and the selected credential's
-    /// principal and holder. Retries must retain both request and authority.
+    /// from the received wire bytes, excluding transport/retry controls, and the selected credential's
+    /// principal and holder. Retries must retain both message bytes and authority.
+    /// A different contract version that encodes the same call differently is
+    /// a typed mismatch; no cross-version canonicalization is performed.
     ///
     /// # Why this returns a different type
     ///
@@ -2430,7 +2441,7 @@ where
         };
         match response.message {
             WireResponse::Call(Outcome::Ok(value)) => {
-                Ok((value, BodyReader::new(frames, response.body_len)))
+                Ok((value, BodyReader::new(frames, response.control.body_len)))
             }
             // A refusal carries no body: the handler never ran, or never
             // finished, so there is nothing to stream.

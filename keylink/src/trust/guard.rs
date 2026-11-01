@@ -77,7 +77,7 @@ impl<Req: Rpc + 'static, A: Access> Guard<Req, A> {
         build: impl FnOnce(Allowlist) -> ServiceBuilder<WireReq, Resp>,
     ) -> ServiceBuilder<WireReq, Resp>
     where
-        WireReq: Carries<Req> + Serialize + DeserializeOwned + Send + Sync + 'static,
+        WireReq: Carries<Req> + DeserializeOwned + Send + Sync + 'static,
         Resp: Serialize + Granting + Send + Sync + 'static,
     {
         build(Allowlist::anyone())
