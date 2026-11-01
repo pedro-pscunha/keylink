@@ -82,14 +82,26 @@ use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 )]
 #[non_exhaustive]
 pub enum RemoteError {
-    /// The server could not convert this call across a contract version.
-    #[error("the server cannot carry this call in version {version}: {detail}")]
-    Unsupported {
-        /// The wire version that could not carry the value.
+    /// Server request conversion failed before policy, key claim or dispatch. Nothing ran.
+    #[error(
+        "the server cannot convert this request from version {version}; nothing ran: {detail}"
+    )]
+    UnsupportedRequest {
+        /// The caller's wire version.
         version: u32,
         /// The conversion's explanation.
         detail: String,
     },
+    /// The server produced a successful response but could not convert it. Work may have executed.
+    /// Retrying without an idempotency key can execute it again.
+    #[error("the server cannot carry this reply in version {version}; the call may have executed: {detail}")]
+    UnsupportedResponse {
+        /// The caller's wire version.
+        version: u32,
+        /// The conversion's explanation.
+        detail: String,
+    },
+
     /// The peer is known, but not for this method.
     #[error("unauthorized: {0}")]
     Unauthorized(String),

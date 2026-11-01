@@ -701,7 +701,7 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
             anyhow::ensure!(count == items.len() as u64, "Count disagreed with List");
             println!("count       -> {count}");
         }
-        Err(keylink::Error::Unsupported { version, source })
+        Err(keylink::Error::UnsupportedRequest { version, source })
             if version.label() == 2 && source.method() == "Count" =>
         {
             println!("count       -> Unsupported ({source})")

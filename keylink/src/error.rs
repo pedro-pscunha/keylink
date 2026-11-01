@@ -324,12 +324,25 @@ pub enum Error {
     #[error("{0}")]
     SchemaMismatch(Box<crate::Mismatch>),
 
-    /// The negotiated version cannot carry this call.
-    #[error("the peer speaks {version}, which cannot carry this call: {source}")]
-    Unsupported {
+    /// Request conversion failed locally. No stream was opened and nothing was sent.
+    #[error(
+        "the peer speaks {version}, which cannot carry this request; nothing was sent: {source}"
+    )]
+    UnsupportedRequest {
         /// The negotiated version.
         version: crate::Version,
-        /// Why the conversion refused the value.
+        /// Why the request conversion refused the value.
+        source: crate::Unsupported,
+    },
+    /// A reply arrived but cannot be converted. The call was sent and may have executed.
+    /// Do not retry on the assumption that nothing ran; use an idempotency key.
+    #[error(
+        "the peer speaks {version}; the call was sent but its reply cannot be converted: {source}"
+    )]
+    UnsupportedResponse {
+        /// The negotiated version.
+        version: crate::Version,
+        /// Why the reply conversion refused the value.
         source: crate::Unsupported,
     },
 
@@ -528,7 +541,9 @@ impl From<crate::wire::HeaderError> for Error {
 impl From<TellError> for Error {
     fn from(error: TellError) -> Self {
         match error {
-            TellError::Unsupported { version, source } => Self::Unsupported { version, source },
+            TellError::Unsupported { version, source } => {
+                Self::UnsupportedRequest { version, source }
+            }
             TellError::Connection(source) => Self::from(source),
             TellError::Codec(source) => Self::Codec(source),
             TellError::FrameTooLarge { len, cap } => Self::FrameTooLarge { len, cap },

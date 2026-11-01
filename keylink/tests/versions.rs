@@ -53,6 +53,9 @@ mod v3 {
             use ledger::{version_2::Request as Old, Request as New};
             match old {
                 Old::Get { id } => Ok(New::Get { id }),
+                Old::Add { entry } if entry.qty == 15 => {
+                    Err(Unsupported::new("Add", "request refused by conversion"))
+                }
                 Old::Add { entry } => Ok(New::Add {
                     entry: Entry {
                         qty: entry.qty,
@@ -89,6 +92,7 @@ mod v3 {
                     qty: e.qty,
                     memo: None,
                 }))),
+                Old::Add(13) => Err(Unsupported::new("Add", "reply upgrade refused")),
                 Old::Add(n) => Ok(New::Add(n)),
                 _ => Err(Unsupported::new("Note", "carried by generated arms")),
             }
@@ -99,6 +103,7 @@ mod v3 {
             use ledger::{version_2::Response as Old, Response as New};
             match new {
                 New::Get(entry) => Ok(Old::Get(entry.map(|e| v2::Entry { qty: e.qty }))),
+                New::Add(14) => Err(Unsupported::new("Add", "reply downgrade refused")),
                 New::Add(n) => Ok(Old::Add(n)),
                 _ => Err(Unsupported::new("Purge", "version 2 has no such method")),
             }
@@ -128,8 +133,9 @@ impl v3::ledger::Handler for Current {
     }
     async fn add(&self, _cx: &keylink::Context, entry: v3::Entry) -> u64 {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let answer = if entry.qty == 14 { 14 } else { 1 };
         *self.added.lock().unwrap() = Some(entry);
-        1
+        answer
     }
     async fn note(&self, _cx: &keylink::Context, _line: String) {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -165,9 +171,13 @@ impl v2::ledger::Handler for Older {
         self.0.fetch_add(1, Ordering::SeqCst);
         Some(v2::Entry { qty: 7 })
     }
-    async fn add(&self, _cx: &keylink::Context, _entry: v2::Entry) -> u64 {
+    async fn add(&self, _cx: &keylink::Context, entry: v2::Entry) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst);
-        1
+        if entry.qty == 13 {
+            13
+        } else {
+            1
+        }
     }
     async fn note(&self, _cx: &keylink::Context, _line: String) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -216,7 +226,7 @@ async fn a_newer_client_speaks_the_older_version_to_an_older_server() {
         c.get(1).await.unwrap(),
         Some(v3::Entry { qty: 7, memo: None })
     );
-    let Err(Error::Unsupported { version, source }) = c.purge().await else {
+    let Err(Error::UnsupportedRequest { version, source }) = c.purge().await else {
         panic!("Purge must be refused locally")
     };
     assert_eq!(version.label(), 2);
@@ -516,4 +526,60 @@ mod chain {
         assert_eq!(c.version().label(), 1);
         assert_eq!(c.echo(17).await.unwrap(), 17);
     }
+}
+
+/// Watched red: classify a client reply conversion as an unsent request.
+/// This isolated test failed after the old handler ran once: 0 passed, 1 failed.
+/// Restored the separate response error.
+#[tokio::test]
+async fn conversion_failures_name_the_execution_stage() {
+    let server = node().await;
+    let peer = node().await;
+    let old_handler = Older::default();
+    let _old_server = v2::ledger::serve(&server, old_handler.clone(), Allowlist::anyone()).unwrap();
+    let newer = v3::ledger::Client::connect(&peer, server.endpoint().addr())
+        .await
+        .unwrap();
+    assert!(matches!(
+        newer
+            .add(v3::Entry {
+                qty: 13,
+                memo: None
+            })
+            .await,
+        Err(Error::UnsupportedResponse { .. })
+    ));
+    assert_eq!(
+        old_handler.0.load(Ordering::SeqCst),
+        1,
+        "a reply conversion error does not mean nothing ran"
+    );
+    let server = node().await;
+    let current = Current::default();
+    let _new_server = v3::ledger::serve(&server, current.clone(), Allowlist::anyone()).unwrap();
+    let older = v2::ledger::Client::connect(&peer, server.endpoint().addr())
+        .await
+        .unwrap();
+    let key = keylink::IdempotencyKey::new("unconvertible-request").unwrap();
+    assert!(matches!(
+        older
+            .with_idempotency(key.clone())
+            .add(v2::Entry { qty: 15 })
+            .await,
+        Err(Error::Remote(
+            keylink::RemoteError::UnsupportedRequest { .. }
+        ))
+    ));
+    assert_eq!(current.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        older.key_state(key).await.unwrap(),
+        keylink::KeyState::Fresh
+    );
+    assert!(matches!(
+        older.add(v2::Entry { qty: 14 }).await,
+        Err(Error::Remote(
+            keylink::RemoteError::UnsupportedResponse { .. }
+        ))
+    ));
+    assert_eq!(current.calls.load(Ordering::SeqCst), 1);
 }

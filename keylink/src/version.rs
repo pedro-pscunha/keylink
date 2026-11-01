@@ -314,19 +314,21 @@ where
         idem: Option<&Idempotency>,
         r: WireRequest<Req>,
     ) -> Result<Bytes> {
-        let message = request_map(r, P::down_request).map_err(|source| Error::Unsupported {
-            version: self.version,
-            source,
-        })?;
+        let message =
+            request_map(r, P::down_request).map_err(|source| Error::UnsupportedRequest {
+                version: self.version,
+                source,
+            })?;
         Ok(wire::encode_header(body_len, idem, &message)?)
     }
     fn decode_response(&self, bytes: &[u8]) -> Result<Envelope<WireResponse<Resp>>> {
         let r: Envelope<WireResponse<P::Response>> = postcard::from_bytes(bytes)?;
-        let message =
-            response_map(r.message, P::up_response).map_err(|source| Error::Unsupported {
+        let message = response_map(r.message, P::up_response).map_err(|source| {
+            Error::UnsupportedResponse {
                 version: self.version,
                 source,
-            })?;
+            }
+        })?;
         Ok(Envelope {
             message,
             body_len: r.body_len,
@@ -344,7 +346,7 @@ where
                 body_len: r.body_len,
                 idempotency: r.idempotency,
             })
-            .map_err(|e| RemoteError::Unsupported {
+            .map_err(|e| RemoteError::UnsupportedRequest {
                 version: self.version.label,
                 detail: e.to_string(),
             }))
@@ -357,7 +359,7 @@ where
         let (message, len, carry_body) = match response_map(r.message, P::down_response) {
             Ok(m) => (m, r.body_len, true),
             Err(e) => (
-                WireResponse::Call(Outcome::Err(RemoteError::Unsupported {
+                WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
                     version: self.version.label,
                     detail: e.to_string(),
                 })),
@@ -612,7 +614,10 @@ mod tests {
         assert_eq!(reply.body_len, Some(0));
         assert!(matches!(
             reply.message,
-            WireResponse::Call(Outcome::Err(RemoteError::Unsupported { version: 2, .. }))
+            WireResponse::Call(Outcome::Err(RemoteError::UnsupportedResponse {
+                version: 2,
+                ..
+            }))
         ));
     }
     /// Watched red: compare only hashes in the current-version recovery fast

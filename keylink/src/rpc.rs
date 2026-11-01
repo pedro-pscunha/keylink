@@ -2740,7 +2740,7 @@ where
             .codec
             .encode_request(Some(0), None, WireRequest::Call(request))
             .map_err(|error| match error {
-                Error::Unsupported { version, source } => {
+                Error::UnsupportedRequest { version, source } => {
                     crate::TellError::Unsupported { version, source }
                 }
                 Error::Codec(error) => crate::TellError::Codec(error),
