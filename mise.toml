@@ -322,6 +322,7 @@ run = [
     "cargo run -p keylink --example durable_ledger",
     "cargo run -p keylink --example replay_guard",
     "cargo run -p keylink --example gatehouse",
+    "cargo run -p keylink --example trust_chain",
     "cargo run -p keylink --example toll_booth",
     "cargo run -p keylink --example control_room",
     "cargo run -p keylink --example noticeboard",

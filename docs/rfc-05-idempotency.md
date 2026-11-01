@@ -644,3 +644,14 @@ shares moves both pins, and a change to one service's own types moves exactly on
 mailbox, so no turn runs and no ledger entry is written or released — the same position
 `Reentrant` occupies. A peer that meets `MailboxFull` may safely retry the identical key
 after a backoff, because the key was never claimed.
+
+
+## 16. Revision: call identities include the replay binding
+
+The trust integration changes the identity of a replay. A ledger still looks up a slot by service, peer and caller key, but that slot now retains a commitment to the received request-message bytes and selected principal and holder. A different commitment is refused rather than answered from the slot. Transport and retry controls are excluded from the commitment.
+
+`CallId` must identify that same bound call, not only its lookup slot. Otherwise an `Applied<T>` that survives a transport-ledger eviction or restart can hand principal A's recorded answer to an identical request newly authorized as principal B. The v2 ID derives sixteen bytes from peer, key and the ledger commitment under a distinct blake3 derive-key context. Both replay stores therefore agree: identical bytes and authority dedupe; a different bound call cannot inherit the old applied answer.
+
+The method, actor and arguments are covered by the received-message commitment. Service remains the namespace of the state owning `Applied`; sharing an applied set across service namespaces remains unsupported. Another contract encoding changes the call identity even when an application regards it as the same logical operation. Applications needing semantic dedupe across encodings or authority changes must carry their own operation identity and reconciliation policy.
+
+The old peer/key-only IDs cannot be migrated from their opaque digest alone. This repository has no production state to preserve; old application snapshots need an explicit reset or reconciliation before adopting the bound algorithm. No compatibility fallback reuses an unbound cached answer.

@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Context, Departure, IdempotencyKey, KeyState,
-    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH, MAX_HEADER,
-    MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
+    LiveConnection, Peer, ProvenPeer, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH,
+    MAX_HEADER, MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -73,7 +73,7 @@ impl orders::Handler for Desk {
 ///
 /// Two jobs, both needed to make "it reconnected" a fact: `admits` runs once per
 /// connection, so a count of calls is a count of handshakes; and `admitted`
-/// hands over a [`Revocation`], which is how the serving side closes a live
+/// hands over a [`LiveConnection`], which is how the serving side closes a live
 /// connection without shutting the service — and therefore its ledger — down.
 struct Gate {
     allow: Allowlist,
@@ -81,7 +81,7 @@ struct Gate {
     /// Woken on every count, so a test waits for the serving side to have seen
     /// a handshake instead of assuming it already has.
     counted: tokio::sync::Notify,
-    live: Mutex<Option<Revocation>>,
+    live: Mutex<Option<LiveConnection>>,
 }
 
 impl Gate {
@@ -126,7 +126,7 @@ impl Gate {
 
     /// Poison recovery rather than propagation: nothing here can panic while
     /// the lock is held.
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Revocation>> {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<LiveConnection>> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -142,7 +142,7 @@ impl Admission for Gate {
         }
     }
 
-    fn admitted(&self, _peer: &AdmittedPeer, live: Revocation) {
+    fn admitted(&self, _peer: &AdmittedPeer, live: LiveConnection) {
         *self.slot() = Some(live);
     }
 }

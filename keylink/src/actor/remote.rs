@@ -613,6 +613,12 @@ pub fn serving_keyed<M, T>(
         })
 }
 
+impl<R: Rpc> crate::Carries<R> for Addressed<R> {
+    fn carried(&self) -> &R {
+        self.message()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]

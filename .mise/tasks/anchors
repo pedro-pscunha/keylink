@@ -537,6 +537,50 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ("BG4", "keylink/src/trust/tests.rs", "keylink/src/trust/mod.rs",
+     "                if self.roots.contains(&credential.principal())"),
+    ("BG1", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "                let _ = blobs.revoke_peer(holder);"),
+    ("BG2", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "        if store.revoked.revision() != before {"),
+    ("BG3", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "                .is_some_and(|held| !held.is_same_store(blobs))"),
+    ("DA1", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     "        for (registration, live) in self.live.snapshot() {"),
+    ("CA1", "keylink/tests/trust.rs", "keylink/src/call.rs",
+     "        hasher.update(&binding);"),
+    ('RR1', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '            hash.update(credential.principal().as_bytes());'),
+    ('RR2', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
+    ('RR3', 'keylink/tests/idempotency.rs', 'keylink/src/wire.rs', '        let fingerprint = *blake3::hash(message_bytes).as_bytes();'),
+    ('RR4', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                || self.usage.get(key).copied().unwrap_or(0) >= super::MAX_ACCEPTED_PER_REVOKER'),
+    ('RR5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '            .chain(path.iter().rev().copied())'),
+    ('RR6', 'keylink/tests/trust.rs', 'keylink/src/trust/chain.rs', '            if revoked.is_exhausted(&key) {'),
+    ('RR7', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        let closed = self.finish_mutation(&mut store, checkpoint);'),
+    ('RR8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/sign.rs', '            if revoked.is_exhausted(&self.signer) {'),
+    ('RR9', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '        if self.roots.contains(&peer) && !self.revoked.is_exhausted(&peer) {'),
+    ('RR10', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                        refusal.get_or_insert(super::ChangeError::RevokerExhausted {'),
+    ('RR11', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '            .map_or(path, |end| &path[..end]);'),
+    ('RF1', 'keylink/tests/trust.rs', 'keylink/src/idempotency.rs', '                if entry.fingerprint != fingerprint {'),
+    ('RF2', 'keylink/src/trust/sign_tests.rs', 'keylink/src/trust/sign.rs', '    for certificate in chain.links() {'),
+    ('RF3', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            store.standing(credential.chain(), now).is_ok()'),
+    ('RF4', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '    for (policy, credential) in required.iter().zip(&checked) {'),
+    ('RF5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '    pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {'),
+    ('RF6', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            for (registration, live) in self.0.live.snapshot() {'),
+    ('RF7', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '            if total >= MAX_RETAINED_CHAINS'),
+    ('RF8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                >= super::MAX_PENDING_REVOCATIONS'),
+    ('RF9', 'keylink/tests/trust.rs', 'keylink/src/trust/guard.rs', '                    Err(AccessError::Forbidden) => continue,'),
+    ('RF10', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '                    if offered {'),
+    ('RF11', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '    for policy in required {'),
+    ("TR1", "keylink/src/trust/tests.rs", "keylink/src/trust/chain.rs",
+     "        if !child.resources.subset_of(&parent.resources) {"),
+    ("TR2", "keylink/src/trust/tests.rs", "keylink/src/trust/sign.rs",
+     "    bytes.push(kind as u8);"),
+    ("TR3", "keylink/src/trust/cert_tests.rs", "keylink/src/trust/sign.rs",
+     "    if bytes != canonical {"),
+    ("TR4", "keylink/src/trust/tests.rs", "keylink/src/trust/mod.rs",
+     "        if !self.admitting(peer.id()) {"),
+    ("TR5", "keylink/tests/trust.rs", "keylink/src/rpc.rs",
+     "    let Ok(credential) = preflight(&required, peer.id(), &message).await else {"),
     ("R15", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
      "Self::Only(named) => named.contains(&method),"),
     ("R16", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
@@ -833,7 +877,7 @@ ANCHORS = [
     # description still locates the edit. So the choice is not fragile-vs-durable, it
     # is loud-vs-silent, and the record now says so in those terms.
     ("C13", "keylink/tests/persist.rs", "keylink/src/rpc.rs",
-     "                .map(|idem| CallId::of(peer, idem.key())),"),
+     "                .map(|idem| CallId::of(peer, idem.key(), fingerprint)),"),
     # ── three more rows that were DESCRIBED, converted after MEASURING instead of
     # re-reading. All three reasons were property-shaped and none survived a count.
     #
@@ -2085,11 +2129,11 @@ ANCHORS = [
     ("X9", "keylink/tests/admission.rs", "keylink/src/authz.rs",
      "        let allow = Allowlist::only(allowed.keys().copied());"),
     ("X10", "keylink/tests/admission.rs", "keylink/src/authz.rs",
-     "            .require_authorization(self.authorization)"),
+     "            .require(self.authorization)"),
     ("X11", "keylink/src/representability.rs", "keylink/src/authz.rs",
-     "impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>"),
-    ("X12", "keylink/src/representability.rs", "keylink/src/authz.rs",
-     "impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>"),
+     "impl<Req: Rpc + 'static, W: Carries<Req>> Preflight<W> for Authorization<Req> {"),
+    ("X12", "keylink/src/representability.rs", "keylink/src/actor/remote.rs",
+     "impl<R: Rpc> crate::Carries<R> for Addressed<R> {"),
     ("X13", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
      "                .first_unknown(Req::METHODS)"),
     ("X14", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
@@ -2097,7 +2141,7 @@ ANCHORS = [
     ("X15", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
      "                return Err(Error::Config(error));"),
     ("X16", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
-     "        for layer in self.required_layers.into_iter().rev() {"),
+     "    for policy in required {"),
     ("X17", "keylink/tests/admission.rs", "keylink/src/admission.rs",
      "    for policy in required {\n"
      "        require_admitted(policy.admits(&proven), connection)?;\n"
@@ -2118,13 +2162,13 @@ ANCHORS = [
     ("X24", "keylink/tests/admission.rs", "keylink/src/admission.rs",
      '            connection.close(UNAVAILABLE.into(), b"admission unavailable");'),
     ("X25", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
-     "    for policy in required_authorization.iter() {"),
+     "    for policy in required {"),
     ("X26", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
-     "    for policy in required_authorization.iter() {"),
+     "    for policy in required {"),
     ("X27", "keylink/tests/admission.rs", "keylink/src/authz.rs",
      "            return Err(ConfigError::EmptyRules.into());"),
     ("X28", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
-     "    for policy in required_authorization.iter() {"),
+     "    for policy in required {"),
     ("SA1", "keylink/tests/api.rs", "keylink/src/macros.rs",
      "    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,\n"
      "        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};"),
@@ -4024,7 +4068,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 352
+RECORD_BLOCKS = 392
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

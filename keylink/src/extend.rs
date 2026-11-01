@@ -9,14 +9,15 @@
 //! | Seam | Sees | Runs | Refusal or ending | Panic |
 //! |---|---|---|---|---|
 //! | [`Admission`](crate::Admission) | [`ProvenPeer`](crate::ProvenPeer) | Once per connection, before dispatch. | [`Admittance`](crate::Admittance) admits or closes the connection. | This seam has no typed panic recovery. |
+//! | [`trust::Access`](crate::trust::Access) | [`trust::Call`](crate::trust::Call) | Every call, before idempotency and every layer. | `Unauthorized` or `AccessUnavailable`. | No panic recovery. |
 //! | [`Middleware`](crate::Middleware) | [`Context`](crate::Context), typed request, [`BodyReader`](crate::BodyReader), and [`Next`](crate::Next) | Around dispatch, before the handler or actor delivery. | [`Outcome::Err`](crate::Outcome::Err) carries a [`RemoteError`](crate::RemoteError). | This seam does not convert a panic into a typed refusal. |
 //! | [`Observer`](crate::Observer) | `&A` and [`TurnInfo`](crate::TurnInfo) with outcome, method, and duration | After the handler and before the reply, on local and keyed actors. | The caller sees [`Withheld::Refused`](crate::Withheld::Refused). The actor reports [`Ended::Observer`](crate::Ended::Observer). | The caller sees [`Withheld::ObserverPanicked`](crate::Withheld::ObserverPanicked). The actor reports [`Ended::Observer`](crate::Ended::Observer), or supervision restarts it. |
 //! | generated `Feeds` | No caller context. A feed is a local input. | Interleaved with the mailbox. | Stream exhaustion reports [`Ended::Feed`](crate::Ended::Feed). | A feed-handler panic is a panicked turn. It reports [`Ended::Panicked`](crate::Ended::Panicked), or supervision restarts it. |
 //!
 //! [`Rules`](crate::Rules) and [`Compiled`](crate::Compiled) are the data-driven
 //! front end to two existing seams. They compile one TOML policy and install
-//! required [`Admission`](crate::Admission) and [`Middleware`](crate::Middleware)
-//! behavior. They are not a fifth extension mechanism.
+//! required [`Admission`](crate::Admission) and per-call preflight behavior.
+//! [`Guard`](crate::trust::Guard) installs the same required pair for signed authority.
 //!
 //! Generated feeds have no single root type. The [`inspect`](crate::inspect) service
 //! has one generated `Feeds` example. A generated `Feeds::new` accepts one local

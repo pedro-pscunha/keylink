@@ -8,8 +8,12 @@
 //! # What is stored, and what is not
 //!
 //! One entry per claimed key, keyed on the pair the ledger keys on — the peer
-//! iroh proved, and the key that peer chose. Its value is one byte of state and,
-//! for a settled call that produced a recordable reply, that reply's frame.
+//! iroh proved, and the key that peer chose. A value starts with a one-byte
+//! request-binding/version tag, a 32-byte request-and-authority commitment, and
+//! a one-byte state: 34 fixed bytes. A recordable settled reply appends its frame.
+//! The commitment binds received message bytes (not retry controls) and the
+//! selected principal and holder. Legacy unbound values are refused during
+//! recovery, never migrated or replayed with an invented binding.
 //!
 //! **The in-flight half is not stored and cannot be.** A claimed key belongs to
 //! a caller holding a live QUIC stream, and no disk carries one of those across
@@ -76,6 +80,8 @@ const PEER_LEN: usize = 32;
 
 /// A claimed key whose call never settled. Recovers as `Interrupted`.
 const TAG_CLAIMED: u8 = 0;
+/// Versioned request/authority-bound records, never confused with the former unbound states.
+const TAG_BOUND: u8 = 5;
 /// A settled key holding a replayable reply.
 const TAG_DONE: u8 = 1;
 /// Entered, and no reply came out.
@@ -134,6 +140,9 @@ pub enum RecordError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecordFault {
+    /// A request-bound record lacks its fingerprint.
+    #[error("a request-bound record lacks its fingerprint")]
+    MissingFingerprint,
     /// Shorter than the peer id every key starts with.
     #[error("a record key is {len} bytes, and a peer id alone is {PEER_LEN}")]
     KeyTooShort {
@@ -212,8 +221,8 @@ fn decode_key(stored: &EntryKey) -> Result<(EndpointId, IdempotencyKey), RecordF
 /// [`Slot::Running`] stores as [`TAG_CLAIMED`], which is the whole of how an
 /// interrupted call is recovered: the claim is written before the handler runs,
 /// so a process that dies mid-call leaves exactly this.
-pub(crate) fn encode_slot(slot: &Slot) -> Vec<u8> {
-    match slot {
+pub(crate) fn encode_slot(slot: &Slot, fingerprint: [u8; 32]) -> Vec<u8> {
+    let state = match slot {
         Slot::Running(_) => vec![TAG_CLAIMED],
         Slot::Done(frame) => {
             let mut bytes = Vec::with_capacity(1 + frame.len());
@@ -224,11 +233,34 @@ pub(crate) fn encode_slot(slot: &Slot) -> Vec<u8> {
         Slot::Interrupted => vec![TAG_INTERRUPTED],
         Slot::Unrecordable => vec![TAG_UNRECORDABLE],
         Slot::Forgotten => vec![TAG_FORGOTTEN],
-    }
+    };
+    bound_bytes(&state, fingerprint)
+}
+fn bound_bytes(state: &[u8], fingerprint: [u8; 32]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(33 + state.len());
+    value.push(TAG_BOUND);
+    value.extend_from_slice(&fingerprint);
+    value.extend_from_slice(state);
+    value
 }
 
 /// What a stored record becomes when the process comes back.
-fn decode_slot(stored: &[u8]) -> Result<Slot, RecordFault> {
+fn decode_slot(stored: &[u8]) -> Result<([u8; 32], Slot), RecordFault> {
+    let Some((version, rest)) = stored.split_first() else {
+        return Err(RecordFault::Empty);
+    };
+    if *version != TAG_BOUND {
+        return Err(RecordFault::UnknownState { tag: *version });
+    }
+    let Some((fingerprint, state)) = rest.split_at_checked(32) else {
+        return Err(RecordFault::MissingFingerprint);
+    };
+    let fingerprint = fingerprint
+        .try_into()
+        .map_err(|_| RecordFault::MissingFingerprint)?;
+    Ok((fingerprint, decode_state(state)?))
+}
+fn decode_state(stored: &[u8]) -> Result<Slot, RecordFault> {
     let Some((tag, rest)) = stored.split_first() else {
         return Err(RecordFault::Empty);
     };
@@ -295,6 +327,8 @@ pub struct DurableRecords {
     store: Arc<Store>,
 }
 
+pub(crate) type Recovered = (EndpointId, IdempotencyKey, [u8; 32], Slot);
+
 /// The claimed store, and what it held when this process opened it.
 struct Store {
     id: StateId,
@@ -303,7 +337,7 @@ struct Store {
     ///
     /// A `std::sync::Mutex` and not the async one beside it: this is taken from
     /// `Ledger::new`, which is not a future, and holding it spans no await.
-    recovered: std::sync::Mutex<Vec<(EndpointId, IdempotencyKey, Slot)>>,
+    recovered: std::sync::Mutex<Vec<Recovered>>,
     /// Entries written since the log was last rewritten. Read against the live
     /// count, which only the ledger knows.
     since_compaction: AtomicU64,
@@ -340,7 +374,8 @@ impl DurableRecords {
         let mut recovered = Vec::with_capacity(stored.len());
         for (key, value) in stored {
             let (peer, key) = decode_key(&key)?;
-            recovered.push((peer, key, decode_slot(&value)?));
+            let (fingerprint, slot) = decode_slot(&value)?;
+            recovered.push((peer, key, fingerprint, slot));
         }
 
         Ok(Self {
@@ -358,7 +393,7 @@ impl DurableRecords {
     /// The ledger built from these records takes them; a second reader gets
     /// nothing, which is the honest answer — there is one ledger per store, and
     /// this value is how the first one is told what it already knows.
-    pub(crate) fn take_recovered(&self) -> Vec<(EndpointId, IdempotencyKey, Slot)> {
+    pub(crate) fn take_recovered(&self) -> Vec<Recovered> {
         let mut held = self
             .store
             .recovered
@@ -377,6 +412,7 @@ impl DurableRecords {
         &self,
         peer: EndpointId,
         key: &IdempotencyKey,
+        fingerprint: [u8; 32],
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
         let wrote = self
@@ -384,7 +420,7 @@ impl DurableRecords {
             .held
             .lock()
             .await
-            .put(&address, &[TAG_CLAIMED])
+            .put(&address, &bound_bytes(&[TAG_CLAIMED], fingerprint))
             .await;
         self.counted(wrote)?;
         Ok(())
@@ -416,9 +452,10 @@ impl DurableRecords {
         peer: EndpointId,
         key: &IdempotencyKey,
         slot: &Slot,
+        fingerprint: [u8; 32],
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
-        let value = encode_slot(slot);
+        let value = encode_slot(slot, fingerprint);
         let wrote = self.store.held.lock().await.put(&address, &value).await;
         self.counted(wrote)?;
         Ok(())
@@ -527,4 +564,34 @@ pub(crate) enum Reconcile {
     Write(Vec<u8>),
     /// A claim owns the key now, so the write that counts is its own.
     Untouched,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    // Made red with scripts/break-once.sh by zeroing the fingerprint bytes in bound_bytes, using `value.extend_from_slice(&[0; 32]);`.
+    // The multi-line or same-file edit is described rather than quoted.
+    // Watched: the recovered fingerprint was zero rather than the original [9; 32].
+    fn request_fingerprints_roundtrip_with_durable_record_states() {
+        for slot in [
+            Slot::Done(Bytes::from_static(b"reply")),
+            Slot::Interrupted,
+            Slot::Unrecordable,
+            Slot::Forgotten,
+        ] {
+            let bytes = encode_slot(&slot, [9; 32]);
+            let (fingerprint, decoded) = decode_slot(&bytes).unwrap();
+            assert_eq!(fingerprint, [9; 32]);
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&slot)
+            );
+            if let Slot::Done(frame) = decoded {
+                assert_eq!(frame, Bytes::from_static(b"reply"));
+            }
+        }
+        assert!(decode_slot(&[TAG_DONE, 0, 0, 0]).is_err()); // no legacy unbound replay
+    }
 }

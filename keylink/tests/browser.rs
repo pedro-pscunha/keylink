@@ -332,3 +332,42 @@ async fn lossy_drop_newest_runs_in_a_browser() {
     );
     assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
 }
+
+#[wasm_bindgen_test]
+fn a_two_link_chain_verifies_in_a_browser() {
+    use keylink::trust::{
+        Caveats, Certificate, Chain, Delegation, Pattern, Roots, Scope, Timestamp, Validity,
+    };
+    let root = keylink::SecretKey::from_bytes(&[1; 32]);
+    let user = keylink::SecretKey::from_bytes(&[2; 32]);
+    let device = keylink::SecretKey::from_bytes(&[3; 32]);
+    let grant = |subject, resource: &str, delegate| Delegation {
+        subject,
+        serial: 0,
+        delegate,
+        caveats: Caveats {
+            resources: Scope::only([Pattern::under(resource).unwrap()]).unwrap(),
+            operations: Scope::any(),
+            validity: Validity::new(
+                Timestamp::from_unix_secs(0),
+                Timestamp::from_unix_secs(u64::MAX),
+            )
+            .unwrap(),
+        },
+    };
+    let first = Certificate::issue(&root, grant(user.public(), "repo", 1)).unwrap();
+    let chain = Chain::new(vec![first])
+        .delegate(&user, grant(device.public(), "repo/a", 0))
+        .unwrap();
+    let chain = Chain::from_bytes(&chain.to_bytes()).unwrap();
+    let credential = chain
+        .verify(
+            &Roots::only([root.public()]).unwrap(),
+            Timestamp::from_unix_secs(1),
+        )
+        .unwrap();
+    assert_eq!(credential.principal(), root.public());
+    assert_eq!(credential.holder(), device.public());
+    assert!(credential.permits(Some("repo/a/file"), "Repo/Read"));
+    assert!(!credential.permits(Some("repo/b"), "Repo/Read"));
+}

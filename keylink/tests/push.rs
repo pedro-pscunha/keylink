@@ -323,12 +323,10 @@ async fn a_peer_can_unsubscribe_without_leaving() {
 /// deletes the entry that replaced it.
 ///
 /// The result is a peer that believes it is subscribed and a desk that has
-/// forgotten it: pushes stop, and nothing reports a fault. In the admission
-/// adapter, which instantiates this same registry at `Revocation`, the same race
-/// is worse than a lost push — the surviving connection leaves the registry, so
-/// a later `replace` can neither see nor close it, and a revoked peer keeps a
-/// live connection. That is an authorization bypass reached through a
-/// bookkeeping race.
+/// forgotten it: pushes stop, and nothing reports a fault. Admission now uses a
+/// separate per-connection registry rather than this per-peer subscriber map.
+/// That shared registry keeps the same generation-checked cleanup invariant,
+/// because stale cleanup must never hide a connection from later revocation.
 ///
 /// So each entry is stamped and an eviction task removes only its own stamp.
 /// Made red by removing the stamp comparison in `Subscribers::insert`.

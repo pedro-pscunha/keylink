@@ -93,6 +93,17 @@ pub struct WireKinds {
 /// wire that never met a constructor. The TYPE stays public because each
 /// generated `Contract` names it.
 pub struct Envelope<T> {
+    /// Transport and retry controls, serialized before the opaque message.
+    pub(crate) control: Control,
+    /// The caller's request or response.
+    pub(crate) message: T,
+}
+
+/// The prefix shared by envelope encoding and received-message fingerprinting.
+/// Postcard structs carry no extra boundary bytes: the message starts immediately
+/// after these controls, whose exact encoded length is found while decoding.
+#[derive(Debug, Serialize, Deserialize, Schema)]
+pub(crate) struct Control {
     /// How many body bytes follow the header, when the sender knows. `None` is
     /// an open-ended stream that ends when the sender finishes it.
     pub(crate) body_len: Option<u64>,
@@ -103,8 +114,6 @@ pub struct Envelope<T> {
     /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
     /// much as an actor message does.
     pub(crate) idempotency: Option<crate::Idempotency>,
-    /// The caller's request or response.
-    pub(crate) message: T,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,8 +172,10 @@ pub(crate) fn encode_header<T: Serialize>(
     // that only the write path has, and the read path would pay for it.
     let mut buf = postcard::to_extend(
         &Envelope {
-            body_len,
-            idempotency: idempotency.cloned(),
+            control: Control {
+                body_len,
+                idempotency: idempotency.cloned(),
+            },
             message,
         },
         buf,
@@ -212,6 +223,27 @@ impl FrameReader {
     /// started — a normal end of conversation. A frame that starts and does not
     /// finish is [`Error::FrameTruncated`]. The two are never confused.
     pub(crate) async fn read_header<T: DeserializeOwned>(&mut self) -> Result<Option<Envelope<T>>> {
+        self.read_frame()
+            .await?
+            .map(|frame| postcard::from_bytes(&frame).map_err(Error::from))
+            .transpose()
+    }
+
+    /// Decode controls once and hash the remaining received message bytes before
+    /// deserialization can change map iteration order or any other representation.
+    pub(crate) async fn read_request<T: DeserializeOwned>(
+        &mut self,
+    ) -> Result<Option<(Envelope<T>, [u8; 32])>> {
+        let Some(frame) = self.read_frame().await? else {
+            return Ok(None);
+        };
+        let (control, message_bytes) = postcard::take_from_bytes::<Control>(&frame)?;
+        let fingerprint = *blake3::hash(message_bytes).as_bytes();
+        let message = postcard::from_bytes(message_bytes)?;
+        Ok(Some((Envelope { control, message }, fingerprint)))
+    }
+
+    async fn read_frame(&mut self) -> Result<Option<Bytes>> {
         if !self.stage_at_least(PREFIX).await? {
             return if self.staged.is_empty() {
                 Ok(None)
@@ -243,7 +275,7 @@ impl FrameReader {
         }
 
         let frame = self.staged.split_to(want).freeze();
-        Ok(Some(postcard::from_bytes(&frame)?))
+        Ok(Some(frame))
     }
 
     /// The next run of body bytes, or `None` once the peer finishes the stream.
@@ -293,7 +325,7 @@ mod tests {
 
         let header = reader.read_header::<String>().await.unwrap().unwrap();
         assert_eq!(header.message, "hello");
-        assert_eq!(header.body_len, Some(3));
+        assert_eq!(header.control.body_len, Some(3));
         assert_eq!(&reader.next_chunk().await.unwrap().unwrap()[..], b"abc");
     }
 
@@ -377,8 +409,10 @@ mod tests {
         framed.extend_from_slice(&[0u8; PREFIX]);
         let mut framed = postcard::to_extend(
             &Envelope {
-                body_len: None,
-                idempotency: None,
+                control: Control {
+                    body_len: None,
+                    idempotency: None,
+                },
                 message: &long,
             },
             framed,

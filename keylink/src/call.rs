@@ -224,7 +224,8 @@ pub const APPLIED_BOUND: NonZeroUsize = match NonZeroUsize::new(4096) {
 
 /// One keyed call, named so that a handler can recognise its own retry.
 ///
-/// `blake3(peer || key)`, truncated to sixteen bytes. Present on
+/// A domain-separated blake3 of `peer || key || binding`, truncated to sixteen
+/// bytes. `binding` is the ledger's request-and-authority commitment. Present on
 /// [`Context::call`](crate::Context::call) for every call that arrived carrying an
 /// [`IdempotencyKey`], and absent for every call that did not — including every
 /// `tell`, which cannot carry one.
@@ -242,8 +243,8 @@ pub const APPLIED_BOUND: NonZeroUsize = match NonZeroUsize::new(4096) {
 /// So the failure direction is fixed by construction. A collision is a **false
 /// hit** — one caller's key B recognised as its own key A, and answered from A's
 /// record. It is never a false miss: the digest is a total function of exactly the
-/// pair, so the same peer and the same key always name the same call, and a retry
-/// cannot fail to be recognised because the id came out different.
+/// tuple, so the same peer, key and binding always name the same call. A changed
+/// request encoding, principal or holder is a different bound call, not a retry.
 ///
 /// # `Serialize` yes, `Schema` never — and the difference is the whole rule
 ///
@@ -269,33 +270,31 @@ pub struct CallId([u8; DIGEST_BYTES]);
 impl CallId {
     /// Name the call this peer made under this key.
     ///
-    /// The peer goes in first and is a fixed thirty-two bytes, which is what makes
-    /// the concatenation unambiguous without a length prefix: no `(peer, key)`
-    /// pair can produce the same byte string as another.
+    /// The fixed peer prefix and fixed 32-byte binding suffix make the variable
+    /// key between them unambiguous. The v2 derive-key domain separates these
+    /// identities from the former peer/key-only digest.
     ///
-    /// # The service and the method are absent, and that is decided
+    /// # Slot namespace and call identity are different
     ///
-    /// **A key names a call, not a method.** The digest is scoped exactly as the
-    /// ledger's slots are, and that is the whole reason to leave both out.
+    /// The live ledger looks up `(peer, key)` inside one service. Its retained
+    /// binding refuses a different request or authority in that slot. A CallId
+    /// names the bound call itself, so `Applied` cannot return a reply belonging
+    /// to another request or principal after that live slot has been forgotten.
     ///
-    /// - **Method**, because the ledger does not scope by one either:
-    ///   `Bucket::slots` is a `HashMap<IdempotencyKey, Entry>`, so a caller that
-    ///   sends one key to two methods already gets one call out of the ledger — the
-    ///   second is answered with the first's recorded reply. Folding the method in
-    ///   here would make [`Applied`] *disagree* with the ledger, and the caller
-    ///   would meet one rule before a restart and another after it.
-    /// - **Service**, because an `Applied` lives inside one state, which is served
-    ///   behind one ALPN. The dimension is carried by where the set sits rather than
-    ///   by what is in the digest, and a `Ledger` is per built `Service` for the
-    ///   same reason.
+    /// Method, actor and arguments are already in the received-message binding;
+    /// principal and holder are in it too. Service remains implicit in the state
+    /// that owns an `Applied`: do not share one set across service namespaces.
+    /// Retry controls are excluded, just as they are from the ledger commitment.
     ///
-    /// The consequence is reachable and belongs to the caller: two methods sharing
-    /// one `Applied` field will answer the second from the first's record, exactly
-    /// as the live ledger already would. If two methods must not share a key, give
-    /// them different keys — or different `Applied` fields.
-    pub(crate) fn of(peer: EndpointId, key: &IdempotencyKey) -> Self {
+    /// Different message bytes (including another contract encoding) or authority
+    /// yield a different ID. A caller needing logical dedupe across those changes
+    /// must supply an application-level operation identity, not assume byte-level
+    /// retries are interchangeable. Persisted old unbound IDs are not migrated:
+    /// reset or explicitly reconcile that application state before adopting v2
+    /// identities, because old entries will not dedupe new bound calls.
+    pub(crate) fn of(peer: EndpointId, key: &IdempotencyKey, binding: [u8; 32]) -> Self {
         let mut id = [0u8; DIGEST_BYTES];
-        id.copy_from_slice(&Self::digest(peer, key)[..DIGEST_BYTES]);
+        id.copy_from_slice(&Self::digest(peer, key, binding)[..DIGEST_BYTES]);
         Self(id)
     }
 
@@ -303,10 +302,11 @@ impl CallId {
     ///
     /// Split out so the unit tests can cut it somewhere else and watch what a
     /// narrower id does — see `a_shortened_digest_fails_towards_a_false_hit`.
-    fn digest(peer: EndpointId, key: &IdempotencyKey) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
+    fn digest(peer: EndpointId, key: &IdempotencyKey, binding: [u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key("keylink bound call id v2");
         hasher.update(peer.as_bytes());
         hasher.update(key.as_str().as_bytes());
+        hasher.update(&binding);
         *hasher.finalize().as_bytes()
     }
 
@@ -663,7 +663,7 @@ mod tests {
     /// it.
     fn narrow(peer: EndpointId, key: &IdempotencyKey, width: usize) -> CallId {
         let mut id = [0u8; DIGEST_BYTES];
-        id[..width].copy_from_slice(&CallId::digest(peer, key)[..width]);
+        id[..width].copy_from_slice(&CallId::digest(peer, key, [0; 32])[..width]);
         CallId::from_bytes(id)
     }
 
@@ -679,8 +679,8 @@ mod tests {
     fn one_peers_key_cannot_name_another_peers_call() {
         let shared = key("reserve-4471");
         assert_ne!(
-            CallId::of(peer(A), &shared),
-            CallId::of(peer(B), &shared),
+            CallId::of(peer(A), &shared, [0; 32]),
+            CallId::of(peer(B), &shared, [0; 32]),
             "the same key from two peers must be two calls",
         );
     }
@@ -697,9 +697,17 @@ mod tests {
     #[test]
     fn two_keys_from_one_peer_are_two_calls() {
         assert_ne!(
-            CallId::of(peer(A), &key("reserve-4471")),
-            CallId::of(peer(A), &key("reserve-4472")),
+            CallId::of(peer(A), &key("reserve-4471"), [0; 32]),
+            CallId::of(peer(A), &key("reserve-4472"), [0; 32]),
             "two keys from one peer must be two calls",
+        );
+    }
+
+    #[test]
+    fn one_slot_with_different_bindings_has_different_call_ids() {
+        assert_ne!(
+            CallId::of(peer(A), &key("bound"), [1; 32]),
+            CallId::of(peer(A), &key("bound"), [2; 32])
         );
     }
 
@@ -729,7 +737,7 @@ mod tests {
     ///   instead is that the record's copy is closed by a **backtick** where the
     ///   declaration's is closed by a **newline**. The pair that collides at one byte
     ///   then collides at the real width too. Watched:
-    ///   `at DIGEST_BYTES the same pair must be two calls / left: CallId(4a) right: CallId(4a)`.
+    ///   `at DIGEST_BYTES the same pair must be two calls / left: CallId(c0) right: CallId(c0)`.
     /// - The **demonstration** is the `Applied` half. It passes broken and
     ///   unbroken, because it is asserted at the narrowed width on purpose, and it
     ///   is here to state the consequence in executable form rather than in prose.
@@ -737,7 +745,7 @@ mod tests {
     ///   `CallId` alone, which is the only way this consequence could change.
     ///
     /// A false **miss** has no assertion and cannot have one: the digest is a total
-    /// function of exactly `(peer, key)`, so there is no input that makes one id
+    /// function of exactly `(peer, key, binding)`, so there is no input that makes one id
     /// into two. What could still produce one is `CallId`'s `Hash` and `Eq`
     /// disagreeing, and that is guarded by
     /// [`a_keyed_call_is_answered_from_what_it_applied`].
@@ -765,8 +773,8 @@ mod tests {
         // The guard: at the real width they are two calls, so the consequence
         // above is a property of the narrowing and not of the design.
         assert_ne!(
-            CallId::of(peer(A), left),
-            CallId::of(peer(A), right),
+            CallId::of(peer(A), left, [0; 32]),
+            CallId::of(peer(A), right, [0; 32]),
             "at DIGEST_BYTES the same pair must be two calls",
         );
     }
@@ -803,7 +811,7 @@ mod tests {
     #[test]
     fn a_keyed_call_is_answered_from_what_it_applied() {
         let mut applied: Applied<u64> = Applied::new();
-        let call = Some(CallId::of(peer(A), &key("debit-1")));
+        let call = Some(CallId::of(peer(A), &key("debit-1"), [0; 32]));
         assert!(applied.get(call).is_none(), "nothing applied yet");
         applied.insert(call, 50);
         assert_eq!(applied.get(call), Some(&50));
@@ -828,7 +836,7 @@ mod tests {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
         let mut applied: Applied<u64> = Applied::bounded(two);
         let calls: Vec<Option<CallId>> = (0..3)
-            .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")))))
+            .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")), [0; 32])))
             .collect();
         for (n, call) in calls.iter().enumerate() {
             applied.insert(*call, n as u64);
@@ -852,7 +860,7 @@ mod tests {
     #[test]
     fn the_first_answer_for_a_call_is_the_one_kept() {
         let mut applied: Applied<u64> = Applied::new();
-        let call = Some(CallId::of(peer(A), &key("debit-1")));
+        let call = Some(CallId::of(peer(A), &key("debit-1"), [0; 32]));
         applied.insert(call, 50);
         applied.insert(call, 999);
         assert_eq!(applied.get(call), Some(&50));
@@ -879,8 +887,8 @@ mod tests {
     fn a_recognised_retry_does_not_displace_anything() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
         let mut applied: Applied<u64> = Applied::bounded(two);
-        let first = Some(CallId::of(peer(A), &key("credit-1")));
-        let second = Some(CallId::of(peer(A), &key("credit-2")));
+        let first = Some(CallId::of(peer(A), &key("credit-1"), [0; 32]));
+        let second = Some(CallId::of(peer(A), &key("credit-2"), [0; 32]));
 
         applied.insert(first, 10);
         applied.insert(first, 10); // the retry
@@ -949,7 +957,7 @@ mod tests {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
         let mut applied: Applied<u64> = Applied::bounded(two);
         let calls: Vec<Option<CallId>> = (0..2)
-            .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")))))
+            .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")), [0; 32])))
             .collect();
         applied.insert(calls[0], 10);
         applied.insert(calls[1], 20);
@@ -967,7 +975,7 @@ mod tests {
         );
 
         // And the next insert displaces the same entry the original would have.
-        let third = Some(CallId::of(peer(A), &key("debit-2")));
+        let third = Some(CallId::of(peer(A), &key("debit-2"), [0; 32]));
         restored.insert(third, 30);
         assert!(
             restored.get(calls[0]).is_none(),
@@ -1019,7 +1027,10 @@ mod tests {
     fn one_unchanged_set_encodes_to_one_sequence_of_bytes() {
         let mut applied: Applied<u64> = Applied::new();
         for n in 0..32 {
-            applied.insert(Some(CallId::of(peer(A), &key(&format!("debit-{n}")))), n);
+            applied.insert(
+                Some(CallId::of(peer(A), &key(&format!("debit-{n}")), [0; 32])),
+                n,
+            );
         }
         let once = postcard::to_stdvec(&applied).expect("encodes");
         let twice = postcard::to_stdvec(&applied).expect("encodes");

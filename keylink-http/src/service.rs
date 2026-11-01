@@ -672,8 +672,10 @@ mod tests {
         assert!(!source.contains(&["serde_json::", "to_vec(value)"].concat()));
     }
 
+    /// A key is bound to its original request. The ledger refuses a different
+    /// RPC before replay, rather than handing the adapter a wrong response variant.
     #[tokio::test]
-    async fn reused_key_for_a_different_rpc_rejects_the_wrong_response_variant() {
+    async fn reused_key_for_a_different_rpc_is_refused_before_replay() {
         let server_node = local_node().await;
         let client_node = local_node().await;
         let _server =
@@ -704,14 +706,13 @@ mod tests {
             codec,
         )
         .await
-        .expect_err("a One response cannot become a successful Many response");
+        .expect_err("the key belongs to One, not the new Many request");
 
         assert!(matches!(
             error,
-            keylink::ExternalError::Client(keylink::Error::UnexpectedResponse {
-                expected: "Many",
-                actual: "One"
-            })
+            keylink::ExternalError::Client(keylink::Error::Remote(
+                keylink::RemoteError::Idempotency(keylink::IdempotencyRefusal::RequestMismatch)
+            ))
         ));
     }
 }

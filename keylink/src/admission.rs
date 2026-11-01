@@ -1,4 +1,4 @@
-//! Who may talk to a served protocol, as a port with one adapter.
+//! Who may talk to a served protocol, as a port with live-policy adapters.
 //!
 //! [`Allowlist`] answers the question once, at startup, from a value in
 //! memory. That is the right shape for a fleet you deploy and the wrong one for
@@ -24,15 +24,14 @@
 //!            └───┬─────────────┬────────────┘
 //!                │             │
 //!        ┌───────▼──────────┐  ┌▼─────────────────┐
-//!        │ DynamicAdmission │  │ your policy      │
-//!        │  (built)         │  │ system, not built│
+//!        │ DynamicAdmission │  │ trust::Trust     │
+//!        │  (built)         │  │ (signed records) │
 //!        └──────────────────┘  └──────────────────┘
 //! ```
 //!
 //! `Allowlist` is the **value** [`DynamicAdmission`] holds, not a second
 //! adapter: a static allowlist is a `DynamicAdmission` nobody replaces. The
-//! reason to write a second adapter is an external policy system, and that is
-//! the only reason.
+//! signed-record adapter is [`crate::trust::Trust`]. Applications can add their own policy systems.
 //!
 //! # Why revocation is in the port and not in an adapter
 //!
@@ -57,21 +56,23 @@
 //!
 //! # What this does not promise
 //!
-//! - **Nothing about a peer already inside a stream.** Revocation closes the
+//! - **Nothing about a peer already inside a stream.** LiveConnection closes the
 //!   connection; a call already dispatched runs to completion.
-//! - **Nothing across nodes.** [`DynamicAdmission`] is one process's view.
+//! - **Each node has its own view.** Feeders must handle explicit capacity refusals;
+//!   revocation latency is the feeder's delivery latency.
 //! - **No history.** There is no audit trail of past decisions; that is a
 //!   different port with different operations.
-//! - **One connection per peer.** The registry is keyed by [`EndpointId`], so a
-//!   peer holding several has its most recent remembered and closed. Two live
-//!   connections from one identity are not two peers.
+//! - **Both built-in revocable adapters track every connection.** Each removed
+//!   peer's sessions are closed across ALPNs. The returned peer IDs are unique;
+//!   `live()` counts connections, not unique identities.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
 
-use crate::{AdmittedPeer, Allowlist, ProvenPeer, Subscribers, Watch};
+use crate::{AdmittedPeer, Allowlist, ProvenPeer, Watch};
 
 /// The close code for a peer a policy refused.
 pub(crate) const REFUSED: u32 = 1;
@@ -150,12 +151,15 @@ pub enum Admittance {
 /// later has the proof rather than having to re-invent one from an id — which
 /// it could not do, since the only constructor takes a completed handshake.
 #[derive(Debug, Clone)]
-pub struct Revocation {
+pub struct LiveConnection {
     connection: Connection,
     peer: ProvenPeer,
 }
 
-impl Revocation {
+impl LiveConnection {
+    pub(crate) fn id(&self) -> usize {
+        self.connection.stable_id()
+    }
     pub(crate) fn new(connection: Connection, peer: ProvenPeer) -> Self {
         Self { connection, peer }
     }
@@ -204,24 +208,24 @@ pub trait Admission: Send + Sync + 'static {
     /// Called once per admitted connection, so a policy that can revoke has
     /// something to close. The default drops it, which is correct for a policy
     /// that never changes its mind: a static allowlist has nothing to revoke.
-    fn admitted(&self, peer: &AdmittedPeer, live: Revocation) {
+    fn admitted(&self, peer: &AdmittedPeer, live: LiveConnection) {
         let _ = (peer, live);
     }
 }
 
 /// An admission whose answer can change while connections are live.
 pub trait Revocable: Admission {
-    /// Swap the policy, **then** close every live connection the new one no
-    /// longer admits, and report the peers closed.
-    ///
-    /// The order is the correctness property, not an implementation detail:
-    /// closing first leaves a window in which a revoked peer reconnects and is
-    /// admitted by the policy that is on its way out.
+    /// The change this adapter applies before rechecking live connections.
+    type Change;
+    /// A typed refusal to apply the change. An infallible adapter uses `Infallible`.
+    type Error;
+
+    /// Apply the change before closing connections no longer admitted.
     #[must_use = "a revocation that closed nothing is usually a mistake"]
-    fn replace(&self, next: Allowlist) -> Vec<EndpointId>;
+    fn apply(&self, next: Self::Change) -> Result<Vec<EndpointId>, Self::Error>;
 }
 
-/// The one adapter keylink ships: a snapshot behind a lock.
+/// A mutable allowlist snapshot behind a lock.
 ///
 /// There is deliberately no `Default`, for the same reason [`Allowlist`] has
 /// none: admitting everyone is a decision you have to type out, so it can never
@@ -229,10 +233,9 @@ pub trait Revocable: Admission {
 #[derive(Debug)]
 pub struct DynamicAdmission {
     allow: Mutex<Allowlist>,
-    /// Wave C's registry, instantiated at the one other thing worth keying by
-    /// peer. One type, two uses: fan out to the peers that dialled in, and
-    /// close the ones a new policy no longer admits.
-    live: Subscribers<Revocation>,
+    /// Every connection is tracked separately, including simultaneous sessions
+    /// from one identity and connections on different service ALPNs.
+    live: crate::live::Live,
 }
 
 impl DynamicAdmission {
@@ -241,7 +244,7 @@ impl DynamicAdmission {
     pub fn new(initial: Allowlist) -> Self {
         Self {
             allow: Mutex::new(initial),
-            live: Subscribers::new(),
+            live: crate::live::Live::default(),
         }
     }
 
@@ -270,13 +273,12 @@ impl Admission for DynamicAdmission {
         }
     }
 
-    fn admitted(&self, peer: &AdmittedPeer, live: Revocation) {
-        let watch = live.watch();
-        self.live.insert(peer.id(), live.clone(), watch);
+    fn admitted(&self, _peer: &AdmittedPeer, live: LiveConnection) {
+        let registration = self.live.insert(live.clone());
 
         // Re-read the policy AFTER the insert, and the order is the whole fix.
         //
-        // `admits` released the policy lock before this ran, so a `replace` can
+        // `admits` released the policy lock before this ran, so an `apply` can
         // land entirely inside that gap: it swaps the policy, takes its
         // snapshot of `live`, and finds nothing — and then this connection is
         // inserted, admitted under a policy that no longer exists, never closed
@@ -284,32 +286,36 @@ impl Admission for DynamicAdmission {
         // peer most likely to be reconnecting in a loop.
         //
         // Re-reading here cannot miss, because the two orders are exhaustive: a
-        // `replace` that takes its snapshot AFTER the insert sees this entry
+        // `apply` that takes its snapshot AFTER the insert sees this entry
         // and closes it, and one that takes it BEFORE is visible to this read.
         if self.policy().admit(live.peer()).is_none() {
             live.close();
-            self.live.remove(peer.id());
+            self.live.remove(registration);
         }
     }
 }
 
 impl Revocable for DynamicAdmission {
-    fn replace(&self, next: Allowlist) -> Vec<EndpointId> {
+    type Change = Allowlist;
+    type Error = std::convert::Infallible;
+
+    fn apply(&self, next: Self::Change) -> Result<Vec<EndpointId>, Self::Error> {
         // The swap happens FIRST, and under the lock, so a peer that reconnects
         // during the sweep below meets the new policy rather than the old one.
         // Closing first would leave exactly that window open.
         *self.policy() = next;
 
         let policy = self.policy().clone();
-        let mut closed = Vec::new();
-        for (id, live) in self.live.snapshot() {
+        let mut closed = BTreeSet::new();
+        for (registration, live) in self.live.snapshot() {
+            let id = live.peer().id();
             if policy.admit(live.peer()).is_none() {
                 live.close();
-                self.live.remove(id);
-                closed.push(id);
+                self.live.remove(registration);
+                closed.insert(id);
             }
         }
-        closed
+        Ok(closed.into_iter().collect())
     }
 }
 
@@ -338,7 +344,7 @@ pub(crate) fn settle(
     admission: &dyn Admission,
     required: &[Arc<dyn Admission>],
     connection: &Connection,
-) -> Option<(AdmittedPeer, Revocation)> {
+) -> Option<(AdmittedPeer, LiveConnection)> {
     let proven = ProvenPeer::on(connection);
     for policy in required {
         require_admitted(policy.admits(&proven), connection)?;
@@ -350,7 +356,7 @@ pub(crate) fn settle(
     // `Allowlist::admit`, which is what keeps a foreign policy from
     // manufacturing one.
     let admitted = AdmittedPeer::mint(proven);
-    let live = Revocation::new(connection.clone(), proven);
+    let live = LiveConnection::new(connection.clone(), proven);
     for policy in required {
         policy.admitted(&admitted, live.clone());
     }

@@ -190,6 +190,7 @@ impl GatewayError {
             keylink::Error::Transport(_) | keylink::Error::Closed => Self::UpstreamUnavailable,
             keylink::Error::Remote(remote) => match remote {
                 keylink::RemoteError::Unauthorized(_) => Self::Forbidden,
+                keylink::RemoteError::AccessUnavailable => Self::UpstreamUnavailable,
                 keylink::RemoteError::TimedOut { .. } => Self::UpstreamTimeout,
                 keylink::RemoteError::NoSuchActor { .. } => Self::ActorNotFound,
                 keylink::RemoteError::AtCapacity { .. }
@@ -200,6 +201,7 @@ impl GatewayError {
                     keylink::IdempotencyRefusal::Malformed(_) => Self::InvalidIdempotencyKey,
                     keylink::IdempotencyRefusal::NotKeyable { .. } => Self::IdempotencyNotSupported,
                     keylink::IdempotencyRefusal::TooManyRunning { .. } => Self::IdempotencyCapacity,
+                    keylink::IdempotencyRefusal::RequestMismatch => Self::IdempotencyConflict,
                     keylink::IdempotencyRefusal::InFlight
                     | keylink::IdempotencyRefusal::Interrupted
                     | keylink::IdempotencyRefusal::Unrecordable
@@ -429,6 +431,16 @@ mod tests {
         let secret = "principal=tenant-secret key=raw-secret upstream=private";
         let cases = [
             (Error::Closed, GatewayError::UpstreamUnavailable),
+            (
+                Error::Remote(RemoteError::Idempotency(
+                    IdempotencyRefusal::RequestMismatch,
+                )),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
+                Error::Remote(RemoteError::AccessUnavailable),
+                GatewayError::UpstreamUnavailable,
+            ),
             (
                 Error::Remote(RemoteError::Unauthorized(secret.into())),
                 GatewayError::Forbidden,

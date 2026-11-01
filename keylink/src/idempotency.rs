@@ -533,6 +533,9 @@ pub enum IdempotencyRefusal {
         "this service could not record the key, so nothing ran - the same key is safe to send again"
     )]
     NotClaimed,
+    /// This key was claimed for different received message bytes or authority.
+    #[error("this idempotency key belongs to a different request or authority")]
+    RequestMismatch,
 }
 
 impl From<IdempotencyRefusal> for RemoteError {
@@ -1198,6 +1201,7 @@ impl Slot {
 #[derive(Debug)]
 struct Entry {
     slot: Slot,
+    fingerprint: [u8; 32],
     /// When this entry settled — or, for [`Slot::Running`], when it was claimed.
     /// Only settled entries are aged out; a running claim has no deadline,
     /// because the transport is what bounds it.
@@ -2051,6 +2055,12 @@ pub(crate) enum Claim {
 /// let one peer read another peer's reply by guessing `order-1`, which is an
 /// information leak before it is a collision. It is also what makes `attach`
 /// safe for free: one peer can never wait on another peer's call.
+/// Each entry additionally commits to its request and selected authority
+/// (principal and holder). Message bytes are the received encoding, excluding
+/// retry-control metadata. A different encoding, including across contract
+/// versions, is a typed mismatch even when it expresses the same logical call.
+/// A different binding is refused before attachment or replay; the same
+/// commitment is retained by durable records.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     inner: Mutex<Inner>,
@@ -2112,7 +2122,12 @@ impl Ledger {
     /// This is the whole at-most-once property: the slot is claimed *before* the
     /// handler is entered, and the only way back to vacant is for the guard to
     /// be released — which happens exactly when nothing ran.
-    pub(crate) fn claim(self: &Arc<Self>, peer: EndpointId, key: IdempotencyKey) -> Claim {
+    pub(crate) fn claim(
+        self: &Arc<Self>,
+        peer: EndpointId,
+        key: IdempotencyKey,
+        fingerprint: [u8; 32],
+    ) -> Claim {
         let now = Instant::now();
         let mut guard = self.lock();
         // Dereferenced once, on purpose: field-splitting borrows work through a
@@ -2131,6 +2146,9 @@ impl Ledger {
         // memory in the one module whose whole purpose is bounds.
         if let Some(bucket) = inner.peers.get(&peer) {
             if let Some(entry) = bucket.slots.get(&key) {
+                if entry.fingerprint != fingerprint {
+                    return Claim::Refused(IdempotencyRefusal::RequestMismatch.into());
+                }
                 return entry.slot.replay();
             }
             if bucket.running >= self.limits.running_per_peer.get() {
@@ -2146,6 +2164,7 @@ impl Ledger {
                 key.clone(),
                 Entry {
                     slot: Slot::Running(Arc::new(Notify::new())),
+                    fingerprint,
                     at: now,
                 },
             );
@@ -2158,6 +2177,7 @@ impl Ledger {
             peer,
             key,
             settled: false,
+            fingerprint,
             // Nothing is watching yet, which `Drop` reads as `NotDispatched` —
             // the truth about a key nothing has been dispatched under.
             // `serve_one` fills it before anything is.
@@ -2225,15 +2245,16 @@ impl Ledger {
         self: &Arc<Self>,
         peer: EndpointId,
         key: IdempotencyKey,
+        fingerprint: [u8; 32],
     ) -> Claim {
         // Moved rather than cloned: every arm but `Fresh` drops the key, and the
         // `Fresh` arm's guard is holding it, so the write below borrows it back
         // instead of being handed a second copy.
-        let claim = self.claim(peer, key);
+        let claim = self.claim(peer, key, fingerprint);
         let Claim::Fresh(guard) = claim else {
             return claim;
         };
-        if let Err(refusal) = self.write_claim(peer, &guard.key).await {
+        if let Err(refusal) = self.write_claim(peer, &guard.key, fingerprint).await {
             // Nothing ran, so the key goes back and the caller's retry is a
             // first attempt. If the write in fact reached the disk and reported
             // otherwise, that retry reads `Interrupted` instead — refused rather
@@ -2252,15 +2273,20 @@ impl Ledger {
     /// can act on: nothing ran, and the same key is safe to send again. The
     /// store's own error is not carried, because it names a disk the caller has
     /// no access to and cannot do anything about.
-    async fn write_claim(&self, peer: EndpointId, key: &IdempotencyKey) -> Result<(), RemoteError> {
+    async fn write_claim(
+        &self,
+        peer: EndpointId,
+        key: &IdempotencyKey,
+        fingerprint: [u8; 32],
+    ) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if store.claimed(peer, key).await.is_err() {
+            if store.claimed(peer, key, fingerprint).await.is_err() {
                 return Err(IdempotencyRefusal::NotClaimed.into());
             }
         }
         #[cfg(not(feature = "persist"))]
-        let _ = (peer, key);
+        let _ = (peer, key, fingerprint);
         Ok(())
     }
 
@@ -2278,15 +2304,16 @@ impl Ledger {
         peer: EndpointId,
         key: &IdempotencyKey,
         slot: &Slot,
+        fingerprint: [u8; 32],
     ) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if store.write(peer, key, slot).await.is_err() {
+            if store.write(peer, key, slot, fingerprint).await.is_err() {
                 return Err(IdempotencyRefusal::Unrecordable.into());
             }
         }
         #[cfg(not(feature = "persist"))]
-        let _ = (peer, key, slot);
+        let _ = (peer, key, slot, fingerprint);
         Ok(())
     }
 
@@ -2372,7 +2399,9 @@ impl Ledger {
             None => Reconcile::Erase,
             Some(entry) => match &entry.slot {
                 Slot::Running(_) => Reconcile::Untouched,
-                settled => Reconcile::Write(crate::durable::encode_slot(settled)),
+                settled => {
+                    Reconcile::Write(crate::durable::encode_slot(settled, entry.fingerprint))
+                }
             },
         }
     }
@@ -2398,10 +2427,14 @@ impl Ledger {
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
+        let Some(fingerprint) = bucket.slots.get(key).map(|entry| entry.fingerprint) else {
+            return;
+        };
         let Some(previous) = bucket.slots.insert(
             key.clone(),
             Entry {
                 slot,
+                fingerprint,
                 at: Instant::now(),
             },
         ) else {
@@ -2552,7 +2585,8 @@ impl Ledger {
         if moved {
             refile(inner, peer);
         }
-        // A tombstone on the disk is one byte; the reply it replaced is up to
+        // A disk tombstone retains 34 fixed bytes: binding/version tag,
+        // request-and-authority commitment and state. Its former reply is up to
         // `frame_bytes`. Without this the store would keep every expired reply
         // until its key left the tombstone pool, so `pool_bytes` would bind
         // memory and nothing else — and a restart would read `Done` for a key
@@ -2649,10 +2683,10 @@ impl Ledger {
 /// shorter one, which is the direction to be wrong in, and it is the only
 /// honest reading of a monotonic clock across two processes.
 #[cfg(feature = "persist")]
-fn recover(stored: Vec<(EndpointId, IdempotencyKey, Slot)>) -> Inner {
+fn recover(stored: Vec<crate::durable::Recovered>) -> Inner {
     let mut inner = Inner::default();
     let now = Instant::now();
-    for (peer, key, slot) in stored {
+    for (peer, key, fingerprint, slot) in stored {
         let holds_reply = matches!(slot, Slot::Done(_));
         let bytes = slot.held_bytes();
         let bucket = inner.peers.entry(peer).or_default();
@@ -2662,7 +2696,14 @@ fn recover(stored: Vec<(EndpointId, IdempotencyKey, Slot)>) -> Inner {
         if bucket.slots.contains_key(&key) {
             continue;
         }
-        bucket.slots.insert(key.clone(), Entry { slot, at: now });
+        bucket.slots.insert(
+            key.clone(),
+            Entry {
+                slot,
+                fingerprint,
+                at: now,
+            },
+        );
         if holds_reply {
             bucket.held.push_back(key);
             inner.held += 1;
@@ -2762,6 +2803,7 @@ fn refused_over(limit: NonZeroUsize) -> Claim {
 /// the only code that still runs, so it is where the decision has to live.
 #[derive(Debug)]
 pub(crate) struct Guard {
+    fingerprint: [u8; 32],
     ledger: Arc<Ledger>,
     peer: EndpointId,
     key: IdempotencyKey,
@@ -2865,7 +2907,10 @@ impl Guard {
         //
         // Bound rather than written one line lower, because the await sits
         // inside the `if let` head below and there is no position between them.
-        let stored = self.ledger.write_settled(self.peer, &self.key, &slot).await;
+        let stored = self
+            .ledger
+            .write_settled(self.peer, &self.key, &slot, self.fingerprint)
+            .await;
         self.settled = true;
         if let Err(refusal) = stored {
             // It RAN and produced a reply this ledger cannot hold, which is
@@ -3335,7 +3380,7 @@ mod tests {
             // test is about the call that DID enter the handler, and a
             // `NotDispatched` guard releases instead, which would be green for
             // the wrong reason.
-            let claimed = guard(ledger.claim(peer(A), key("k"))).watching(dispatched());
+            let claimed = guard(ledger.claim(peer(A), key("k"), [0; 32])).watching(dispatched());
             abort(claimed.record(&frame(16), false));
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Interrupted);
@@ -3347,7 +3392,7 @@ mod tests {
         #[test]
         fn an_abort_during_the_claim_write_leaves_the_key_claimable() {
             let ledger = stalling();
-            abort(ledger.claim_durably(peer(A), key("k")));
+            abort(ledger.claim_durably(peer(A), key("k"), [0; 32]));
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Fresh);
         }
@@ -3360,7 +3405,7 @@ mod tests {
         #[test]
         fn a_store_that_refuses_the_claim_says_nothing_ran() {
             let ledger = ledger_on(&Refusing);
-            let claim = now(ledger.claim_durably(peer(A), key("k")));
+            let claim = now(ledger.claim_durably(peer(A), key("k"), [0; 32]));
 
             assert_eq!(refusal(claim), IdempotencyRefusal::NotClaimed);
         }
@@ -3397,10 +3442,14 @@ mod tests {
         #[test]
         fn records_none_settles_the_key_and_holds_no_reply() {
             let ledger = recordless();
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                false,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Unrecordable,
                 "the key must be spent, so the work cannot run again"
             );
@@ -3428,19 +3477,31 @@ mod tests {
         #[test]
         fn a_retention_refusal_is_told_apart_from_an_eviction() {
             let ledger = Ledger::new(holding(1), Records::None);
-            settle(guard(ledger.claim(peer(A), key("kept"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(A), key("kept"), [0; 32])),
+                &frame(8),
+                false,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("kept"))),
+                refusal(ledger.claim(peer(A), key("kept"), [0; 32])),
                 IdempotencyRefusal::Unrecordable,
                 "a configured retention policy is not an eviction"
             );
 
             let evicting = Ledger::new(holding(1), Records::Memory);
-            settle(guard(evicting.claim(peer(A), key("old"))), &frame(8), false);
-            settle(guard(evicting.claim(peer(A), key("new"))), &frame(8), false);
+            settle(
+                guard(evicting.claim(peer(A), key("old"), [0; 32])),
+                &frame(8),
+                false,
+            );
+            settle(
+                guard(evicting.claim(peer(A), key("new"), [0; 32])),
+                &frame(8),
+                false,
+            );
             assert_eq!(
-                refusal(evicting.claim(peer(A), key("old"))),
+                refusal(evicting.claim(peer(A), key("old"), [0; 32])),
                 IdempotencyRefusal::Forgotten,
                 "and an eviction still says so, or the two names have merged"
             );
@@ -3460,7 +3521,11 @@ mod tests {
         #[test]
         fn a_retention_settle_is_a_tombstone_not_a_record() {
             let ledger = recordless();
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                false,
+            );
 
             let inner = ledger.lock();
             assert_eq!(
@@ -3508,7 +3573,7 @@ mod tests {
             let settle_eight = |ledger: &Arc<Ledger>| {
                 for n in 0..8 {
                     settle(
-                        guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                        guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                         &frame(8),
                         false,
                     );
@@ -3523,11 +3588,17 @@ mod tests {
             settle_eight(&recordless);
 
             assert!(
-                !matches!(recording.claim(peer(A), key("k0")), Claim::Fresh(_)),
+                !matches!(
+                    recording.claim(peer(A), key("k0"), [0; 32]),
+                    Claim::Fresh(_)
+                ),
                 "under Memory the oldest key must still be remembered"
             );
             assert!(
-                matches!(recordless.claim(peer(A), key("k0")), Claim::Fresh(_)),
+                matches!(
+                    recordless.claim(peer(A), key("k0"), [0; 32]),
+                    Claim::Fresh(_)
+                ),
                 "a record pool the key passes through first is what buys the longer window"
             );
         }
@@ -3552,7 +3623,11 @@ mod tests {
         #[test]
         fn a_retention_settle_reports_the_same_state_it_refuses_with() {
             let ledger = recordless();
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                false,
+            );
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Unrecordable);
         }
@@ -3587,16 +3662,19 @@ mod tests {
             // unwatched drop here would be asking a different question.
             let entered = Progress::new();
             entered.dispatched();
-            drop(guard(ledger.claim(peer(A), key("entered"))).watching(entered));
+            drop(guard(ledger.claim(peer(A), key("entered"), [0; 32])).watching(entered));
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("entered"))),
+                refusal(ledger.claim(peer(A), key("entered"), [0; 32])),
                 IdempotencyRefusal::Interrupted,
                 "entered and unfinished is still unknown"
             );
 
-            drop(guard(ledger.claim(peer(A), key("nothing"))).watching(Progress::new()));
+            drop(guard(ledger.claim(peer(A), key("nothing"), [0; 32])).watching(Progress::new()));
             assert!(
-                matches!(ledger.claim(peer(A), key("nothing")), Claim::Fresh(_)),
+                matches!(
+                    ledger.claim(peer(A), key("nothing"), [0; 32]),
+                    Claim::Fresh(_)
+                ),
                 "a key nothing ran under must still be claimable"
             );
         }
@@ -3620,9 +3698,13 @@ mod tests {
         #[test]
         fn memory_records_and_replays() {
             let ledger = Ledger::new(Limits::default(), Records::Memory);
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                false,
+            );
             assert_eq!(
-                recorded(ledger.claim(peer(A), key("k"))),
+                recorded(ledger.claim(peer(A), key("k"), [0; 32])),
                 frame(16),
                 "`Memory` must replay, which is what this crate did before the type"
             );
@@ -3636,7 +3718,7 @@ mod tests {
         fn an_unused_key_is_fresh() {
             let ledger = ledger();
             assert!(matches!(
-                ledger.claim(peer(A), key("first")),
+                ledger.claim(peer(A), key("first"), [0; 32]),
                 Claim::Fresh(_)
             ));
         }
@@ -3644,9 +3726,16 @@ mod tests {
         #[test]
         fn a_recorded_key_replays_the_same_bytes() {
             let ledger = ledger();
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                false,
+            );
 
-            assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(16));
+            assert_eq!(
+                recorded(ledger.claim(peer(A), key("k"), [0; 32])),
+                frame(16)
+            );
         }
 
         /// Byte for byte, not value for value. The property is asserted in three
@@ -3665,9 +3754,13 @@ mod tests {
             // Deliberately not a run of one repeated byte: a frame that is
             // uniform cannot show a re-encoding that reordered anything.
             let original = Bytes::from((0u8..=255).cycle().take(777).collect::<Vec<u8>>());
-            settle(guard(ledger.claim(peer(A), key("k"))), &original, false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &original,
+                false,
+            );
 
-            let replayed = recorded(ledger.claim(peer(A), key("k")));
+            let replayed = recorded(ledger.claim(peer(A), key("k"), [0; 32]));
             assert_eq!(
                 replayed, original,
                 "the recorded frame must be written back verbatim"
@@ -3678,9 +3771,16 @@ mod tests {
         #[test]
         fn a_different_key_is_fresh_even_after_one_is_recorded() {
             let ledger = ledger();
-            settle(guard(ledger.claim(peer(A), key("one"))), &frame(16), false);
+            settle(
+                guard(ledger.claim(peer(A), key("one"), [0; 32])),
+                &frame(16),
+                false,
+            );
 
-            assert!(matches!(ledger.claim(peer(A), key("two")), Claim::Fresh(_)));
+            assert!(matches!(
+                ledger.claim(peer(A), key("two"), [0; 32]),
+                Claim::Fresh(_)
+            ));
         }
 
         /// The property that keeps one peer from reading another's reply by
@@ -3690,13 +3790,16 @@ mod tests {
         fn two_peers_using_the_same_key_do_not_collide() {
             let ledger = ledger();
             settle(
-                guard(ledger.claim(peer(A), key("shared"))),
+                guard(ledger.claim(peer(A), key("shared"), [0; 32])),
                 &frame(16),
                 false,
             );
 
             assert!(
-                matches!(ledger.claim(peer(B), key("shared")), Claim::Fresh(_)),
+                matches!(
+                    ledger.claim(peer(B), key("shared"), [0; 32]),
+                    Claim::Fresh(_)
+                ),
                 "peer B must not be answered from peer A's record"
             );
         }
@@ -3704,10 +3807,10 @@ mod tests {
         #[test]
         fn a_second_claim_while_the_first_runs_is_refused_as_in_flight() {
             let ledger = ledger();
-            let _running = guard(ledger.claim(peer(A), key("k")));
+            let _running = guard(ledger.claim(peer(A), key("k"), [0; 32]));
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::InFlight
             );
         }
@@ -3722,10 +3825,10 @@ mod tests {
             let ledger = ledger();
             // A fresh marker says `NotDispatched`, which is what a layer that
             // refused without calling through leaves behind.
-            drop(guard(ledger.claim(peer(A), key("k"))).watching(Progress::new()));
+            drop(guard(ledger.claim(peer(A), key("k"), [0; 32])).watching(Progress::new()));
 
             assert!(
-                matches!(ledger.claim(peer(A), key("k")), Claim::Fresh(_)),
+                matches!(ledger.claim(peer(A), key("k"), [0; 32]), Claim::Fresh(_)),
                 "a key nothing ran under must be claimable again"
             );
         }
@@ -3737,10 +3840,10 @@ mod tests {
             let ledger = ledger();
             let progress = Progress::new();
             progress.dispatched();
-            drop(guard(ledger.claim(peer(A), key("k"))).watching(progress));
+            drop(guard(ledger.claim(peer(A), key("k"), [0; 32])).watching(progress));
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Interrupted
             );
         }
@@ -3748,10 +3851,14 @@ mod tests {
         #[test]
         fn a_reply_that_carries_a_body_is_not_replayed() {
             let ledger = ledger();
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(16), true);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(16),
+                true,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Unrecordable
             );
         }
@@ -3790,10 +3897,14 @@ mod tests {
         #[test]
         fn a_reply_over_the_frame_ceiling_is_not_replayed() {
             let ledger = bounded(Limits::default().frame_bytes(nz(64)));
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(65), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(65),
+                false,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Unrecordable
             );
         }
@@ -3810,10 +3921,14 @@ mod tests {
         #[test]
         fn a_reply_under_the_ceiling_and_over_the_pool_is_forgotten_not_unrecordable() {
             let ledger = bounded(Limits::default().frame_bytes(nz(64)).pool_bytes(nz(8)));
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(32), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(32),
+                false,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Forgotten,
                 "a frame inside the ceiling is recorded, then evicted by the pool"
             );
@@ -3828,7 +3943,7 @@ mod tests {
             let ledger = bounded(holding(4));
             for n in 0..64 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(8),
                     false,
                 );
@@ -3863,7 +3978,7 @@ mod tests {
             let ledger = bounded(Limits::default().pool_bytes(nz(64)));
             for n in 0..64 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(16),
                     false,
                 );
@@ -3918,7 +4033,7 @@ mod tests {
             );
             for n in 0..64 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(16),
                     false,
                 );
@@ -3984,17 +4099,21 @@ mod tests {
         #[test]
         fn a_flooding_peer_cannot_evict_a_quiet_peers_record() {
             let ledger = bounded(holding(4));
-            settle(guard(ledger.claim(peer(B), key("quiet"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(B), key("quiet"), [0; 32])),
+                &frame(8),
+                false,
+            );
             for n in 0..64 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(8),
                     false,
                 );
             }
 
             assert_eq!(
-                recorded(ledger.claim(peer(B), key("quiet"))),
+                recorded(ledger.claim(peer(B), key("quiet"), [0; 32])),
                 frame(8),
                 "the quiet peer's record must survive the flood"
             );
@@ -4005,17 +4124,17 @@ mod tests {
         #[test]
         fn a_running_claim_is_never_evicted() {
             let ledger = bounded(holding(1));
-            let _running = guard(ledger.claim(peer(A), key("running")));
+            let _running = guard(ledger.claim(peer(A), key("running"), [0; 32]));
             for n in 0..64 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(8),
                     false,
                 );
             }
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("running"))),
+                refusal(ledger.claim(peer(A), key("running"), [0; 32])),
                 IdempotencyRefusal::InFlight,
                 "the in-flight claim must outlive every settled record"
             );
@@ -4026,16 +4145,24 @@ mod tests {
         #[test]
         fn an_evicted_key_is_refused_not_rerun() {
             let ledger = bounded(holding(2));
-            settle(guard(ledger.claim(peer(A), key("old"))), &frame(8), false);
-            settle(guard(ledger.claim(peer(A), key("new"))), &frame(8), false);
             settle(
-                guard(ledger.claim(peer(A), key("newest"))),
+                guard(ledger.claim(peer(A), key("old"), [0; 32])),
+                &frame(8),
+                false,
+            );
+            settle(
+                guard(ledger.claim(peer(A), key("new"), [0; 32])),
+                &frame(8),
+                false,
+            );
+            settle(
+                guard(ledger.claim(peer(A), key("newest"), [0; 32])),
                 &frame(8),
                 false,
             );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("old"))),
+                refusal(ledger.claim(peer(A), key("old"), [0; 32])),
                 IdempotencyRefusal::Forgotten,
                 "the oldest record must leave a tombstone, not a vacancy"
             );
@@ -4048,14 +4175,14 @@ mod tests {
             let ledger = bounded(Limits::default().pool_records(nz(1)).tombstones(nz(2)));
             for n in 0..8 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(8),
                     false,
                 );
             }
 
             assert!(
-                matches!(ledger.claim(peer(A), key("k0")), Claim::Fresh(_)),
+                matches!(ledger.claim(peer(A), key("k0"), [0; 32]), Claim::Fresh(_)),
                 "the oldest tombstone must be the one that left"
             );
             assert!(ledger.lock().spent <= 2);
@@ -4064,15 +4191,15 @@ mod tests {
         #[test]
         fn running_claims_are_bounded_per_peer() {
             let ledger = bounded(Limits::default().running_per_peer(nz(2)));
-            let _one = guard(ledger.claim(peer(A), key("a")));
-            let _two = guard(ledger.claim(peer(A), key("b")));
+            let _one = guard(ledger.claim(peer(A), key("a"), [0; 32]));
+            let _two = guard(ledger.claim(peer(A), key("b"), [0; 32]));
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("c"))),
+                refusal(ledger.claim(peer(A), key("c"), [0; 32])),
                 IdempotencyRefusal::TooManyRunning { limit: 2 }
             );
             assert!(
-                matches!(ledger.claim(peer(B), key("c")), Claim::Fresh(_)),
+                matches!(ledger.claim(peer(B), key("c"), [0; 32]), Claim::Fresh(_)),
                 "one peer's flood must not close the door on another"
             );
         }
@@ -4080,11 +4207,11 @@ mod tests {
         #[test]
         fn running_claims_are_bounded_in_total() {
             let ledger = bounded(Limits::default().running(nz(2)));
-            let _one = guard(ledger.claim(peer(A), key("a")));
-            let _two = guard(ledger.claim(peer(B), key("b")));
+            let _one = guard(ledger.claim(peer(A), key("a"), [0; 32]));
+            let _two = guard(ledger.claim(peer(B), key("b"), [0; 32]));
 
             assert_eq!(
-                refusal(ledger.claim(peer(B), key("c"))),
+                refusal(ledger.claim(peer(B), key("c"), [0; 32])),
                 IdempotencyRefusal::TooManyRunning { limit: 2 }
             );
         }
@@ -4152,13 +4279,17 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_record_expires_after_its_ttl() {
             let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(8), false);
-            assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(8));
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(8),
+                false,
+            );
+            assert_eq!(recorded(ledger.claim(peer(A), key("k"), [0; 32])), frame(8));
 
             tokio::time::advance(Duration::from_secs(61)).await;
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Forgotten,
                 "an expired record must leave a tombstone, not its reply"
             );
@@ -4176,10 +4307,14 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_ttl_of_zero_forgets_every_record_at_the_next_claim() {
             let ledger = bounded(Limits::default().ttl(Duration::ZERO));
-            settle(guard(ledger.claim(peer(A), key("k"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(A), key("k"), [0; 32])),
+                &frame(8),
+                false,
+            );
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::Forgotten,
                 "at-most-once holds and no answer survives"
             );
@@ -4188,12 +4323,12 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_running_claim_does_not_expire() {
             let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
-            let _running = guard(ledger.claim(peer(A), key("k")));
+            let _running = guard(ledger.claim(peer(A), key("k"), [0; 32]));
 
             tokio::time::advance(Duration::from_secs(600)).await;
 
             assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
+                refusal(ledger.claim(peer(A), key("k"), [0; 32])),
                 IdempotencyRefusal::InFlight,
                 "a claim with no reply yet has no deadline but the transport's"
             );
@@ -4213,7 +4348,7 @@ mod tests {
             // `NotDispatched` and releases the key instead.
             let entered = Progress::new();
             entered.dispatched();
-            let running = guard(ledger.claim(peer(A), key("running"))).watching(entered);
+            let running = guard(ledger.claim(peer(A), key("running"), [0; 32])).watching(entered);
             assert_eq!(
                 ledger.key_state(peer(A), &key("running")),
                 KeyState::Running
@@ -4224,24 +4359,40 @@ mod tests {
                 KeyState::Interrupted
             );
 
-            settle(guard(ledger.claim(peer(A), key("body"))), &frame(8), true);
+            settle(
+                guard(ledger.claim(peer(A), key("body"), [0; 32])),
+                &frame(8),
+                true,
+            );
             assert_eq!(
                 ledger.key_state(peer(A), &key("body")),
                 KeyState::Unrecordable
             );
 
-            settle(guard(ledger.claim(peer(A), key("kept"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(A), key("kept"), [0; 32])),
+                &frame(8),
+                false,
+            );
             assert_eq!(ledger.key_state(peer(A), &key("kept")), KeyState::Done);
 
             // One record fits, so the second recording evicts the first.
-            settle(guard(ledger.claim(peer(A), key("later"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(A), key("later"), [0; 32])),
+                &frame(8),
+                false,
+            );
             assert_eq!(ledger.key_state(peer(A), &key("kept")), KeyState::Forgotten);
         }
 
         #[test]
         fn key_state_is_peer_scoped() {
             let ledger = ledger();
-            settle(guard(ledger.claim(peer(A), key("mine"))), &frame(8), false);
+            settle(
+                guard(ledger.claim(peer(A), key("mine"), [0; 32])),
+                &frame(8),
+                false,
+            );
 
             assert_eq!(ledger.key_state(peer(A), &key("mine")), KeyState::Done);
             assert_eq!(
@@ -4425,16 +4576,20 @@ mod tests {
                 let p = if n % 3 == 0 { peer(B) } else { peer(A) };
                 match n % 5 {
                     // recorded, sometimes too large to hold
-                    0 => settle(guard(ledger.claim(p, k)), &frame(usize::from(n) + 1), false),
+                    0 => settle(
+                        guard(ledger.claim(p, k, [0; 32])),
+                        &frame(usize::from(n) + 1),
+                        false,
+                    ),
                     // unrecordable
-                    1 => settle(guard(ledger.claim(p, k)), &frame(8), true),
+                    1 => settle(guard(ledger.claim(p, k, [0; 32])), &frame(8), true),
                     // interrupted, by dropping an unwatched guard
-                    2 => drop(guard(ledger.claim(p, k))),
+                    2 => drop(guard(ledger.claim(p, k, [0; 32]))),
                     // released, because nothing was dispatched
-                    3 => drop(guard(ledger.claim(p, k)).watching(Progress::new())),
+                    3 => drop(guard(ledger.claim(p, k, [0; 32])).watching(Progress::new())),
                     // claimed and left running for a while
                     _ => {
-                        let running = guard(ledger.claim(p, k.clone()));
+                        let running = guard(ledger.claim(p, k.clone(), [0; 32]));
                         assert_agrees(&ledger, "while a claim is running");
                         settle(running, &frame(4), false);
                     }
@@ -4446,7 +4601,7 @@ mod tests {
             // removes a tombstone and adds a record in one call.
             for n in 0..20u8 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(2),
                     false,
                 );
@@ -4461,7 +4616,7 @@ mod tests {
             let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
             for n in 0..10u8 {
                 settle(
-                    guard(ledger.claim(peer(A), key(&format!("k{n}")))),
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")), [0; 32])),
                     &frame(8),
                     false,
                 );
@@ -4470,7 +4625,7 @@ mod tests {
 
             tokio::time::advance(Duration::from_secs(61)).await;
             // `expire` is lazy, so a claim is what drives it.
-            let _ = ledger.claim(peer(A), key("wake"));
+            let _ = ledger.claim(peer(A), key("wake"), [0; 32]);
             assert_agrees(&ledger, "after the ttl");
             assert_eq!(ledger.lock().bytes, 0, "expired records free their bytes");
         }
@@ -4484,10 +4639,10 @@ mod tests {
         #[test]
         fn a_claim_the_global_cap_refuses_leaves_no_bucket_behind() {
             let ledger = bounded(Limits::default().running(nz(1)));
-            let _running = guard(ledger.claim(peer(A), key("a")));
+            let _running = guard(ledger.claim(peer(A), key("a"), [0; 32]));
 
             assert_eq!(
-                refusal(ledger.claim(peer(B), key("b"))),
+                refusal(ledger.claim(peer(B), key("b"), [0; 32])),
                 IdempotencyRefusal::TooManyRunning { limit: 1 }
             );
             // The probe is the assertion. A second, narrower one here would
@@ -4541,9 +4696,9 @@ mod tests {
         #[tokio::test]
         async fn a_waiter_is_woken_when_the_slot_settles() {
             let ledger = ledger();
-            let running = guard(ledger.claim(peer(A), key("k")));
+            let running = guard(ledger.claim(peer(A), key("k"), [0; 32]));
 
-            let Claim::Running(notify) = ledger.claim(peer(A), key("k")) else {
+            let Claim::Running(notify) = ledger.claim(peer(A), key("k"), [0; 32]) else {
                 panic!("expected a running slot");
             };
 
@@ -4556,7 +4711,10 @@ mod tests {
             settle(running, &frame(16), false);
             notified.await;
 
-            assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(16));
+            assert_eq!(
+                recorded(ledger.claim(peer(A), key("k"), [0; 32])),
+                frame(16)
+            );
         }
 
         /// The half that made §3.3 right to worry: a waiter that registers after
@@ -4564,8 +4722,8 @@ mod tests {
         #[tokio::test]
         async fn a_waiter_that_registers_late_still_sees_the_settled_slot() {
             let ledger = ledger();
-            let running = guard(ledger.claim(peer(A), key("k")));
-            let Claim::Running(notify) = ledger.claim(peer(A), key("k")) else {
+            let running = guard(ledger.claim(peer(A), key("k"), [0; 32]));
+            let Claim::Running(notify) = ledger.claim(peer(A), key("k"), [0; 32]) else {
                 panic!("expected a running slot");
             };
 
@@ -4574,7 +4732,10 @@ mod tests {
             // No `enable()` before the settle, so this wakeup is genuinely lost.
             // The re-claim under the lock is what makes that survivable, and it
             // is why the accept path re-reads the slot before it awaits.
-            assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(16));
+            assert_eq!(
+                recorded(ledger.claim(peer(A), key("k"), [0; 32])),
+                frame(16)
+            );
             drop(notify);
         }
 
@@ -4670,6 +4831,45 @@ mod tests {
                 Limits::default().attach,
                 Attaching::UpTo(MAX_ATTACH),
                 "the default ceiling must be the constant the README prints"
+            );
+        }
+    }
+    #[test]
+    fn request_fingerprints_bind_running_settled_and_recovered_records() {
+        let ledger = Ledger::new(Limits::default(), Records::Memory);
+        let first = guard(ledger.claim(peer(A), key("bound"), [1; 32]));
+        assert_eq!(
+            refusal(ledger.claim(peer(A), key("bound"), [2; 32])),
+            IdempotencyRefusal::RequestMismatch
+        );
+        settle(first, &frame(16), false);
+        assert_eq!(
+            refusal(ledger.claim(peer(A), key("bound"), [2; 32])),
+            IdempotencyRefusal::RequestMismatch
+        );
+        assert_eq!(
+            recorded(ledger.claim(peer(A), key("bound"), [1; 32])),
+            frame(16)
+        );
+        #[cfg(feature = "persist")]
+        {
+            let recovered = Arc::new(Ledger {
+                inner: Mutex::new(recover(vec![(
+                    peer(A),
+                    key("bound"),
+                    [1; 32],
+                    Slot::Done(frame(16)),
+                )])),
+                limits: Limits::default(),
+                records: Records::Memory,
+            });
+            assert_eq!(
+                refusal(recovered.claim(peer(A), key("bound"), [2; 32])),
+                IdempotencyRefusal::RequestMismatch
+            );
+            assert_eq!(
+                recorded(recovered.claim(peer(A), key("bound"), [1; 32])),
+                frame(16)
             );
         }
     }

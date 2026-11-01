@@ -52,7 +52,7 @@ all = { level = "deny", priority = -1 }
 expect_used = "deny"
 unwrap_used = "deny"
 # One module-file layout, held by the gate rather than by habit.
-# `keylink/src/actor/mod.rs` and `keylink/src/compose/mod.rs` are the only
+# `keylink/src/{actor,compose,trust}/mod.rs` are the only
 # directory modules in the workspace, so this is a no-op on the tree as it
 # stands and a refusal on the first `foo.rs` written beside a `foo/`.
 #

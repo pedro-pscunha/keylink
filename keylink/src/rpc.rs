@@ -189,13 +189,60 @@ pub trait Governed: GovernedSeal {}
 #[doc(hidden)]
 pub trait GovernedSeal {}
 
-/// A compiled method policy checked before idempotency state is touched.
-pub(crate) trait MethodAuthorization: Send + Sync + 'static {
-    /// Bind a typed layer to the same policy object used by preflight.
-    fn bind(&mut self, installed: std::sync::Weak<dyn MethodAuthorization>);
+// The ledger stores this commitment unchanged, including across durable recovery.
+// An identical request under another selected principal is not the same replay.
+fn replay_binding(message: [u8; 32], credential: Option<&crate::trust::Credential>) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"keylink replay binding v1");
+    hash.update(&message);
+    match credential {
+        Some(credential) => {
+            hash.update(&[1]);
+            hash.update(credential.principal().as_bytes());
+            hash.update(credential.holder().as_bytes());
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    *hash.finalize().as_bytes()
+}
 
-    /// Whether `peer` may call `method`.
-    fn authorizes(&self, peer: EndpointId, method: &'static str) -> bool;
+pub(crate) type Checked<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<Option<Arc<crate::trust::Credential>>, RemoteError>,
+            > + Send
+            + 'a,
+    >,
+>;
+pub(crate) trait Preflight<Req>: Send + Sync + 'static {
+    fn check<'a>(&'a self, peer: EndpointId, request: &'a Req) -> Checked<'a>;
+    fn recheck(
+        &self,
+        _peer: EndpointId,
+        _request: &Req,
+        _credential: Option<&crate::trust::Credential>,
+    ) -> std::result::Result<(), RemoteError> {
+        Ok(())
+    }
+}
+
+async fn preflight<Req: 'static>(
+    required: &[Arc<dyn Preflight<Req>>],
+    peer: EndpointId,
+    req: &Req,
+) -> std::result::Result<Option<Arc<crate::trust::Credential>>, RemoteError> {
+    let mut checked = Vec::with_capacity(required.len());
+    for policy in required {
+        checked.push(policy.check(peer, req).await?);
+    }
+    // A later asynchronous policy can outlive an earlier one's decision.
+    // Recheck every exact credential, not whichever alternative now admits peer.
+    for (policy, credential) in required.iter().zip(&checked) {
+        policy.recheck(peer, req, credential.as_deref())?;
+    }
+    Ok(checked.into_iter().flatten().next())
 }
 
 /// Serves one protocol: authorizes the peer once per connection, then answers
@@ -207,7 +254,7 @@ pub(crate) struct RpcService<Req, Resp> {
     /// I/O, and a generic would reach every `service!` user's type errors.
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
-    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -224,7 +271,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
             next: self.next.clone(),
             admission: self.admission.clone(),
             required_admission: self.required_admission.clone(),
-            required_authorization: self.required_authorization.clone(),
+            required: self.required.clone(),
             blobs: self.blobs.clone(),
             keys: self.keys.clone(),
             _p: PhantomData,
@@ -393,6 +440,7 @@ async fn claim_key(
     method: &'static str,
     peer: EndpointId,
     idem: Option<Idempotency>,
+    fingerprint: [u8; 32],
 ) -> Claimed {
     let Some(idem) = idem else {
         return Claimed::None;
@@ -422,7 +470,7 @@ async fn claim_key(
     ledger.housekeep().await;
     let key = idem.key().clone();
 
-    let notify = match ledger.claim_durably(peer, key.clone()).await {
+    let notify = match ledger.claim_durably(peer, key.clone(), fingerprint).await {
         Claim::Running(notify) => notify,
         settled => return resolve(settled),
     };
@@ -474,14 +522,14 @@ async fn claim_key(
     // under load.
     notified.as_mut().enable();
 
-    match ledger.claim_durably(peer, key.clone()).await {
+    match ledger.claim_durably(peer, key.clone(), fingerprint).await {
         Claim::Running(_) => {}
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
-    resolve(ledger.claim_durably(peer, key).await)
+    resolve(ledger.claim_durably(peer, key, fingerprint).await)
 }
 
 /// Write a recorded reply again, byte for byte.
@@ -594,12 +642,13 @@ fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
 /// needs an answer must be an `rpc`.
 async fn serve_one_tell<Req, Resp>(
     next: Next<Req, Resp>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     blobs: Option<Blobs>,
     peer: AdmittedPeer,
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
@@ -614,13 +663,22 @@ where
         return Ok(());
     };
 
+    let Ok(credential) = preflight(&required, peer.id(), &message).await else {
+        return Ok(());
+    };
     let cx = Context::new(peer.id(), Req::SERVICE, message.method())
-        .with_actor(message.actor().cloned());
+        .with_actor(message.actor().cloned())
+        .with_credential(credential);
 
     // The body reader is handed over for symmetry with `serve_one`: a `tell`
     // carries no body today, and a future kind that does will find the seam
     // already here rather than needing the signature changed.
-    let (_outcome, _body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
+    let (_outcome, _body) = next(
+        cx,
+        message,
+        BodyReader::new(frames, request.control.body_len),
+    )
+    .await;
     let _ = blobs;
     Ok(())
 }
@@ -628,7 +686,7 @@ where
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
-    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
+    required: Arc<[Arc<dyn Preflight<Req>>]>,
     keys: Keys,
     grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
@@ -636,14 +694,15 @@ async fn serve_one<Req, Resp>(
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: Rpc + DeserializeOwned,
+    Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
     let peer = admitted.id();
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some(request) = frames.read_header::<WireRequest<Req>>().await? else {
+    let Some((request, received_fingerprint)) = frames.read_request::<WireRequest<Req>>().await?
+    else {
         return Ok(());
     };
 
@@ -654,37 +713,39 @@ where
         WireRequest::Call(message) => message,
     };
 
-    // Required method policy runs before key validation, claim, attach, replay,
+    // Required policy runs before key validation, claim, attach, replay,
     // or refusal. The ledger is scoped to `(peer, key)`, so a replay cannot be
     // allowed to answer a method this policy denies.
-    for policy in required_authorization.iter() {
-        if !policy.authorizes(peer, message.method()) {
-            return refuse::<Resp>(
-                &mut send,
-                RemoteError::Unauthorized(message.method().to_owned()),
-            )
-            .await;
-        }
-    }
+    let credential = match preflight(&required, peer, &message).await {
+        Ok(credential) => credential,
+        Err(error) => return refuse::<Resp>(&mut send, error).await,
+    };
 
-    // Named BEFORE the key is consumed below, and by reference rather than by
-    // clone: this is the one place both halves of the digest exist, exactly as it
-    // is the one place both halves of a blob grant do.
+    // One commitment drives both replay stores: the transport ledger and the
+    // application's Applied state reached through Context::call.
+    let fingerprint = if request.control.idempotency.is_some() {
+        replay_binding(received_fingerprint, credential.as_deref())
+    } else {
+        [0; 32]
+    };
+
+    // Name the bound call BEFORE consuming the key below. Peer, key and the
+    // shared request/authority commitment are all available here, so handlers
+    // never have to reconstruct either replay store's identity rules.
     //
     // Computed for a key that has not been validated yet, which is harmless and
     // worth saying: `claim_key` refuses a malformed key before the chain is
     // entered, so no handler ever sees a `CallId` derived from one.
-    let mut cx = Context::new(peer, Req::SERVICE, message.method())
+    let cx = Context::new(peer, Req::SERVICE, message.method())
         .with_actor(message.actor().cloned())
         .with_call(
             request
+                .control
                 .idempotency
                 .as_ref()
-                .map(|idem| CallId::of(peer, idem.key())),
-        );
-    if !required_authorization.is_empty() {
-        cx = cx.with_method_authorized(required_authorization.clone());
-    }
+                .map(|idem| CallId::of(peer, idem.key(), fingerprint)),
+        )
+        .with_credential(credential);
     // Kept while the chain runs, because the chain's own `Outcome` cannot say
     // whether the work was entered — see `Reached`.
     let progress = cx.progress();
@@ -695,9 +756,17 @@ where
     //
     // `keys` is also where this service says which methods accept a key at all,
     // and a key on any other is refused here rather than quietly dropped. An
-    // UNKEYED call still costs nothing: `request.idempotency` is `None`, which is
+    // UNKEYED call still costs nothing: `request.control.idempotency` is `None`, which is
     // the first thing `claim_key` reads and the only thing it needs.
-    let keyed = match claim_key(&keys, message.method(), peer, request.idempotency).await {
+    let keyed = match claim_key(
+        &keys,
+        message.method(),
+        peer,
+        request.control.idempotency,
+        fingerprint,
+    )
+    .await
+    {
         Claimed::None => None,
         // The guard watches the marker, so this task being ABORTED — the
         // connection ended, the server shut down — still settles honestly, even
@@ -710,7 +779,12 @@ where
     // The fence in `grants` was taken when this stream was accepted, before the
     // request was read or the key claimed, so a revoke that lands at any point
     // after that reaches the grant this call is about to make.
-    let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
+    let (outcome, body) = next(
+        cx,
+        message,
+        BodyReader::new(frames, request.control.body_len),
+    )
+    .await;
 
     // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
     // is written, and that order is the whole property: the address reaches the
@@ -905,7 +979,7 @@ where
                     };
                     calls.spawn(serve_one(
                         self.next.clone(),
-                        self.required_authorization.clone(),
+                        self.required.clone(),
                         self.keys.clone(),
                         grants,
                         admitted,
@@ -916,6 +990,7 @@ where
                 Ok(Stream::Uni(recv)) => {
                     calls.spawn(serve_one_tell(
                         self.next.clone(),
+                        self.required.clone(),
                         self.blobs.clone(),
                         admitted,
                         recv,
@@ -943,6 +1018,52 @@ mod tests {
 
     // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
+
+    #[test]
+    // Made red with scripts/break-once.sh by zeroing the holder contribution in replay_binding with `hash.update(&[0; 32]);`.
+    // This same-file edit is described rather than quoted.
+    // Watched: different holders produced the same replay commitment.
+    fn replay_authority_commitments_include_principal_and_holder() {
+        use crate::trust::{
+            Caveats, Certificate, Chain, Delegation, Roots, Scope, Timestamp, Validity,
+        };
+        let a = iroh::SecretKey::from_bytes(&[20; 32]);
+        let b = iroh::SecretKey::from_bytes(&[21; 32]);
+        let first = iroh::SecretKey::from_bytes(&[22; 32]);
+        let second = iroh::SecretKey::from_bytes(&[23; 32]);
+        let credential = |root: &iroh::SecretKey, holder: iroh::PublicKey| {
+            Chain::new(vec![Certificate::issue(
+                root,
+                Delegation {
+                    subject: holder,
+                    delegate: 0,
+                    serial: 0,
+                    caveats: Caveats {
+                        resources: Scope::any(),
+                        operations: Scope::any(),
+                        validity: Validity::new(
+                            Timestamp::from_unix_secs(0),
+                            Timestamp::from_unix_secs(u64::MAX),
+                        )
+                        .unwrap(),
+                    },
+                },
+            )
+            .unwrap()])
+            .verify(
+                &Roots::only([root.public()]).unwrap(),
+                Timestamp::from_unix_secs(1),
+            )
+            .unwrap()
+        };
+        let original = credential(&a, first.public());
+        let different_principal = credential(&b, first.public());
+        let different_holder = credential(&a, second.public());
+        let bound = replay_binding([9; 32], Some(&original));
+        assert_ne!(bound, replay_binding([9; 32], Some(&different_principal)));
+        assert_ne!(bound, replay_binding([9; 32], Some(&different_holder)));
+        assert_ne!(bound, replay_binding([9; 32], None));
+    }
     use crate::idempotency::{MAX_ATTACH, MAX_WAITING_PER_PEER};
 
     /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
@@ -1048,7 +1169,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
@@ -1060,6 +1181,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
         )
         .await;
 
@@ -1098,7 +1220,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         // Every place but one, so the attacher below takes the last.
@@ -1114,6 +1236,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
         ));
         let answered = poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await;
         assert!(
@@ -1146,7 +1269,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
 
@@ -1156,6 +1279,7 @@ mod tests {
             "Probe",
             peer,
             Some(Idempotency::attaching_for(key, asked)),
+            [0; 32],
         )
         .await;
         let held = started.elapsed();
@@ -1357,7 +1481,7 @@ mod tests {
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
-        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone(), [0; 32]) else {
             panic!("the first claim must be fresh");
         };
         let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
@@ -1368,7 +1492,7 @@ mod tests {
             Some(budget) => Idempotency::attaching_for(key, budget),
             None => key.into(),
         };
-        let keyed = claim_key(&any(&ledger), "Probe", peer, Some(idem)).await;
+        let keyed = claim_key(&any(&ledger), "Probe", peer, Some(idem), [0; 32]).await;
 
         // Exhaustive, with no catch-all, for the reason
         // `an_attacher_over_the_cap_is_refused_before_it_parks` gives: the arm that
@@ -1501,10 +1625,9 @@ pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
-    required_authorization: Vec<Arc<dyn MethodAuthorization>>,
+    required: Vec<Arc<dyn Preflight<Req>>>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
-    required_layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     blobs: Option<Blobs>,
     /// Set by generated code from `DECLARES_BLOBS`. Compared against `blobs` at
     /// spawn, so "this service serves content but was given no store" is a
@@ -1534,10 +1657,9 @@ where
             alpn,
             admission: Arc::new(allow),
             required_admission: Vec::new(),
-            required_authorization: Vec::new(),
+            required: Vec::new(),
             base: dispatch,
             layers: Vec::new(),
-            required_layers: Vec::new(),
             blobs: None,
             declares_blobs: false,
             // Spelled out rather than reached through `Default`, and neither type
@@ -1592,19 +1714,14 @@ where
         self
     }
 
-    pub(crate) fn require_authorization<A>(mut self, mut authorization: A) -> Self
-    where
-        A: MethodAuthorization + Middleware<Req, Resp>,
-    {
-        let authorization = Arc::new_cyclic(|installed| {
-            authorization.bind(installed.clone() as std::sync::Weak<dyn MethodAuthorization>);
-            authorization
-        });
-        self.required_authorization.push(authorization.clone());
-        self.required_layers.push(authorization);
+    pub(crate) fn require(mut self, policy: impl Preflight<Req>) -> Self {
+        self.required.push(Arc::new(policy));
         self
     }
 
+    /// Required policies installed by `Compiled` or `trust::Guard` run before
+    /// every layer and cannot be replaced by this setting.
+    ///
     /// Admit against a policy rather than against the fixed list this was built
     /// with.
     ///
@@ -1621,7 +1738,7 @@ where
     ///     .admission(policy.clone())
     ///     .build();
     /// // ... later, without a restart, and closing whoever is no longer welcome
-    /// let closed = policy.replace(Allowlist::only([second]));
+    /// let closed = policy.apply(Allowlist::only([second]))?;
     /// ```
     #[must_use]
     pub fn admission(mut self, admission: Arc<dyn Admission>) -> Self {
@@ -1630,8 +1747,9 @@ where
     }
 
     /// Add a layer. The first ordinary layer added is the outermost: it sees the
-    /// request first and the reply last. Required layers installed by
-    /// [`Compiled`](crate::Compiled) remain outside every ordinary layer.
+    /// request first and the reply last. Required policies installed by
+    /// [`Compiled`](crate::Compiled) or [`Guard`](crate::trust::Guard) run
+    /// before every ordinary layer, on both call and tell paths.
     #[must_use]
     pub fn layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
         self.layers.push(Arc::new(layer));
@@ -1875,16 +1993,13 @@ where
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);
         }
-        for layer in self.required_layers.into_iter().rev() {
-            chain = wrap(layer, chain);
-        }
         Service {
             alpn: self.alpn,
             handler: Box::new(RpcService {
                 next: chain,
                 admission: self.admission,
                 required_admission: self.required_admission,
-                required_authorization: self.required_authorization.into(),
+                required: self.required.into(),
                 blobs: self.blobs.clone(),
                 keys: Keys::new(self.keyable, self.records, self.limits),
                 _p: PhantomData,
@@ -2198,10 +2313,12 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     ///
     /// The key goes on EVERY call made through the returned client, so it is
     /// meant for one. A second, DIFFERENT call through the same handle is
-    /// answered from the first call's record, and the generated client refuses
-    /// a reply to a question it did not ask
-    /// ([`Error::UnexpectedResponse`]). That is a loud failure rather than a
-    /// wrong answer, but it is still a mistake worth not making.
+    /// refused as [`IdempotencyRefusal::RequestMismatch`] before any recorded
+    /// reply is returned. The binding covers the encoded request message,
+    /// from the received wire bytes, excluding transport/retry controls, and the selected credential's
+    /// principal and holder. Retries must retain both message bytes and authority.
+    /// A different contract version that encodes the same call differently is
+    /// a typed mismatch; no cross-version canonicalization is performed.
     ///
     /// # Why this returns a different type
     ///
@@ -2373,7 +2490,7 @@ where
         };
         match response.message {
             WireResponse::Call(Outcome::Ok(value)) => {
-                Ok((value, BodyReader::new(frames, response.body_len)))
+                Ok((value, BodyReader::new(frames, response.control.body_len)))
             }
             // A refusal carries no body: the handler never ran, or never
             // finished, so there is nothing to stream.

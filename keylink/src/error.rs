@@ -765,6 +765,10 @@ pub enum ConfigError {
     /// The allowlist parsed to nothing at all.
     #[error("allowlist is empty - refusing to serve a protocol nobody can reach")]
     EmptyAllowlist,
+
+    /// No trusted roots were supplied.
+    #[error("at least one trusted root is required")]
+    EmptyRoots,
     /// [`Records::Durable`](crate::Records) was configured on a service that
     /// accepts no idempotency key.
     ///
