@@ -910,3 +910,73 @@ mod attributed {
         assert_eq!(attributed::version_1::VERSION, old::attributed::VERSION);
     }
 }
+
+// Keep this invocation at this file's root. As a standalone integration target
+// it is at crate root; the aggregate includes the same fixture one module deep.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, postcard_schema::Schema,
+)]
+pub struct RootScopedEntry {
+    pub qty: u64,
+}
+mod root_frozen {
+    use super::RootScopedEntry;
+    keylink::service! {
+        service RootScope; version 1;
+        rpc Echo(value: RootScopedEntry) -> RootScopedEntry;
+    }
+}
+keylink::service! {
+    service RootScope; version 2;
+    rpc Echo(value: RootScopedEntry) -> RootScopedEntry;
+    previous 1 {
+        hash root_frozen::root_scope::VERSION.hash();
+        keyed_hash root_frozen::root_scope::KEYED_VERSION.hash();
+        rpc Echo(value: RootScopedEntry) -> RootScopedEntry;
+    }
+}
+impl root_scope::version_1::Convert for root_scope::version_1::Step {
+    fn upgrade_request(
+        _: root_scope::version_1::Request,
+    ) -> Result<root_scope::Request, Unsupported> {
+        unreachable!("plain request is generated")
+    }
+    fn downgrade_request(
+        _: root_scope::Request,
+    ) -> Result<root_scope::version_1::Request, Unsupported> {
+        unreachable!("plain request is generated")
+    }
+    fn upgrade_response(
+        _: root_scope::version_1::Response,
+    ) -> Result<root_scope::Response, Unsupported> {
+        unreachable!("plain reply is generated")
+    }
+    fn downgrade_response(
+        _: root_scope::Response,
+    ) -> Result<root_scope::version_1::Response, Unsupported> {
+        unreachable!("plain reply is generated")
+    }
+}
+struct RootHandler;
+impl root_scope::Handler for RootHandler {
+    async fn echo(&self, _cx: &keylink::Context, value: RootScopedEntry) -> RootScopedEntry {
+        value
+    }
+}
+/// Watched red on Rust 1.91 before the named re-export fix: importing the
+/// parent module itself produced E0432 here and in the nested fixtures. The
+/// standalone target keeps this case at crate root; the aggregate nests it.
+#[tokio::test]
+async fn a_crate_root_service_freezes_types_from_its_call_site() {
+    let server = node().await;
+    let caller = node().await;
+    let _running = root_scope::serve(&server, RootHandler, Allowlist::anyone()).unwrap();
+    let old = root_frozen::root_scope::Client::connect(&caller, server.endpoint().addr())
+        .await
+        .unwrap();
+    assert_eq!(old.version().label(), 1);
+    assert_eq!(
+        old.echo(RootScopedEntry { qty: 19 }).await.unwrap(),
+        RootScopedEntry { qty: 19 }
+    );
+}

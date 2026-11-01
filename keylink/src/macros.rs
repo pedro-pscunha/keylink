@@ -10358,7 +10358,11 @@ macro_rules! __keylink_previous {
             pub mod [<version_ $label>] {
                 #![allow(unused_imports, dead_code, missing_docs)]
                 use super::*;
-                use $($newer)* as __newer;
+                // Rust 1.91 cannot alias the parent module with `use super as`.
+                // Re-export named items while keeping call-site imports here.
+                mod __newer {
+                    pub(super) use super::$($newer)*::{Request, Response, __Toward};
+                }
                 $crate::__keylink_contract! { $svc, $label; $($all)+ }
                 const _: () = ::core::assert!($label < $upper, ::core::concat!("previous ", ::core::stringify!($label), " must be lower than ", ::core::stringify!($upper), " in ", ::core::stringify!($svc)));
                 const _: () = ::core::assert!(VERSION.hash() == $pin, ::core::concat!("previous ", ::core::stringify!($label), " of ", ::core::stringify!($svc), " does not hash to its pin: the frozen declaration differs from the one that was current, or keylink's own wire types moved since. Print version_", ::core::stringify!($label), "::VERSION to read what this one hashes to."));
