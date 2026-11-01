@@ -8,8 +8,12 @@
 //! # What is stored, and what is not
 //!
 //! One entry per claimed key, keyed on the pair the ledger keys on — the peer
-//! iroh proved, and the key that peer chose. Its value is one byte of state and,
-//! for a settled call that produced a recordable reply, that reply's frame.
+//! iroh proved, and the key that peer chose. A value starts with a one-byte
+//! request-binding/version tag, a 32-byte request-and-authority commitment, and
+//! a one-byte state: 34 fixed bytes. A recordable settled reply appends its frame.
+//! The commitment binds received message bytes (not retry controls) and the
+//! selected principal and holder. Legacy unbound values are refused during
+//! recovery, never migrated or replayed with an invented binding.
 //!
 //! **The in-flight half is not stored and cannot be.** A claimed key belongs to
 //! a caller holding a live QUIC stream, and no disk carries one of those across

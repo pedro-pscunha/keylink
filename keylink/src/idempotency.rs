@@ -2585,7 +2585,8 @@ impl Ledger {
         if moved {
             refile(inner, peer);
         }
-        // A tombstone on the disk is one byte; the reply it replaced is up to
+        // A disk tombstone retains 34 fixed bytes: binding/version tag,
+        // request-and-authority commitment and state. Its former reply is up to
         // `frame_bytes`. Without this the store would keep every expired reply
         // until its key left the tombstone pool, so `pool_bytes` would bind
         // memory and nothing else — and a restart would read `Done` for a key
