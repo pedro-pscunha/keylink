@@ -35,8 +35,11 @@
 //! # Limits not hidden by this interface
 //!
 //! The retained window lives in memory; durable storage is for recovery, not
-//! reads. The byte bound counts encoded events, not the size of `E` or cloned
-//! pages. Age retention uses wall time, lazily at append and pull. Durable event
+//! reads. The ring holds only checked encoded bytes, not mutable `E` values.
+//! Pulls decode independent deliveries after releasing the ring lock. The byte
+//! bound excludes metadata and decoded pages; `E` needs neither `Clone` nor `Sync`.
+//! A serde decoder that rejects its own encoding is refused as `Unreadable`.
+//! Age retention uses wall time, lazily at append and pull. Durable event
 //! schema migrations, server-held subscriber cursors and subscriber groups are
 //! not built. Undecodable stored events refuse opening rather than being skipped.
 //! Reopen with the same `E`: its type is not stored, so overlapping encodings
@@ -166,6 +169,13 @@ pub enum PullRefused {
         /// Where to follow after resyncing.
         head: Cursor,
     },
+    /// Retained bytes cannot be decoded as the event type. Fix its serde
+    /// round-trip before following again; retrying or skipping is not a repair.
+    #[error("the retained event at {seq} cannot be decoded")]
+    Unreadable {
+        /// The first event that could not be materialized.
+        seq: Seq,
+    },
     /// No log is served under the requested name. Produced by keyed handlers only.
     #[error("no log is served under that name")]
     Unknown,
@@ -185,7 +195,7 @@ impl PullRefused {
             Self::Expired { head, .. } | Self::Replaced { head } | Self::Ahead { head, .. } => {
                 Some(*head)
             }
-            Self::Unknown | Self::Crowded { .. } => None,
+            Self::Unknown | Self::Crowded { .. } | Self::Unreadable { .. } => None,
         }
     }
 }

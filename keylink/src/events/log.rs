@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::watch;
 
@@ -49,21 +51,23 @@ impl Retention {
 
 /// A sequenced, retained event log. Clones share one log and one exclusive writer.
 pub struct EventLog<E> {
-    inner: Arc<Inner<E>>,
+    inner: Arc<Inner>,
+    event: PhantomData<fn() -> E>,
 }
 
 impl<E> Clone for EventLog<E> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            event: PhantomData,
         }
     }
 }
 
-struct Inner<E> {
+struct Inner {
     id: LogId,
     retention: Retention,
-    ring: Mutex<Ring<E>>,
+    ring: Mutex<Ring>,
     writer: tokio::sync::Mutex<Writer>,
     changed: watch::Sender<u64>,
     #[cfg(feature = "persist")]
@@ -77,25 +81,20 @@ struct Writer {
     truncated_before: u64,
 }
 
-struct Ring<E> {
-    events: VecDeque<Held<E>>,
+struct Ring {
+    events: VecDeque<Held>,
     bytes: u64,
     head: Seq,
     parked: usize,
 }
 
-struct Held<E> {
+struct Held {
     seq: Seq,
     at_ms: u64,
-    encoded: Encoded<E>,
+    bytes: Bytes,
 }
 
-struct Encoded<E> {
-    event: E,
-    bytes: Vec<u8>,
-}
-
-impl<E> Ring<E> {
+impl Ring {
     fn trim(&mut self, retention: Retention, now_ms: u64) -> usize {
         let mut removed = 0;
         while self.events.len() > 1 {
@@ -111,7 +110,7 @@ impl<E> Ring<E> {
                 break;
             }
             if let Some(event) = self.events.pop_front() {
-                self.bytes -= event.encoded.bytes.len() as u64;
+                self.bytes -= event.bytes.len() as u64;
                 removed += 1;
             }
         }
@@ -123,15 +122,15 @@ impl<E> Ring<E> {
     }
 }
 
-impl<E> Inner<E> {
-    fn ring(&self) -> MutexGuard<'_, Ring<E>> {
+impl Inner {
+    fn ring(&self) -> MutexGuard<'_, Ring> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl<E> EventLog<E>
 where
-    E: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    E: Serialize + DeserializeOwned + Send + 'static,
 {
     /// Create a memory log. Recreating it gives old cursors a `Replaced` refusal.
     ///
@@ -143,10 +142,11 @@ where
     pub fn memory(retention: Retention) -> Self {
         Self {
             inner: Arc::new(Self::build(LogId::mint(), retention)),
+            event: PhantomData,
         }
     }
 
-    fn build(id: LogId, retention: Retention) -> Inner<E> {
+    fn build(id: LogId, retention: Retention) -> Inner {
         let (changed, _) = watch::channel(0);
         Inner {
             id,
@@ -208,13 +208,13 @@ where
                 if bytes.len() > MAX_EVENT_BYTES {
                     return Err(OpenError::Invalid { seq });
                 }
-                let event = super::store::decode(seq, &bytes)?;
+                let _: E = super::store::decode(seq, &bytes)?;
                 let mut ring = inner.ring();
                 ring.bytes += bytes.len() as u64;
                 ring.events.push_back(Held {
                     seq,
                     at_ms: batch.at_ms,
-                    encoded: Encoded { event, bytes },
+                    bytes: bytes.into(),
                 });
                 ring.head = seq;
                 ring.trim(retention, now_ms());
@@ -227,6 +227,7 @@ where
         inner.writer.get_mut().store = Some(store);
         Ok(Self {
             inner: Arc::new(inner),
+            event: PhantomData,
         })
     }
 
@@ -242,7 +243,7 @@ where
         self.append_batch(vec![encode(event)?]).await
     }
 
-    async fn append_batch(&self, batch: Vec<Encoded<E>>) -> Result<Seq, AppendError> {
+    async fn append_batch(&self, batch: Vec<Bytes>) -> Result<Seq, AppendError> {
         #[cfg(feature = "persist")]
         if self.inner.durable {
             let log = self.clone();
@@ -254,7 +255,7 @@ where
         self.commit(batch).await
     }
 
-    async fn commit(&self, batch: Vec<Encoded<E>>) -> Result<Seq, AppendError> {
+    async fn commit(&self, batch: Vec<Bytes>) -> Result<Seq, AppendError> {
         let mut writer = self.inner.writer.lock().await;
         let before = self.inner.ring().head.0;
         let last = before
@@ -263,9 +264,8 @@ where
         let at_ms = now_ms();
         #[cfg(feature = "persist")]
         if let Some(store) = &mut writer.store {
-            let bytes =
-                super::store::encode_batch(at_ms, batch.iter().map(|event| event.bytes.as_slice()))
-                    .map_err(AppendError::Encode)?;
+            let bytes = super::store::encode_batch(at_ms, batch.iter().map(Bytes::as_ref))
+                .map_err(AppendError::Encode)?;
             store
                 .append(last, &bytes)
                 .await
@@ -273,14 +273,10 @@ where
         }
         let (oldest, retained) = {
             let mut ring = self.inner.ring();
-            for (offset, encoded) in batch.into_iter().enumerate() {
+            for (offset, bytes) in batch.into_iter().enumerate() {
                 let seq = Seq(before + offset as u64 + 1);
-                ring.bytes += encoded.bytes.len() as u64;
-                ring.events.push_back(Held {
-                    seq,
-                    at_ms,
-                    encoded,
-                });
+                ring.bytes += bytes.len() as u64;
+                ring.events.push_back(Held { seq, at_ms, bytes });
             }
             ring.head = Seq(last);
             ring.trim(self.inner.retention, at_ms);
@@ -318,7 +314,9 @@ where
             ring.trim(self.inner.retention, now_ms());
             let after = self.position(&ring, from)?;
             if after < ring.head.0 {
-                return Ok(self.page(&ring, after));
+                let page = self.page(&ring, after);
+                drop(ring);
+                return Self::materialize(page);
             }
             if ring.parked >= MAX_PULLERS {
                 return Err(PullRefused::Crowded {
@@ -333,10 +331,12 @@ where
         let mut ring = self.inner.ring();
         ring.trim(self.inner.retention, now_ms());
         self.position(&ring, from)?;
-        Ok(self.page(&ring, after))
+        let page = self.page(&ring, after);
+        drop(ring);
+        Self::materialize(page)
     }
 
-    fn position(&self, ring: &Ring<E>, from: Cursor) -> Result<u64, PullRefused> {
+    fn position(&self, ring: &Ring, from: Cursor) -> Result<u64, PullRefused> {
         let head = Cursor::after(self.inner.id, ring.head);
         let after = match from.0 {
             Position::Origin => 0,
@@ -364,17 +364,17 @@ where
         Ok(after)
     }
 
-    fn page(&self, ring: &Ring<E>, after: u64) -> Page<E> {
+    fn page(&self, ring: &Ring, after: u64) -> Page<Bytes> {
         let mut bytes = 0;
         let events: Vec<_> = ring
             .events
             .iter()
             .filter(|event| event.seq.0 > after)
             .take_while(|event| {
-                bytes += event.encoded.bytes.len() + 10;
+                bytes += event.bytes.len() + 10;
                 bytes <= PAGE_BYTES
             })
-            .map(|event| (event.seq, event.encoded.event.clone()))
+            .map(|event| (event.seq, event.bytes.clone()))
             .collect();
         let next = events.last().map_or(Seq(after), |(seq, _)| *seq);
         Page {
@@ -382,6 +382,26 @@ where
             next: Cursor::after(self.inner.id, next),
             head: ring.head,
         }
+    }
+
+    fn materialize(page: Page<Bytes>) -> Pull<E> {
+        let events = page
+            .events
+            .into_iter()
+            .map(|(seq, bytes)| {
+                let (event, remaining) = postcard::take_from_bytes::<E>(&bytes)
+                    .map_err(|_| PullRefused::Unreadable { seq })?;
+                if !remaining.is_empty() {
+                    return Err(PullRefused::Unreadable { seq });
+                }
+                Ok((seq, event))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Page {
+            events,
+            next: page.next,
+            head: page.head,
+        })
     }
 
     /// Park an actor's deferred reply, end its turn, and pull on a separate task.
@@ -408,6 +428,7 @@ where
     pub fn stage(&self) -> (Stage<E>, Publish<E>) {
         let stage = Stage {
             batch: Arc::new(Mutex::new(Vec::new())),
+            event: PhantomData,
         };
         let publish = Publish {
             log: self.clone(),
@@ -417,8 +438,8 @@ where
     }
 }
 
-struct ParkGuard<'a, E>(&'a Inner<E>);
-impl<E> Drop for ParkGuard<'_, E> {
+struct ParkGuard<'a>(&'a Inner);
+impl Drop for ParkGuard<'_> {
     fn drop(&mut self) {
         self.0.ring().parked -= 1;
     }
@@ -433,7 +454,7 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn encode<E: Serialize>(event: E) -> Result<Encoded<E>, AppendError> {
+fn encode<E: Serialize>(event: E) -> Result<Bytes, AppendError> {
     let bytes = postcard::to_allocvec(&event).map_err(AppendError::Encode)?;
     if bytes.len() > MAX_EVENT_BYTES {
         return Err(AppendError::TooLarge {
@@ -441,12 +462,13 @@ fn encode<E: Serialize>(event: E) -> Result<Encoded<E>, AppendError> {
             max: MAX_EVENT_BYTES,
         });
     }
-    Ok(Encoded { event, bytes })
+    Ok(bytes.into())
 }
 
 /// Events staged by one actor's current turn. A stage is intentionally not cloneable.
 pub struct Stage<E> {
-    batch: Arc<Mutex<Vec<Encoded<E>>>>,
+    batch: Arc<Mutex<Vec<Bytes>>>,
+    event: PhantomData<fn() -> E>,
 }
 
 impl<E: Serialize> Stage<E> {
@@ -474,12 +496,12 @@ impl<E: Serialize> Stage<E> {
 /// See the module's warning about ordering this observer against `Persist`.
 pub struct Publish<E> {
     log: EventLog<E>,
-    batch: Arc<Mutex<Vec<Encoded<E>>>>,
+    batch: Arc<Mutex<Vec<Bytes>>>,
 }
 
 impl<A: Send + 'static, E> Observer<A> for Publish<E>
 where
-    E: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    E: Serialize + DeserializeOwned + Send + 'static,
 {
     fn name(&self) -> &'static str {
         "Publish"

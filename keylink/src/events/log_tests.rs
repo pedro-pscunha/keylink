@@ -146,6 +146,133 @@ async fn a_panicked_staging_batch_is_cleared_before_the_next_turn() {
     );
 }
 
+#[tokio::test]
+async fn delivery_does_not_require_clone_or_sync_and_refuses_unreadable_bytes() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct NotClone(std::cell::Cell<u64>);
+    let log = EventLog::memory(retention(100, 1 << 20));
+    log.append(NotClone(std::cell::Cell::new(7))).await.unwrap();
+    assert_eq!(
+        log.pull(Cursor::ORIGIN).await.unwrap().events[0].1 .0.get(),
+        7
+    );
+    let (stage, mut publish) = log.stage();
+    stage.push(NotClone(std::cell::Cell::new(8))).unwrap();
+    publish
+        .after_turn(
+            &(),
+            TurnInfo::for_test(TurnOutcome::Completed, "Post", Duration::ZERO),
+        )
+        .await
+        .unwrap();
+    assert_eq!(log.head().seq(), Some(Seq(2)));
+
+    #[derive(serde::Serialize)]
+    struct Unreadable(u64);
+    impl<'de> serde::Deserialize<'de> for Unreadable {
+        fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+            Err(serde::de::Error::custom(
+                "this event's decoder refuses its encoding",
+            ))
+        }
+    }
+    let log = EventLog::memory(retention(100, 1 << 20));
+    log.append(Unreadable(1)).await.unwrap();
+    assert!(matches!(
+        log.pull(Cursor::ORIGIN).await,
+        Err(PullRefused::Unreadable { seq: Seq(1) })
+    ));
+    assert_eq!(log.append(Unreadable(2)).await.unwrap(), Seq(2));
+}
+
+#[cfg(feature = "persist-file")]
+#[derive(Clone)]
+struct Shared(std::sync::Arc<std::sync::RwLock<Vec<u8>>>);
+
+#[cfg(feature = "persist-file")]
+impl serde::Serialize for Shared {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.read().unwrap().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "persist-file")]
+impl<'de> serde::Deserialize<'de> for Shared {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(Arc::new(std::sync::RwLock::new(
+            Vec::<u8>::deserialize(deserializer)?,
+        ))))
+    }
+}
+
+/// Finding 4 was watched red with application cloning under the ring lock:
+/// the producer watchdog reported `delivery materialization must not hold the producer`.
+/// The same hook now holds decoding after byte selection; append still completes.
+#[tokio::test]
+async fn a_held_decoder_does_not_stall_the_producer() {
+    use std::sync::mpsc;
+    #[derive(Clone)]
+    struct Hook {
+        entered: mpsc::Sender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    fn hold() {
+        let hook = HOOK.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook.entered.send(()).unwrap();
+            hook.release.lock().unwrap().recv().unwrap();
+        }
+    }
+    #[derive(Debug, serde::Serialize)]
+    struct Value(u64);
+    impl Clone for Value {
+        fn clone(&self) -> Self {
+            hold();
+            Self(self.0)
+        }
+    }
+    impl<'de> serde::Deserialize<'de> for Value {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let value = u64::deserialize(deserializer)?;
+            hold();
+            Ok(Self(value))
+        }
+    }
+    let log = EventLog::memory(retention(100, 1 << 20));
+    log.append(Value(1)).await.unwrap();
+    let (entered, arriving) = mpsc::channel();
+    let (release, holding) = mpsc::channel();
+    *HOOK.lock().unwrap() = Some(Hook {
+        entered,
+        release: Arc::new(Mutex::new(holding)),
+    });
+    let reader = log.clone();
+    let pull = std::thread::spawn(move || n0_future::future::block_on(reader.pull(Cursor::ORIGIN)));
+    arriving
+        .recv_timeout(Duration::from_secs(20))
+        .expect("delivery materialization starts");
+    let writer = log.clone();
+    let (finished, progress) = mpsc::channel();
+    let append = std::thread::spawn(move || {
+        let result = n0_future::future::block_on(writer.append(Value(2)));
+        finished.send(result).unwrap();
+    });
+    let result = progress.recv_timeout(Duration::from_secs(20));
+    // Always release the application code before asserting, even under the
+    // broken implementation, so this liveness guard cannot strand its threads.
+    release.send(()).unwrap();
+    pull.join().unwrap().unwrap();
+    append.join().unwrap();
+    *HOOK.lock().unwrap() = None;
+    assert_eq!(
+        result
+            .expect("delivery materialization must not hold the producer")
+            .unwrap(),
+        Seq(2)
+    );
+}
+
 #[cfg(feature = "persist-file")]
 mod durable {
     use super::*;
@@ -183,6 +310,40 @@ mod durable {
                 TurnInfo::for_test(TurnOutcome::Completed, "Batch", Duration::ZERO),
             )
             .await
+    }
+
+    /// Finding 2 was watched red before bytes became authoritative: changing
+    /// the original shared value failed `producer mutation changed a committed event`.
+    #[tokio::test]
+    async fn mutating_values_cannot_change_retained_or_recovered_events() {
+        let scratch = Scratch::new();
+        let files = Files::open(&scratch.0).await.unwrap();
+        let id = StateId::new("events").unwrap();
+        let log = EventLog::<Shared>::durable(&files, &id, retention(100, 1 << 20))
+            .await
+            .unwrap();
+        let original = Arc::new(std::sync::RwLock::new(vec![1]));
+        log.append(Shared(original.clone())).await.unwrap();
+        *original.write().unwrap() = vec![9; MAX_EVENT_BYTES + 1];
+        let page = log.pull(Cursor::ORIGIN).await.unwrap();
+        assert!(
+            page.events[0].1 .0.read().unwrap().as_slice() == [1],
+            "producer mutation changed a committed event"
+        );
+        *page.events[0].1 .0.write().unwrap() = vec![8; MAX_EVENT_BYTES + 1];
+        let again = log.pull(Cursor::ORIGIN).await.unwrap();
+        assert!(
+            again.events[0].1 .0.read().unwrap().as_slice() == [1],
+            "delivery mutation changed a retained event"
+        );
+        let head = log.head();
+        drop(log);
+        let log = EventLog::<Shared>::durable(&files, &id, retention(100, 1 << 20))
+            .await
+            .unwrap();
+        assert_eq!(log.head(), head);
+        let restored = log.pull(Cursor::ORIGIN).await.unwrap();
+        assert_eq!(*restored.events[0].1 .0.read().unwrap(), [1]);
     }
 
     #[test]
