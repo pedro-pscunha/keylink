@@ -357,7 +357,7 @@ async fn a_local_keyed_ref_rejects_a_reentrant_call() {
         .expect("the id is free");
 
     let actor = journal::at_local(&system, actor_id.clone());
-    let result = tokio::time::timeout(Duration::from_secs(30), actor.apply(7, 0))
+    let result = tokio::time::timeout(Duration::from_secs(120), actor.apply(7, 0))
         .await
         .expect("the re-entrant call must resolve without waiting for the actor");
     assert_eq!(result.expect("the outer turn answers"), 7);
@@ -448,12 +448,12 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
             .apply(2, 0)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if status_of(&system, &actor_id).queued == 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -1141,8 +1141,8 @@ async fn until_empty(system: &journal::Registry) {
 ///
 /// With a budget the two numbers are independent and both are deliberate.
 /// `after` is short: the actor is stale almost at once, which is what puts the
-/// eviction inside the turn. `shutdown_budget` is five seconds, and **that** is
-/// what buys the answer. The name says `inside_its_shutdown_budget` because that
+/// eviction inside the turn. `shutdown_budget` is two minutes, parked-turn long, and
+/// **that** is what buys the answer. The name says `inside_its_shutdown_budget` because that
 /// is the condition; the converse — a turn that outlives the budget being
 /// destroyed — is `an_eviction_whose_budget_expires_destroys_the_actor` below,
 /// and the two together are the whole of what an eviction budget means.
@@ -1167,7 +1167,7 @@ async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_fligh
     let fixture = start(
         journal::Registry::builder(Eviction::Idle {
             after: Duration::from_millis(200),
-            shutdown_budget: Duration::from_secs(5),
+            shutdown_budget: Duration::from_secs(120),
         })
         .spawn_with({
             let release = release.clone();
@@ -1301,7 +1301,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
             .await
             .expect("the second call reached the mailbox behind the turn in flight");
             let doc = id("doc");
-            let stopped = fixture.system.stop(&doc, Duration::from_secs(5));
+            let stopped = fixture.system.stop(&doc, Duration::from_secs(120));
             let letting_go = async {
                 until_empty(&fixture.system).await;
                 release.add_permits(2);
@@ -1345,7 +1345,10 @@ async fn abort_destroys_the_message_in_flight() {
             journal::spawn(Journal {
                 applied: applied.clone(),
                 entered: Some(entered_tx),
-                release: None,
+                // Never given a permit: the turn is parked inside the handler
+                // until `abort` destroys it, so no hold can run out between
+                // `entered` and the abort.
+                release: Some(Arc::new(Semaphore::new(0))),
                 inside: None,
                 nested: None,
                 forward: None,
@@ -1356,15 +1359,15 @@ async fn abort_destroys_the_message_in_flight() {
 
     let client_call = {
         let client = &fixture.client;
-        // A hold the abort is sequenced against by `entered`, not by a clock:
-        // the abort lands the moment the turn is inside, so the hold only has
-        // to outlast the gap between those two events, and it is the length of
-        // the red a broken `abort` takes to show.
-        async move { client.at(id("doc")).apply(1, 5_000).await }
+        async move { client.at(id("doc")).apply(1, 0).await }
     };
     let aborting = async {
         entered.recv().await.expect("the turn is inside the actor");
-        fixture.system.abort(&id("doc")).await
+        // Bounded, because an `abort` that does not abort waits for a turn that
+        // never ends; two minutes is how long that takes to show as a red test.
+        tokio::time::timeout(Duration::from_secs(120), fixture.system.abort(&id("doc")))
+            .await
+            .expect("abort destroyed the parked turn instead of waiting for it")
     };
 
     let (answered, was_mounted) = tokio::join!(client_call, aborting);

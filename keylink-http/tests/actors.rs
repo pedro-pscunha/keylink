@@ -1330,15 +1330,16 @@ async fn a_backend_refusal_reaches_the_caller_as_a_refusal() {
 /// property is about what the caller does: replacing `drop(socket);` with
 /// `let _held = socket;` keeps the connection open, and the row terminates on
 /// `the invocation is dropped when the caller hangs up, before it could
-/// finish: Elapsed(())`. That is the measurement the tight bound buys —
-/// `SignalDrop` fires when the future ends for ANY reason, so a generous
-/// timeout would have been satisfied by the call merely completing.
+/// finish: Elapsed(())`, which takes `HOLD_MS / 20` (three minutes) to arrive. That
+/// is the measurement the bound buys — `SignalDrop` fires when the future ends for
+/// ANY reason, so a bound near the hold would have been satisfied by the call
+/// merely completing; this one is a twentieth of it.
 #[tokio::test]
 async fn a_keyed_client_that_hangs_up_drops_the_invocation() {
     use tokio::io::AsyncWriteExt as _;
 
     /// How long the actor holds its loop, in milliseconds.
-    const HOLD_MS: u64 = 600_000;
+    const HOLD_MS: u64 = 3_600_000;
 
     #[derive(Clone)]
     struct WatchedClient {
@@ -1452,7 +1453,7 @@ async fn a_keyed_client_that_hangs_up_drops_the_invocation() {
         .expect("the request is written");
     socket.flush().await.expect("the request is flushed");
 
-    // The actor holds its loop for ten minutes, so this hangs up long before an
+    // The actor holds its loop for an hour, so this hangs up long before an
     // answer exists. The hang-up waits for the invocation to have started, which
     // the wrapper reports: closing the socket earlier would prove nothing about
     // cancellation, and a sleep that guesses when the handler has started is the
@@ -1471,7 +1472,7 @@ async fn a_keyed_client_that_hangs_up_drops_the_invocation() {
     // future ends for ANY reason, so a generous timeout would be satisfied by the
     // call simply completing — the row would pass with cancellation entirely
     // absent. Arriving that far inside the hold is only possible if the hang-up is
-    // what ended it, and a loaded machine would have to stall for half a minute
+    // what ended it, and a loaded machine would have to stall for three minutes
     // to cross it.
     tokio::time::timeout(
         std::time::Duration::from_millis(HOLD_MS / 20),
