@@ -36,6 +36,8 @@
 //!    the item that exceeded its patience.
 //! 5. **Bounded lossy fan-out.** `BroadcastDepth` boundaries and both loss
 //!    policies run in Chrome, including in-band loss before the surviving item.
+//! 6. **Random event-log identities.** The gate compares the first log minted
+//!    in two independent browser instances with Date.now fixed to the same value.
 //!
 //! Not covered, said here rather than left to be assumed: no `Node`, no
 //! `Server`, no `Client`, no connection, no actor turn, and nothing at all from
@@ -96,6 +98,26 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+/// Two fresh browser runs use the same clock and no shared log-incarnation state.
+/// Compare this test's printed identities across those runs: they must differ.
+#[wasm_bindgen_test]
+fn event_log_identity_comes_from_browser_randomness() {
+    let date = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Date")).unwrap();
+    let now_name = JsValue::from_str("now");
+    let original = js_sys::Reflect::get(&date, &now_name).unwrap();
+    let fixed =
+        wasm_bindgen::closure::Closure::wrap(Box::new(|| 1234.0) as Box<dyn FnMut() -> f64>);
+    js_sys::Reflect::set(&date, &now_name, fixed.as_ref()).unwrap();
+    assert_eq!(js_sys::Date::now(), 1234.0);
+    let log = keylink::events::EventLog::<u64>::memory(keylink::events::Retention::new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroU64::new(1024).unwrap(),
+    ));
+    let identity = postcard::to_allocvec(&log.head()).unwrap();
+    js_sys::Reflect::set(&date, &now_name, &original).unwrap();
+    wasm_bindgen_test::console_log!("event-log identity: {:?}", identity);
+}
 
 /// A schema, and below it the same schema with one more field. Local to this
 /// file on purpose: the property under test is that the hash MOVES, and a type

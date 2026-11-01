@@ -71,7 +71,9 @@ export CHROMEDRIVER="$driver"
 # page instead, which is the only way to see a JS exception's stack.
 
 log="$(mktemp -t keylink-wasm-browser)"
-trap 'rm -f "$log"' EXIT
+identity_one="$(mktemp -t keylink-browser-identity-one)"
+identity_two="$(mktemp -t keylink-browser-identity-two)"
+trap 'rm -f "$log" "$identity_one" "$identity_two"' EXIT
 
 AR_wasm32_unknown_unknown="$ar" \
     cargo test --target wasm32-unknown-unknown -p keylink \
@@ -98,3 +100,24 @@ if ! grep -qF 'headless tests in Chrome' "$log"; then
     echo "file to Node instead — where every assertion in it still passes." >&2
     exit 1
 fi
+
+# Finding 1: a shared millisecond clock is not a log identity. Each exact-filter
+# run initializes its own Wasm module in a fresh Chrome instance. The test fixes
+# Date.now before the first log is minted, so no process-local counter can hide
+# a clock collision. Watched red with the original time-and-counter mint: both
+# browsers printed identical cursors and the comparison refused them.
+for identity_log in "$identity_one" "$identity_two"; do
+    AR_wasm32_unknown_unknown="$ar" \
+        cargo test --target wasm32-unknown-unknown -p keylink \
+            --no-default-features --features web --test browser \
+            event_log_identity_comes_from_browser_randomness -- --exact --nocapture \
+            2>&1 | tee "$identity_log"
+    grep -qF 'headless tests in Chrome' "$identity_log"
+done
+first="$(grep -F 'event-log identity:' "$identity_one")"
+second="$(grep -F 'event-log identity:' "$identity_two")"
+if [[ -z "$first" || -z "$second" || "$first" = "$second" ]]; then
+    echo 'IDENTITY COLLISION across independent fixed-clock browsers' >&2
+    exit 1
+fi
+echo 'IDENTITIES DISTINCT'

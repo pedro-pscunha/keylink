@@ -134,6 +134,11 @@ where
     E: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Create a memory log. Recreating it gives old cursors a `Replaced` refusal.
+    ///
+    /// # Panics
+    ///
+    /// If OS/browser randomness is unavailable. A clock-based fallback cannot
+    /// distinguish independently created log incarnations and is never used.
     #[must_use]
     pub fn memory(retention: Retention) -> Self {
         Self {

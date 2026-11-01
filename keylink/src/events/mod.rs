@@ -47,7 +47,6 @@
 //! followers compile for the browser; no network connection has run in a tab.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use postcard_schema::Schema;
@@ -116,16 +115,10 @@ struct LogId([u8; 16]);
 
 impl LogId {
     fn mint() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let now = n0_future::time::SystemTime::now()
-            .duration_since(n0_future::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut hash = blake3::Hasher::new();
-        hash.update(&now.to_le_bytes());
-        hash.update(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         let mut id = [0; 16];
-        id.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+        getrandom::fill(&mut id).unwrap_or_else(|error| {
+            panic!("event-log identity randomness is unavailable: {error}")
+        });
         Self(id)
     }
 }

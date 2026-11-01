@@ -48,6 +48,8 @@ postcard = { workspace = true }
 postcard-schema = { workspace = true }
 postcard-rpc = { workspace = true }
 bytes = { workspace = true }
+# Event-log identities use OS randomness, already resolved through iroh.
+getrandom = "0.4"
 thiserror = { workspace = true }
 pastey = { workspace = true }
 # Parses startup authorization rules. Already present in the resolved graph.
@@ -164,6 +166,8 @@ tokio = { version = "1", default-features = false, features = [
 # The browser's body sources. Scoped to the browser target so that `web` on a
 # native build is inert rather than a resolution failure.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+# Declare the browser backend explicitly, as iroh-base does for its key RNG.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 # **`0.5` and not `0.6`, and the reason is a link error nobody could see.**
 #
 # `wasm-streams` exports its glue with `#[wasm_bindgen]`, so its symbols are
