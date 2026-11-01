@@ -15,7 +15,8 @@ use crate::{Dial, Error, Peer, RemoteError};
 /// The closure receives a shared client and the last delivered cursor. Several
 /// followers can share one `Arc<Peer<C>>` and therefore one connection. Save a
 /// delivery's resume cursor only after processing the event. Transport outages,
-/// remote capacity and remote timeouts retry; other failures terminate the stream.
+/// remote capacity, timeouts, restarting actors and full mailboxes back off and
+/// retry; other failures terminate the stream.
 ///
 /// ```ignore
 /// let mut events = keylink::events::follow(peer, saved, |client, from| async move {
@@ -182,7 +183,8 @@ pub enum Lapse {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Retry {
-    /// Transport loss, clean close, remote timeout or remote capacity.
+    /// Transport loss, clean close, remote timeout or capacity, actor restart,
+    /// or mailbox saturation. All retry with backoff, not immediate replay.
     Unreachable(crate::Error),
     /// The log's parked-pull limit was reached.
     Crowded {
@@ -196,7 +198,12 @@ fn retryable(error: &Error) -> bool {
         error,
         Error::Transport(_)
             | Error::Closed
-            | Error::Remote(RemoteError::TimedOut { .. } | RemoteError::AtCapacity { .. })
+            | Error::Remote(
+                RemoteError::TimedOut { .. }
+                    | RemoteError::AtCapacity { .. }
+                    | RemoteError::MailboxFull
+                    | RemoteError::Withheld(crate::Withheld::Restarting { .. })
+            )
     )
 }
 

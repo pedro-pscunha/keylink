@@ -52,6 +52,12 @@ fn jitter_is_deterministic_per_node_and_stays_inside_the_capped_window() {
     assert!(retryable(&Error::Remote(RemoteError::AtCapacity {
         capacity: 1
     })));
+    assert!(!retryable(&Error::Remote(RemoteError::Withheld(
+        crate::Withheld::Gone
+    ))));
+    assert!(!retryable(&Error::Remote(RemoteError::Unauthorized(
+        "Events".into()
+    ))));
 }
 
 struct Client;
@@ -114,6 +120,60 @@ async fn retries_wait_without_advancing_and_buffered_events_advance_only_when_yi
         3,
         "drain the page before pulling again"
     );
+}
+
+// Finding 3 was watched red for both callers below: each temporary condition
+// yielded terminal Failed instead of the required Retrying lapse.
+async fn temporary_actor_condition_retries(error: Error) {
+    let node = crate::Node::bind_local().await.unwrap();
+    let peer = Arc::new(Peer::<Client>::new(&node, node.id()));
+    let saved = Cursor::after(LogId([1; 16]), Seq(1));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let mut transient = Some(error);
+    let mut events = follow(peer, saved, move |_client, from| {
+        observed.lock().unwrap().push(from);
+        let error = transient.take();
+        async move {
+            match error {
+                Some(error) => Err(error),
+                None => Ok(Ok(page(&[2, 3]))),
+            }
+        }
+    });
+    let first = events.next().await.unwrap();
+    let Err(Lapse::Retrying { after, .. }) = first else {
+        panic!("a temporary actor condition must back off and retry: {first:?}")
+    };
+    assert_eq!(after, backoff(node.id().as_bytes(), 0));
+    assert_eq!(events.cursor(), saved);
+    let mut pending = Box::pin(events.next());
+    assert!(poll_once(pending.as_mut()).await.is_none());
+    assert_eq!(*calls.lock().unwrap(), [saved]);
+    tokio::time::advance(after).await;
+    let event = pending.await.unwrap().unwrap();
+    assert_eq!((event.seq, event.event), (Seq(2), 2));
+    assert_eq!(events.cursor(), event.resume);
+    assert_eq!(*calls.lock().unwrap(), [saved, saved]);
+    assert_eq!(events.next().await.unwrap().unwrap().seq, Seq(3));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarting_retries_without_advancing_the_cursor() {
+    temporary_actor_condition_retries(Error::Remote(RemoteError::Withheld(
+        crate::Withheld::Restarting {
+            reason: crate::EndReason::Panicked {
+                message: "the next incarnation is starting".into(),
+            },
+        },
+    )))
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mailbox_full_retries_without_advancing_the_cursor() {
+    temporary_actor_condition_retries(Error::Remote(RemoteError::MailboxFull)).await;
 }
 
 #[tokio::test]
