@@ -192,12 +192,7 @@ blobs connections, so a transfer in flight stops, and it refuses the grant of a
 call whose handler was already running when it landed
 (`RemoteError::GrantsWithdrawn`). Bytes already delivered stay with the
 fetcher. Remove a peer from admission first, then call `revoke_peer`:
-removing it from an allowlist does not touch its blob grants. **That recipe is
-complete only if admission closes every RPC connection of the peer.**
-`DynamicAdmission` keeps one revocation handle per peer today, so a second live
-connection of the same peer survives a `replace` and can still take a fresh
-fence; the `trust` branch fixes the registry, which already tracks connections
-by id.
+removing it from an allowlist does not touch its blob grants. Both `DynamicAdmission` and `Trust` close every RPC connection of a removed peer. For `DynamicAdmission`, apply the admission change before calling `revoke_peer`. For delegated authority, bind `Trust::with_blobs(&blobs)` before serving calls, using the same `Blobs` handle as the node's services; Trust then performs both steps.
 
 The ledger holds at most `GRANT_LIMIT` grants (172,032) across every peer, and
 `Blobs::set_grant_limit` changes it. A grant past the limit is answered
@@ -238,6 +233,8 @@ must be typed out, and `from_env` errors at startup rather than bouncing every
 peer at runtime.
 
 `trust::Trust` admits peers from signed delegation chains rooted in explicitly trusted keys. Every child narrows resources, operations, validity, and delegation depth. Push chains with `insert`, or let peers offer their own through `trust::present` before dialing. `Revocable::apply` records signed revocations or replaces roots before closing connections that no longer qualify.
+
+Bind `trust.with_blobs(&blobs)?` before issuing grants or serving calls, with the same store used by the node's services. Every clone shares that binding; binding a different store is refused. Losing any established authority proof withdraws all of that holder's old grants, even if another chain still admits it or it has no live RPC connection. This is deliberately conservative: content grants do not record which chain authorized them. Changes that return an exhaustion error and pending revocations established by `insert`, `verify`, `open`, admission, or preflight have the same effect. Lost RPC admission closes first, then blob grants and in-flight grant permits are revoked. Apply `trust::Change::Expire` on a timer to remove expired authority and its grants; a blob fetch does not check certificate time.
 
 `trust::Signed<T>` carries a forwardable value and its delegation chain. A verifier supplies a `Purpose`, trusted roots, and a time; `open` verifies signatures and authority before decoding the value. Signatures are domain-separated from certificates and revocations. Postcard bytes must round-trip exactly, so nondeterministically ordered values may be refused. Use `Trust::open` when revocations must count.
 
@@ -1024,7 +1021,7 @@ come back and reversing it is the point of reaching one.
 Known gaps, in rough priority order:
 
 - **Trust is a local view.** Revocations reach other nodes only through the application's feeder. Accepted records are permanent and never pruned. Each signer and proven upstream issuer has an accepted-revocation budget; exhausting a key permanently refuses its subtree rather than evicting tombstones. Path accounting also bounds churn through freshly delegated revoker keys. Adding new trusted roots supplies new operator-authorized budgets; it does not reset existing keys. Idle expired connections close only when the application applies `trust::Change::Expire`; expiry is checked on every call regardless. Already-dispatched calls finish after revocation. The host clock is trusted, with no skew allowance.
-- **Closing RPC connections does not retract blob grants.** Wiring the separate `Blobs::revoke_peer` capability into trust changes is still needed. A peer may otherwise retain access to previously granted hashes.
+- **Blob withdrawal is an explicit binding.** `Trust::with_blobs` must receive the same store as the services before any grants are issued. Without it, closing RPC admission does not retract grants. With it, any lost authority proof withdraws all of a known holder's grants, including narrowed and disconnected holders. Expired grants wait for the application's `Change::Expire` timer. Delivered bytes cannot be taken back.
 - **Signed values are replayable.** The application supplies freshness in `T`. Its shape is not part of a service contract hash; drift is refused at `open`. Idempotency records remain per device key, not per delegated principal.
 - **Trust closes every tracked connection for a revoked peer.** Connections are tracked independently across service ALPNs. The open presentation protocol has byte, depth, per-holder and total retained-chain caps, but no rate limit. New entries fail loudly at the total cap; feeders must handle capacity refusals. Pending unauthorized revocations are bounded separately; accepted tombstones are bounded by issuer-path budgets and are never evicted. Browsers can verify chains and signed values, not serve guarded QUIC connections.
 

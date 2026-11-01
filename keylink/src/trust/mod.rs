@@ -8,6 +8,10 @@
 //! Verifying a previously unseen chain can establish a pending revoker's authority.
 //! That decision is retained as a permanent tombstone and closes affected live
 //! connections, even when the offered chain itself is consequently refused.
+//! Bind `with_blobs` to also withdraw every affected holder's old content grants.
+//! Any lost proof triggers the conservative per-holder withdrawal, including
+//! narrowed or disconnected holders. Apply `Change::Expire` on a timer to purge
+//! expired authority and its grants; blob requests do not read this store's clock.
 //!
 //! Each store is one node's view. Revocation reaches other nodes only as fast as
 //! the application's feeder delivers it. Idle expired connections close on
@@ -31,7 +35,8 @@ use iroh::PublicKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    Admission, Admittance, AdmittedPeer, LiveConnection, ProvenPeer, Revocable, Rpc, ServiceBuilder,
+    Admission, Admittance, AdmittedPeer, Blobs, ConfigError, LiveConnection, ProvenPeer, Revocable,
+    Rpc, ServiceBuilder,
 };
 use chain::{standing, structure, Revoked};
 
@@ -121,13 +126,62 @@ impl Timestamp {
     }
 }
 
+// Empty proof = a directly trusted root; stored chains are always non-empty.
+// Proof changes are deliberately conservative: losing any established proof
+// withdraws all of that holder's grants, even if another proof still admits it.
+type Authorities = BTreeMap<PublicKey, BTreeSet<Vec<CertId>>>;
+
 #[derive(Debug)]
 struct Store {
     roots: Roots,
     chains: BTreeMap<PublicKey, Vec<Arc<Credential>>>,
     revoked: Revoked,
+    blobs: Option<Blobs>,
 }
 impl Store {
+    // Established proofs, not an admission check: pending records do not count
+    // until promoted, and wall-clock expiry is handled by Change::Expire's
+    // removal. Keeping expired proofs here lets that removal find old grants.
+    fn authorities(&self) -> Authorities {
+        let mut known = Authorities::new();
+        for key in self.roots.keys() {
+            if !self.revoked.is_exhausted(&key) {
+                known.entry(key).or_default().insert(Vec::new());
+            }
+        }
+        for (holder, credentials) in &self.chains {
+            for credential in credentials {
+                if self.roots.contains(&credential.principal())
+                    && credential.chain().links().iter().all(|link| {
+                        !self.revoked.is_accepted(&link.id())
+                            && !self.revoked.is_exhausted(&link.issuer())
+                            && !self.revoked.is_exhausted(&link.subject())
+                    })
+                {
+                    known.entry(*holder).or_default().insert(
+                        credential
+                            .chain()
+                            .links()
+                            .iter()
+                            .map(Certificate::id)
+                            .collect(),
+                    );
+                }
+            }
+        }
+        known
+    }
+    fn checkpoint(&self) -> Option<Authorities> {
+        self.blobs.as_ref().map(|_| self.authorities())
+    }
+    fn standing_checkpoint(&self) -> Option<Authorities> {
+        if self.revoked.pending.is_empty() {
+            None
+        } else {
+            self.checkpoint()
+        }
+    }
+
     fn standing(&mut self, chain: &Chain, now: Timestamp) -> Result<(), ChainError> {
         standing(chain, &self.roots, &mut self.revoked, now)
     }
@@ -192,13 +246,57 @@ impl Trust {
                 roots,
                 chains: BTreeMap::new(),
                 revoked: Revoked::new(),
+                blobs: None,
             }),
             live: live::Live::default(),
         }))
     }
+    /// Bind the same blob store used by this node's services, before issuing any
+    /// grants or serving calls. Every clone of this Trust shares the binding.
+    /// Losing any established authority proof conservatively withdraws all of
+    /// the holder's grants, even if another proof still admits it. This includes
+    /// disconnected holders and changes that return an exhaustion error.
+    /// Expired grants are withdrawn when the application applies `Change::Expire`.
+    ///
+    /// Returns `ConfigError::ConflictingBlobStores` if already bound elsewhere.
+    pub fn with_blobs(self, blobs: &Blobs) -> crate::Result<Self> {
+        {
+            let mut store = self.store();
+            if store
+                .blobs
+                .as_ref()
+                .is_some_and(|held| !held.is_same_store(blobs))
+            {
+                return Err(ConfigError::ConflictingBlobStores.into());
+            }
+            store.blobs = Some(blobs.clone());
+        }
+        Ok(self)
+    }
+
     fn store(&self) -> MutexGuard<'_, Store> {
         self.0.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    // Standing reads can establish a pending revoker's authority. One finalizer
+    // owns all resulting connection and grant effects, including failed checks.
+    fn checked<R>(&self, check: impl FnOnce(&mut Store) -> R) -> R {
+        let mut store = self.store();
+        let checkpoint = store.standing_checkpoint();
+        let before = store.revoked.revision();
+        let result = check(&mut store);
+        if store.revoked.revision() != before {
+            let _ = self.finish_mutation(&mut store, checkpoint);
+        }
+        result
+    }
+    fn mutate<R>(&self, change: impl FnOnce(&mut Store) -> R) -> (R, Vec<PublicKey>) {
+        let mut store = self.store();
+        let checkpoint = store.checkpoint();
+        let result = change(&mut store);
+        let closed = self.finish_mutation(&mut store, checkpoint);
+        (result, closed)
+    }
+
     /// Verify and retain one chain at the current time. Refused data is not stored.
     /// Identical certificate-id sequences are a no-op. At the per-holder cap,
     /// the earliest expiry loses, breaking ties by ordered certificate IDs. This
@@ -211,9 +309,7 @@ impl Trust {
     /// connections even when this insertion is subsequently refused.
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
-        let mut store = self.store();
-        let before = store.revoked.revision();
-        let result = (|| {
+        let (result, _) = self.mutate(|store| {
             store.standing(&chain, Timestamp::now())?;
             let held = store.chains.get(&credential.holder());
             let duplicate = held.is_some_and(|chains| {
@@ -262,29 +358,18 @@ impl Trust {
             }
             chains.sort_by(|a, b| retention_order(a, b));
             Ok(())
-        })();
-        let promoted = store.revoked.revision() != before;
-        drop(store);
-        if promoted {
-            let _ = self.sweep();
-        }
+        });
         result
     }
+
     /// Verify a chain against this view's roots and revocations at `now`.
     /// Establishing a pending revocation's authority makes it permanent and closes
     /// affected connections, including when verification returns `Revoked`.
     pub fn verify(&self, chain: &Chain, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(chain)?;
-        let mut store = self.store();
-        let before = store.revoked.revision();
-        let result = store.standing(chain, now).map(|()| credential);
-        let promoted = store.revoked.revision() != before;
-        drop(store);
-        if promoted {
-            let _ = self.sweep();
-        }
-        result
+        self.checked(|store| store.standing(chain, now).map(|()| credential))
     }
+
     /// Open a forwarded value against this view's roots and revocations.
     /// Checks signature, chain standing and the purpose's operation caveat before
     /// decoding. Resource caveats are not checked: the application must authorize
@@ -297,23 +382,13 @@ impl Trust {
         now: Timestamp,
     ) -> Result<Opened<T>, SignedError> {
         // User-provided serde runs outside the store lock.
-        let (roots, mut revoked, promoted) = {
-            let mut store = self.store();
-            // Certificate signatures already verified independently of T. Resolve
-            // pending authority in the shared view before copying it for serde.
-            let before = store.revoked.revision();
+        let (roots, mut revoked) = self.checked(|store| {
             let _ = store.standing(signed.chain(), now);
-            (
-                store.roots.clone(),
-                store.revoked.clone(),
-                store.revoked.revision() != before,
-            )
-        };
-        if promoted {
-            let _ = self.sweep();
-        }
+            (store.roots.clone(), store.revoked.clone())
+        });
         signed.open_with(purpose, &roots, &mut revoked, now)
     }
+
     /// Advisory count of remembered live connections.
     pub fn live(&self) -> usize {
         self.0.live.len()
@@ -327,43 +402,68 @@ impl Trust {
     pub fn presentation(&self) -> ServiceBuilder<present::wire::Request, present::wire::Response> {
         present::service(self.clone())
     }
-    fn sweep(&self) -> Vec<PublicKey> {
+    fn finish_mutation(
+        &self,
+        store: &mut Store,
+        checkpoint: Option<Authorities>,
+    ) -> Vec<PublicKey> {
         let mut closed = BTreeSet::new();
-        for (registration, live) in self.0.live.snapshot() {
-            let id = live.peer().id();
-            if !self.admitting(id) {
-                live.close();
-                self.0.live.remove(registration);
-                closed.insert(id);
+        loop {
+            let before = store.revoked.revision();
+            for (registration, live) in self.0.live.snapshot() {
+                let id = live.peer().id();
+                if store.credentials(id, Timestamp::now(), |_| true).is_empty() {
+                    live.close();
+                    self.0.live.remove(registration);
+                    closed.insert(id);
+                }
+            }
+            // Promotion is monotonic and bounded. If an admission read learned
+            // another tombstone, revisit sessions checked before that change.
+            if store.revoked.revision() == before {
+                break;
             }
         }
-        // TODO: wire Blobs::revoke_peer on every mutation/promotion/exhaustion,
-        // including an apply that returns Err. Revoke grants for every affected
-        // holder, including still-admitted holders with narrowed authority and
-        // disconnected holders. `closed` alone is not that complete set.
+        if let (Some(blobs), Some(before)) = (&store.blobs, checkpoint) {
+            let after = store.authorities();
+            let mut affected = closed.clone();
+            for (holder, proofs) in before {
+                if after
+                    .get(&holder)
+                    .is_none_or(|current| !proofs.is_subset(current))
+                {
+                    affected.insert(holder);
+                }
+            }
+            // Lock order: trust store -> blobs ledger, never the reverse.
+            // Blob admission/reserve/commit do not call Trust or user hooks.
+            // Fence's connection predicate runs after its ledger guard drops;
+            // RPC accepts release that guard before running trust preflight.
+            // Both RPC and blob connection closure call out only after their
+            // registry guards drop. Close lost RPC admission FIRST, above, so
+            // an admission-only stream cannot take a fresh post-revoke Fence.
+            for holder in affected {
+                let _ = blobs.revoke_peer(holder);
+            }
+        }
         closed.into_iter().collect()
     }
     fn current(&self, credential: &Credential, now: Timestamp) -> bool {
-        let mut store = self.store();
-        let before = store.revoked.revision();
-        let current = if credential.chain().links().is_empty() {
-            store.roots.contains(&credential.holder())
-                && !store.revoked.is_exhausted(&credential.holder())
-        } else {
-            store.standing(credential.chain(), now).is_ok()
-        };
-        let promoted = store.revoked.revision() != before;
-        drop(store);
-        if promoted {
-            let _ = self.sweep();
-        }
-        current
+        self.checked(|store| {
+            if credential.chain().links().is_empty() {
+                store.roots.contains(&credential.holder())
+                    && !store.revoked.is_exhausted(&credential.holder())
+            } else {
+                store.standing(credential.chain(), now).is_ok()
+            }
+        })
     }
     fn admitting(&self, peer: PublicKey) -> bool {
-        !self
-            .store()
-            .credentials(peer, Timestamp::now(), |_| true)
-            .is_empty()
+        self.checked(|store| {
+            !store
+                .credentials(peer, Timestamp::now(), |_| true)
+                .is_empty()
+        })
     }
     fn permitting(
         &self,
@@ -372,8 +472,7 @@ impl Trust {
         resource: Option<&str>,
         operation: &str,
     ) -> Vec<Arc<Credential>> {
-        self.store()
-            .credentials(peer, now, |c| c.permits(resource, operation))
+        self.checked(|store| store.credentials(peer, now, |c| c.permits(resource, operation)))
     }
 }
 
@@ -409,48 +508,42 @@ impl Revocable for Trust {
     type Change = Change;
     type Error = ChangeError;
     fn apply(&self, change: Change) -> Result<Vec<PublicKey>, ChangeError> {
-        let result = {
-            let mut store = self.store();
-            (|| -> Result<(), ChangeError> {
-                match change {
-                    Change::Revoke(revocation) => {
-                        let authority = if store.roots.contains(&revocation.revoker()) {
-                            Some(Vec::new())
-                        } else {
-                            store.chains.values().flatten().find_map(|credential| {
-                                let mut path = Vec::new();
-                                for link in credential.chain().links() {
-                                    path.push(link.issuer());
-                                    if link.id() == revocation.certificate()
-                                        && path.contains(&revocation.revoker())
-                                    {
-                                        return Some(path);
-                                    }
+        let (result, closed) = self.mutate(|store| {
+            match change {
+                Change::Revoke(revocation) => {
+                    let authority = if store.roots.contains(&revocation.revoker()) {
+                        Some(Vec::new())
+                    } else {
+                        store.chains.values().flatten().find_map(|credential| {
+                            let mut path = Vec::new();
+                            for link in credential.chain().links() {
+                                path.push(link.issuer());
+                                if link.id() == revocation.certificate()
+                                    && path.contains(&revocation.revoker())
+                                {
+                                    return Some(path);
                                 }
-                                None
-                            })
-                        };
-                        store.revoked.add(&revocation, authority.as_deref())?;
-                    }
-                    Change::Roots(roots) => {
-                        store.roots = roots;
-                        let roots = store.roots.clone();
-                        store.revoked.trust_roots(&roots)?;
-                    }
-                    Change::Expire => {
-                        let now = Timestamp::now();
-                        store.chains.retain(|_, chains| {
-                            chains.retain(|c| c.caveats().validity.not_after() > now);
-                            !chains.is_empty()
-                        });
-                    }
+                            }
+                            None
+                        })
+                    };
+                    store.revoked.add(&revocation, authority.as_deref())?;
                 }
-                Ok(())
-            })()
-        };
-        // Errors can establish permanent exhaustion too. Always sweep AFTER
-        // mutating, including when the operation returns a typed budget refusal.
-        let closed = self.sweep();
+                Change::Roots(roots) => {
+                    store.roots = roots;
+                    let roots = store.roots.clone();
+                    store.revoked.trust_roots(&roots)?;
+                }
+                Change::Expire => {
+                    let now = Timestamp::now();
+                    store.chains.retain(|_, chains| {
+                        chains.retain(|c| c.caveats().validity.not_after() > now);
+                        !chains.is_empty()
+                    });
+                }
+            }
+            Ok(())
+        });
         result.map(|()| closed)
     }
 }

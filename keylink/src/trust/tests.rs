@@ -654,3 +654,241 @@ fn an_upstream_revocation_does_not_charge_a_downstream_issuers_budget() {
         MAX_ACCEPTED_PER_REVOKER + 1
     );
 }
+
+// Native sockets and a subprocess watchdog are intentionally not browser work.
+#[cfg(not(target_arch = "wasm32"))]
+mod lock_order {
+    use super::*;
+    use crate::{Context, Grant, Node, SeqId, Server, Wire};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    crate::service! {
+        service ConcurrentShelf;
+        blob Read() -> u32;
+    }
+    struct ConcurrentShelf(SeqId);
+    impl concurrent_shelf::Handler for ConcurrentShelf {
+        async fn read(&self, _cx: &Context) -> (u32, Grant) {
+            (2, self.0.into())
+        }
+    }
+    const REVERSE_LOCK_ORDER: bool = false;
+
+    // Made red with scripts/break-once.sh by enabling this module's reverse-order
+    // injection. Two threads hold the actual trust and blob ledger mutexes, meet
+    // at a barrier, then each requests the other's mutex. The parent's Tokio
+    // watchdog fails and kills only its own child, so runtime shutdown cannot
+    // turn the intentionally deadlocked blocking threads into a stuck gate.
+    // Watched: trust/blob lock-order watchdog expired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trust_and_blob_revocation_stress_has_a_bounded_deadlock_watchdog() {
+        const CHILD: &str = "KEYLINK_TRUST_LOCK_STRESS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            tokio::time::timeout(Duration::from_secs(20), exercise())
+                .await
+                .expect("trust/blob workload timed out");
+            return;
+        }
+        let log = std::env::temp_dir().join(format!(
+            "keylink-trust-lock-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&log)
+            .unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg("trust_and_blob_revocation_stress_has_a_bounded_deadlock_watchdog")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        match status {
+            Ok(status) => assert!(
+                status.unwrap().success(),
+                "stress child failed: {}",
+                std::fs::read_to_string(&log).unwrap()
+            ),
+            Err(_) => {
+                child.kill().await.unwrap();
+                panic!(
+                    "trust/blob lock-order watchdog expired; child log: {}",
+                    log.display()
+                );
+            }
+        }
+        let output = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            output.contains("closure fetch attempts="),
+            "child did not finish its workload: {output}"
+        );
+        eprintln!("{output}");
+        std::fs::remove_file(log).unwrap();
+    }
+
+    async fn exercise() {
+        let root = SecretKey::from_bytes(&[81; 32]);
+        let other = SecretKey::from_bytes(&[82; 32]);
+        let blobs = Blobs::memory();
+        let trust = Trust::new(Roots::only([root.public(), other.public()]).unwrap())
+            .with_blobs(&blobs)
+            .unwrap();
+        if REVERSE_LOCK_ORDER {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (a, b) = (trust.clone(), trust.clone());
+            let (x, y) = (blobs.clone(), blobs.clone());
+            let rendezvous = barrier.clone();
+            let forward = std::thread::spawn(move || {
+                let _trust = a.store();
+                rendezvous.wait();
+                x.revoke_peer(root.public());
+            });
+            let reverse = std::thread::spawn(move || {
+                let _ledger = y.hold_grant_ledger();
+                barrier.wait();
+                let _trust = b.store();
+            });
+            tokio::task::spawn_blocking(move || {
+                forward.join().unwrap();
+                reverse.join().unwrap();
+            })
+            .await
+            .unwrap();
+            unreachable!();
+        }
+        let node = Node::bind_local().await.unwrap();
+        let a = blobs.add_bytes(b"member a".as_slice()).await.unwrap();
+        let b = blobs.add_bytes(b"member b".as_slice()).await.unwrap();
+        let seq = blobs.add_seq([a, b]).await.unwrap();
+        let service = trust
+            .guard::<concurrent_shelf::Request, _>(WithinCaveats)
+            .resource(|_| Some(std::borrow::Cow::Borrowed("repo/a")))
+            .install(|allow| concurrent_shelf::service(ConcurrentShelf(seq), allow))
+            .with_blobs(&blobs)
+            .build();
+        let _running = Server::builder(&node)
+            .service(service)
+            .service(trust.presentation().build())
+            .spawn()
+            .unwrap();
+        let mut peers = Vec::new();
+        let mut ids = Vec::new();
+        for index in 0..4u8 {
+            let secret = SecretKey::from_bytes(&[90 + index; 32]);
+            let peer = Node::bind_local_with_secret(secret.clone()).await.unwrap();
+            let keeper = Chain::new(vec![Certificate::issue(
+                &root,
+                grant(secret.public(), "repo", 0),
+            )
+            .unwrap()]);
+            let extra = Chain::new(vec![Certificate::issue(
+                &other,
+                grant(secret.public(), "repo", 0),
+            )
+            .unwrap()]);
+            trust.insert(keeper.clone()).unwrap();
+            trust.insert(extra).unwrap();
+            let client = concurrent_shelf::Client::connect(&peer, node.endpoint().addr())
+                .await
+                .unwrap();
+            let (_, handle) = client.read().await.unwrap();
+            handle.fetch_into(&Blobs::memory()).await.unwrap();
+            client.close().await.unwrap();
+            ids.push(peer.id());
+            peers.push((peer, keeper, handle));
+        }
+        let unused = Certificate::issue(
+            &root,
+            grant(SecretKey::from_bytes(&[110; 32]).public(), "repo/unused", 0),
+        )
+        .unwrap();
+        let revocation = Revocation::issue(&root, unused.id());
+        let counts = Arc::new([
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ]);
+        let start = Arc::new(tokio::sync::Barrier::new(6));
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut tasks = tokio::task::JoinSet::new();
+        let (mutating, progress, ready) = (trust.clone(), counts.clone(), start.clone());
+        let both = Roots::only([root.public(), other.public()]).unwrap();
+        let keeper = Roots::only([root.public()]).unwrap();
+        tasks.spawn(async move {
+            ready.wait().await;
+            while tokio::time::Instant::now() < until {
+                mutating.apply(Change::Roots(both.clone())).unwrap();
+                mutating.apply(Change::Revoke(revocation.clone())).unwrap();
+                mutating.apply(Change::Roots(keeper.clone())).unwrap();
+                progress[0].fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        let (revoking, progress, ready) = (blobs.clone(), counts.clone(), start.clone());
+        tasks.spawn(async move {
+            ready.wait().await;
+            while tokio::time::Instant::now() < until {
+                for id in &ids {
+                    revoking.revoke_peer(*id);
+                }
+                progress[1].fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        for (peer, chain, old) in peers {
+            let (progress, ready, addr) = (counts.clone(), start.clone(), node.endpoint().addr());
+            tasks.spawn(async move {
+                ready.wait().await;
+                while tokio::time::Instant::now() < until {
+                    assert!(matches!(
+                        super::super::present(&peer, addr.clone(), &chain)
+                            .await
+                            .unwrap(),
+                        Presented::Held { .. }
+                    ));
+                    let client = concurrent_shelf::Client::connect(&peer, addr.clone())
+                        .await
+                        .unwrap();
+                    progress[2].fetch_add(1, Ordering::Relaxed);
+                    let handle = match client.read().await {
+                        Ok((2, handle)) => handle,
+                        Err(crate::Error::Remote(crate::RemoteError::GrantsWithdrawn)) => {
+                            old.clone()
+                        }
+                        answer => panic!("unexpected admitted call: {answer:?}"),
+                    };
+                    // A fresh store forces a real closure request, never a cache hit.
+                    // Revocation may refuse it or close a transfer already in flight.
+                    let _ = handle.fetch_into(&Blobs::memory()).await;
+                    progress[3].fetch_add(1, Ordering::Relaxed);
+                    client.close().await.unwrap();
+                }
+            });
+        }
+        while let Some(task) = tasks.join_next().await {
+            task.unwrap();
+        }
+        assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) > 0));
+        eprintln!(
+            "trust changes={}, direct revocations={}, admissions={}, closure fetch attempts={}",
+            counts[0].load(Ordering::Relaxed),
+            counts[1].load(Ordering::Relaxed),
+            counts[2].load(Ordering::Relaxed),
+            counts[3].load(Ordering::Relaxed)
+        );
+    }
+}

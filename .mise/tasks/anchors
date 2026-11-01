@@ -537,6 +537,12 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ("BG1", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "                let _ = blobs.revoke_peer(holder);"),
+    ("BG2", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "        if store.revoked.revision() != before {"),
+    ("BG3", "keylink/tests/trust.rs", "keylink/src/trust/mod.rs",
+     "                .is_some_and(|held| !held.is_same_store(blobs))"),
     ("DA1", "keylink/tests/admission.rs", "keylink/src/admission.rs",
      "        for (registration, live) in self.live.snapshot() {"),
     ("CA1", "keylink/tests/trust.rs", "keylink/src/call.rs",
@@ -547,7 +553,7 @@ ANCHORS = [
     ('RR4', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                || self.usage.get(key).copied().unwrap_or(0) >= super::MAX_ACCEPTED_PER_REVOKER'),
     ('RR5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '            .chain(path.iter().rev().copied())'),
     ('RR6', 'keylink/tests/trust.rs', 'keylink/src/trust/chain.rs', '            if revoked.is_exhausted(&key) {'),
-    ('RR7', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        let closed = self.sweep();'),
+    ('RR7', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        let closed = self.finish_mutation(&mut store, checkpoint);'),
     ('RR8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/sign.rs', '            if revoked.is_exhausted(&self.signer) {'),
     ('RR9', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '        if self.roots.contains(&peer) && !self.revoked.is_exhausted(&peer) {'),
     ('RR10', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                        refusal.get_or_insert(super::ChangeError::RevokerExhausted {'),
@@ -557,7 +563,7 @@ ANCHORS = [
     ('RF3', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            store.standing(credential.chain(), now).is_ok()'),
     ('RF4', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '    for (policy, credential) in required.iter().zip(&checked) {'),
     ('RF5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '    pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {'),
-    ('RF6', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        for (registration, live) in self.0.live.snapshot() {'),
+    ('RF6', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            for (registration, live) in self.0.live.snapshot() {'),
     ('RF7', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '            if total >= MAX_RETAINED_CHAINS'),
     ('RF8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                >= super::MAX_PENDING_REVOCATIONS'),
     ('RF9', 'keylink/tests/trust.rs', 'keylink/src/trust/guard.rs', '                    Err(AccessError::Forbidden) => continue,'),
@@ -4060,7 +4066,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 352
+RECORD_BLOCKS = 391
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -1294,15 +1294,10 @@ impl Blobs {
     /// grants, because the ledger is per node and does not record which service
     /// granted what: drop the peer from admission first, then call this.
     ///
-    /// **That recipe is complete only if admission closes every RPC connection
-    /// of the peer.** A call is fenced when its stream is accepted and refused if
-    /// its connection is closed by then, so a connection admission left open can
-    /// still take a fresh fence after this has run. [`DynamicAdmission`](crate::DynamicAdmission) keeps one
-    /// revocation handle per peer today, so a second live connection of the same
-    /// peer survives a `replace` and is exactly that. The `trust` branch fixes
-    /// the registry, which already tracks connections by id; until it lands,
-    /// close the peer's connections some other way (restart the server, or admit
-    /// by an allowlist that cannot hold a peer twice) before relying on this.
+    /// Both built-in revocable adapters track and close every RPC connection of
+    /// a removed peer. With `DynamicAdmission`, apply the admission removal first,
+    /// then call this method. `Trust::with_blobs` performs both steps as one policy
+    /// update, including conservative withdrawal when authority only narrows.
     pub fn revoke_peer(&self, peer: EndpointId) -> usize {
         let grants = self.inner.grants.revoke_peer(peer);
         self.inner.live.close_peer(peer);
@@ -1348,6 +1343,13 @@ impl Blobs {
             .map_err(|refused| Error::Remote(refusal(&refused)))?
             .commit();
         Ok(())
+    }
+
+    // Test-only access to the actual ledger mutex, with its private Book hidden.
+    // Production code has no callback while this guard is held.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn hold_grant_ledger(&self) -> impl Drop + '_ {
+        self.inner.grants.lock()
     }
 
     /// Fence a call just accepted for `peer`, refusing it when `open` says the

@@ -28,6 +28,9 @@ impl Revoked {
     pub(super) fn accounted_keys(&self) -> usize {
         self.usage.len()
     }
+    pub(super) fn is_accepted(&self, id: &CertId) -> bool {
+        self.accepted.contains(id)
+    }
     pub(super) fn is_exhausted(&self, key: &PublicKey) -> bool {
         self.exhausted.contains(key)
     }
@@ -189,6 +192,9 @@ impl Roots {
     #[must_use]
     pub fn contains(&self, key: &PublicKey) -> bool {
         self.0.contains(key)
+    }
+    pub(super) fn keys(&self) -> impl Iterator<Item = PublicKey> + '_ {
+        self.0.iter().copied()
     }
 }
 

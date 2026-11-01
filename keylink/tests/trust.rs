@@ -358,8 +358,8 @@ impl ungated::Handler for Ungated {
     }
 }
 #[tokio::test]
-// Search `        for (registration, live) in self.0.live.snapshot() {`.
-// Made red with scripts/break-once.sh replacing it with `        for (registration, live) in self.0.live.snapshot().into_iter().take(1) {`.
+// Search `            for (registration, live) in self.0.live.snapshot() {`.
+// Made red with scripts/break-once.sh replacing it with `            for (registration, live) in self.0.live.snapshot().into_iter().take(1) {`.
 // Watched: one connection remained live instead of zero.
 async fn revocation_closes_every_connection_across_two_alpns() {
     let (root, device, chain, trust) = fixture();
@@ -877,9 +877,10 @@ async fn a_recorded_reply_cannot_cross_principals_for_the_same_request() {
 // Search `            if revoked.is_exhausted(&key) {`.
 // Made red with scripts/break-once.sh replacing it with `            if false {`.
 // Watched: the exhausted subtree retained its live connection.
-// Search `        let closed = self.sweep();`.
-// Made red with scripts/break-once.sh replacing it with `        let closed = if result.is_ok() { self.sweep() } else { Vec::new() };`.
-// Watched: an exhaustion error left the revoked subtree connection open.
+// The earlier result-conditional sweep break is spent after the shared finalizer extraction.
+// Search `        let closed = self.finish_mutation(&mut store, checkpoint);`.
+// Made red with scripts/break-once.sh replacing it with `        let closed = { let _ = checkpoint; Vec::new() };`.
+// Watched: the exhaustion error reported no closed subtree peer instead of the holder key.
 async fn revoker_exhaustion_closes_its_live_subtree_and_keeps_a_sibling_open() {
     let root = SecretKey::from_bytes(&[1; 32]);
     let delegate = SecretKey::from_bytes(&[2; 32]);
@@ -1056,4 +1057,271 @@ async fn applied_replies_keep_authority_after_the_ledger_forgets_the_key() {
         22,
         "the new principal runs rather than receiving A's applied answer"
     );
+}
+
+keylink::service! {
+    service TrustShelf;
+    blob Read(target: String) -> u64;
+    rpc Ping() -> u64;
+}
+struct TrustShelf(keylink::Grant);
+impl trust_shelf::Handler for TrustShelf {
+    async fn read(&self, _cx: &Context, _target: String) -> (u64, keylink::Grant) {
+        (7, self.0)
+    }
+    async fn ping(&self, _cx: &Context) -> u64 {
+        7
+    }
+}
+fn shelf_resource(request: &trust_shelf::Request) -> Option<Cow<'_, str>> {
+    match request {
+        trust_shelf::Request::Read { target } => Some(Cow::Borrowed(target)),
+        trust_shelf::Request::Ping {} => Some(Cow::Borrowed("repo/b")),
+        trust_shelf::Request::__Status {} => None,
+    }
+}
+// The four fetch regressions below were made red together with scripts/break-once.sh.
+// Search `                let _ = blobs.revoke_peer(holder);`.
+// Replace with `                let _ = holder;`: every old-grant refusal assertion failed.
+// The tests cover Err-returning exhaustion, still-admitted narrowing, no live
+// entry, and both verify/open promotions, using real remote reads, not a cache.
+async fn fetch_old_grant(handle: &keylink::BlobHandle) -> keylink::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    handle.copy_to(&mut bytes).await?;
+    Ok(bytes)
+}
+#[tokio::test]
+async fn an_error_returning_trust_change_withdraws_the_subtrees_old_blob_grant() {
+    let (_root, device, chain, trust) = fixture();
+    let delegate = SecretKey::from_bytes(&[2; 32]);
+    let blobs = keylink::Blobs::memory();
+    let blob = blobs.add_bytes(b"old grant".as_slice()).await.unwrap();
+    let trust = trust.with_blobs(&blobs).unwrap();
+    trust.insert(chain.clone()).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device.clone()).await.unwrap();
+    let service = trust
+        .guard::<trust_shelf::Request, _>(WithinCaveats)
+        .resource(shelf_resource)
+        .install(|allow| trust_shelf::service(TrustShelf(blob.into()), allow))
+        .with_blobs(&blobs)
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let (_, handle) = client.read("repo/a".into()).await.unwrap();
+    assert_eq!(fetch_old_grant(&handle).await.unwrap(), b"old grant");
+    for serial in 1..=trust::MAX_ACCEPTED_PER_REVOKER as u64 {
+        let mut delegation = grant(device.public(), "repo/a", 0);
+        delegation.serial = serial;
+        let next = Chain::new(vec![chain.links()[0].clone()])
+            .delegate(&delegate, delegation)
+            .unwrap();
+        trust
+            .apply(Change::Revoke(Revocation::issue(
+                &delegate,
+                next.links()[1].id(),
+            )))
+            .unwrap();
+        assert_eq!(
+            trust.verify(&next, Timestamp::now()).unwrap_err(),
+            ChainError::Revoked { at: 1 }
+        );
+    }
+    assert_eq!(
+        fetch_old_grant(&handle).await.unwrap(),
+        b"old grant",
+        "unrelated revoked leaves did not narrow this holder"
+    );
+    assert!(matches!(
+        trust.apply(Change::Revoke(Revocation::issue(
+            &delegate,
+            chain.links()[1].id()
+        ))),
+        Err(trust::ChangeError::RevokerExhausted { .. })
+    ));
+    assert!(matches!(
+        fetch_old_grant(&handle).await,
+        Err(Error::BlobRefused { .. })
+    ));
+}
+#[tokio::test]
+async fn narrowing_authority_withdraws_grants_even_while_the_holder_stays_admitted() {
+    let (root, device, _, trust) = fixture();
+    let blobs = keylink::Blobs::memory();
+    let blob = blobs.add_bytes(b"narrowed grant".as_slice()).await.unwrap();
+    let trust = trust.with_blobs(&blobs).unwrap();
+    let a = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/a", 0),
+    )
+    .unwrap()]);
+    let b = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    trust.insert(a.clone()).unwrap();
+    trust.insert(b).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<trust_shelf::Request, _>(WithinCaveats)
+        .resource(shelf_resource)
+        .install(|allow| trust_shelf::service(TrustShelf(blob.into()), allow))
+        .with_blobs(&blobs)
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let (_, handle) = client.read("repo/a".into()).await.unwrap();
+    assert_eq!(fetch_old_grant(&handle).await.unwrap(), b"narrowed grant");
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(&root, a.links()[0].id())))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        client.ping().await.unwrap(),
+        7,
+        "the other chain still admits this session"
+    );
+    assert_eq!(trust.live(), 1);
+    assert!(matches!(
+        fetch_old_grant(&handle).await,
+        Err(Error::BlobRefused { .. })
+    ));
+}
+#[tokio::test]
+async fn a_disconnected_holders_old_blob_grant_is_withdrawn_without_a_live_entry() {
+    let (root, device, chain, trust) = fixture();
+    let blobs = keylink::Blobs::memory();
+    let blob = blobs
+        .add_bytes(b"disconnected grant".as_slice())
+        .await
+        .unwrap();
+    let trust = trust.with_blobs(&blobs).unwrap();
+    trust.insert(chain.clone()).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    // The per-node ledger can hold a grant from another admitted service. The
+    // connection is closed before the trust update, and Trust has no live entry:
+    // stored authority, not the successful closed-peer list, must find it.
+    let _running = Server::builder(&node)
+        .service(
+            trust_shelf::service(
+                TrustShelf(blob.into()),
+                keylink::Allowlist::only([peer.id()]),
+            )
+            .with_blobs(&blobs)
+            .build(),
+        )
+        .spawn()
+        .unwrap();
+    let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let (_, handle) = client.read("repo/a".into()).await.unwrap();
+    client.close().await.unwrap();
+    assert_eq!(trust.live(), 0);
+    assert_eq!(
+        fetch_old_grant(&handle).await.unwrap(),
+        b"disconnected grant"
+    );
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(
+            &root,
+            chain.links()[0].id()
+        )))
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        fetch_old_grant(&handle).await,
+        Err(Error::BlobRefused { .. })
+    ));
+}
+// Search `        if store.revoked.revision() != before {`.
+// Made red with scripts/break-once.sh replacing it with `        if false {`.
+// Watched: promotion left the old grant fetchable instead of BlobRefused.
+#[tokio::test]
+async fn verification_and_opening_promotions_withdraw_preexisting_blob_grants() {
+    for opening in [false, true] {
+        let root = SecretKey::from_bytes(&[1; 32]);
+        let issuer = SecretKey::from_bytes(&[2; 32]);
+        let device = SecretKey::from_bytes(&[3; 32]);
+        let upstream = SecretKey::from_bytes(&[4; 32]);
+        let leaf = Certificate::issue(&issuer, grant(device.public(), "repo/a", 0)).unwrap();
+        let old = Chain::new(vec![
+            Certificate::issue(&root, grant(issuer.public(), "repo", 1)).unwrap(),
+            leaf.clone(),
+        ]);
+        let next = Chain::new(vec![
+            Certificate::issue(&root, grant(upstream.public(), "repo", 2)).unwrap(),
+            Certificate::issue(&upstream, grant(issuer.public(), "repo", 1)).unwrap(),
+            leaf.clone(),
+        ]);
+        let blobs = keylink::Blobs::memory();
+        let blob = blobs
+            .add_bytes(b"promotion grant".as_slice())
+            .await
+            .unwrap();
+        let trust = Trust::new(Roots::only([root.public()]).unwrap())
+            .with_blobs(&blobs)
+            .unwrap();
+        trust.insert(old).unwrap();
+        let node = Node::bind_local().await.unwrap();
+        let peer = Node::bind_local_with_secret(device.clone()).await.unwrap();
+        let service = trust
+            .guard::<trust_shelf::Request, _>(WithinCaveats)
+            .resource(shelf_resource)
+            .install(|allow| trust_shelf::service(TrustShelf(blob.into()), allow))
+            .with_blobs(&blobs)
+            .build();
+        let _running = Server::builder(&node).service(service).spawn().unwrap();
+        let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+            .await
+            .unwrap();
+        let (_, handle) = client.read("repo/a".into()).await.unwrap();
+        trust
+            .apply(Change::Revoke(Revocation::issue(&upstream, leaf.id())))
+            .unwrap();
+        assert_eq!(
+            fetch_old_grant(&handle).await.unwrap(),
+            b"promotion grant",
+            "pending authority has not yet been established"
+        );
+        if opening {
+            let purpose = trust::Purpose::new("TrustShelf/Read").unwrap();
+            let signed = trust::Signed::sign(&device, &purpose, &1u64, next).unwrap();
+            assert!(matches!(
+                trust.open(&signed, &purpose, Timestamp::now()),
+                Err(trust::SignedError::Chain(ChainError::Revoked { .. }))
+            ));
+        } else {
+            assert!(matches!(
+                trust.verify(&next, Timestamp::now()),
+                Err(ChainError::Revoked { .. })
+            ));
+        }
+        assert!(matches!(
+            fetch_old_grant(&handle).await,
+            Err(Error::BlobRefused { .. })
+        ));
+    }
+}
+// Search `                .is_some_and(|held| !held.is_same_store(blobs))`.
+// Made red with scripts/break-once.sh replacing it with `                .is_some_and(|_| false)`.
+// Watched: binding the other store returned Ok instead of ConflictingBlobStores.
+#[tokio::test]
+async fn a_shared_trust_binding_cannot_be_redirected_to_another_blob_store() {
+    let (_, _, _, trust) = fixture();
+    let a = keylink::Blobs::memory();
+    let b = keylink::Blobs::memory();
+    let trust = trust.with_blobs(&a).unwrap();
+    let clone = trust.clone().with_blobs(&a).unwrap();
+    assert!(matches!(
+        clone.with_blobs(&b),
+        Err(Error::Config(keylink::ConfigError::ConflictingBlobStores))
+    ));
 }
