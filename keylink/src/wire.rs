@@ -119,8 +119,10 @@ pub(crate) struct Control {
     /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
     /// much as an actor message does.
     pub(crate) idempotency: Option<crate::Idempotency>,
-    /// How long the caller will wait for the reply, in milliseconds, counted
-    /// from the moment the serving side reads this frame.
+    /// How long the caller will wait for the reply, in milliseconds. The serving
+    /// side starts counting once it has **claimed** the call, which is after any
+    /// wait for an idempotency key's ledger: that wait has its own bound,
+    /// `Limits::attach`, and is additional to this budget, not part of it.
     ///
     /// Relative on purpose: the two machines do not share a clock, so an
     /// absolute time would be wrong by their skew. `None` is a caller that set no
