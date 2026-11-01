@@ -3248,27 +3248,15 @@ async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds()
 
 // ═══════════════════════════════════════ a closure with no member cap
 
-/// The biggest closure the suite fetches: 300,000 tiny distinct members, of
-/// which the fetcher already holds every other one, so every window has a gap
-/// after every member it lacks. A closure has no length limit; what bounds the
-/// fetch is that each window of 4096 members is planned from its own slice of
-/// the list and its request has at most 4096 entries.
-///
-/// The fetcher is asked, from its own store, what it lacks (150,000 members,
-/// scattered), fetches exactly those, and ends with `Missing::Nothing`.
-///
-/// Watched red before it went green, in a scratch copy of the tree before
-/// closures were fetched a window at a time, which asked for the whole closure
-/// in one request: `fetch_into` failed with `BlobRefused` (the holder refused a
-/// request whose runs start past the limit it then had on closure size). With
-/// that limit lifted and the windows planned from their own slice it passes.
-#[tokio::test]
-async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
-    const MEMBERS: u32 = 300_000;
+/// A closure of `members` tiny distinct members, of which the fetcher already
+/// holds every other one, so every window has a gap after every member it lacks.
+/// The fetcher is asked, from its own store, what it lacks (every odd member, in
+/// order), fetches exactly those, and ends with `Missing::Nothing`.
+async fn a_closure_with_alternating_gaps_is_fetched(members: u32) {
     let cluster = cluster().await;
 
-    let mut ids = Vec::with_capacity(MEMBERS as usize);
-    for nth in 0..MEMBERS {
+    let mut ids = Vec::with_capacity(members as usize);
+    for nth in 0..members {
         ids.push(
             cluster
                 .blobs
@@ -3293,7 +3281,7 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
 
     // The fetcher holds every even member, so it lacks every odd one.
     let local = Blobs::memory();
-    for nth in (0..MEMBERS).step_by(2) {
+    for nth in (0..members).step_by(2) {
         local
             .add_bytes(nth.to_le_bytes().to_vec())
             .await
@@ -3312,7 +3300,7 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
     let moved = handle.fetch_into(&local).await.expect("fetches the rest");
     assert_eq!(
         moved,
-        u64::from(MEMBERS / 2) * 4,
+        u64::from(members / 2) * 4,
         "the odd members, 4 bytes each"
     );
     assert_eq!(
@@ -3320,4 +3308,37 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
         keylink::Missing::Nothing
     );
     assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+}
+
+/// Three whole windows and one member over (3 * 4096 + 1), with alternating
+/// gaps: the smallest closure that crosses several window boundaries and ends in
+/// a window of one. This is the one the gate runs.
+#[tokio::test]
+async fn a_closure_of_three_windows_and_one_member_with_alternating_gaps_is_fetched() {
+    a_closure_with_alternating_gaps_is_fetched(3 * 4096 + 1).await;
+}
+
+/// The biggest closure the suite fetches: 300,000 tiny distinct members, 150,000
+/// of them lacking and scattered. A closure has no length limit; what bounds the
+/// fetch is that each window of 4096 members is planned from its own slice of
+/// the list and its request has at most 4096 entries.
+///
+/// **Not in the gate.** It costs 100 to 266 seconds a run (about 1.2 million
+/// round trips to the store to ask what it holds), and the case above covers the
+/// windows. `mise run closure-300k` runs it, and its output goes in the pull
+/// request that changes the fetch.
+///
+/// Watched red before it went green, in a scratch copy of the tree before
+/// closures were fetched a window at a time, which asked for the whole closure
+/// in one request: `fetch_into` failed with `fetches the rest: BlobRefused { id:
+/// BlobId(0eed953ea9b4cb2a16d8d9738eeb36ebf165b27e8a979e62f74c6331dae580f2) }`
+/// (the holder refused a request whose runs start past the limit it then had on
+/// closure size). On the tree that had that limit but windows planned from the
+/// whole root it stopped at `BlobUnverified { fault: TooManyMembers { members:
+/// 300000, limit: 262144 } }`. With the limit gone and each window planned from
+/// its own slice it passes.
+#[tokio::test]
+#[ignore = "100 to 266 s a run, outside the gate: run it with `mise run closure-300k`"]
+async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
+    a_closure_with_alternating_gaps_is_fetched(300_000).await;
 }

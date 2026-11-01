@@ -341,6 +341,14 @@ run = [
     { task = "http-smoke-full" },
 ]
 
+[tasks.closure-300k]
+description = "NOT in `gate`: fetch a 300,000-member closure with alternating gaps (100 to 266 s)"
+# The gate runs the same case at 3 * 4096 + 1 members, which crosses several fetch
+# windows. This is the large one, kept out of it for its cost and run by hand
+# when the closure fetch changes: `--ignored` selects it and `--exact` makes the
+# name a whole-name match, so it runs this test and nothing else.
+run = "cargo test -p keylink --test blobs a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched -- --ignored --exact"
+
 # ── documentation ───────────────────────────────────────────────────────────
 
 [tasks.docs]
