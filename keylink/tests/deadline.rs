@@ -12,10 +12,18 @@
 //! | a keyed retry after a deadline gets the first answer, and the work ran once | `a_retry_after_a_deadline_gets_the_first_answer_and_runs_once` |
 //! | the caller's own deadline is a typed local error | `a_caller_deadline_is_typed_locally` |
 //!
-//! No assertion reads a clock. A fallback task releases the gate after ten
-//! seconds, so a missing deadline fails the test instead of hanging it; the
-//! deadline itself is long enough that an actor that starts its turn late still
-//! starts it, because a deadline also sheds a message that has not started.
+//! No assertion reads a clock, and none requires the actor to start a turn inside
+//! the deadline. A deadline also sheds a message that has not started, so on a
+//! machine slow enough to start `Hold` late the scenario of the first and second
+//! tests did not happen. Each of them says so by checking that the handler
+//! **entered** before it asserts anything about a turn in flight, and runs the
+//! scenario again on a fresh service when it did not; only a service that never
+//! starts a turn in time, five times in a row, fails them. The timer boundary
+//! itself is tested on a paused clock in `rpc.rs`, after the same kind of
+//! barrier, where no scheduling is involved. A fallback task releases the gate
+//! after ten seconds, so a missing deadline fails a test instead of hanging it.
+//! The third test needs no retry: it sends the call somewhere the service's
+//! deadline does not reach.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -28,7 +36,7 @@ use keylink::{
     Allowlist, Caller, Error, Idempotency, IdempotencyKey, KeyState, Node, Observer, RemoteError,
     Server, TurnFut, TurnInfo, TurnOutcome,
 };
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 mod common;
 use common::local_node;
@@ -43,12 +51,18 @@ keylink::service! {
     rpc Runs() -> u64;
 }
 
-/// Long enough that a loaded machine still starts the turn inside it, and short
-/// enough to wait for.
+/// Long enough that an idle actor starts its turn inside it, and short enough to
+/// wait for. Nothing here depends on that: see the header.
 const DEADLINE: Duration = Duration::from_millis(250);
+
+/// How many times a scenario is run on a fresh service before the actor is
+/// declared too slow to start a turn inside [`DEADLINE`].
+const ATTEMPTS: usize = 5;
 
 struct Vault {
     gate: Arc<Notify>,
+    /// Fires as `Hold` is entered, which is the barrier the assertions rest on.
+    entered: mpsc::UnboundedSender<()>,
     runs: u64,
 }
 
@@ -56,6 +70,7 @@ impl vault::Actor for Vault {
     async fn hold(&mut self, _cx: Caller<'_>) -> u64 {
         self.runs += 1;
         let run = self.runs;
+        let _ = self.entered.send(());
         self.gate.notified().await;
         run
     }
@@ -87,6 +102,7 @@ struct Fixture {
     vault: vault::Handle<Vault>,
     client: vault::Client,
     gate: Arc<Notify>,
+    entered: mpsc::UnboundedReceiver<()>,
     completed: Arc<AtomicUsize>,
     _server: Server,
     _nodes: (Node, Node),
@@ -96,8 +112,10 @@ impl Fixture {
     async fn new(deadline: Option<Duration>) -> Self {
         let gate = Arc::new(Notify::new());
         let completed = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = mpsc::unbounded_channel();
         let vault = vault::setup(Vault {
             gate: Arc::clone(&gate),
+            entered: entered_tx,
             runs: 0,
         })
         .observe(Counting(Arc::clone(&completed)))
@@ -120,10 +138,19 @@ impl Fixture {
             vault,
             client,
             gate,
+            entered,
             completed,
             _server: server,
             _nodes: (server_node, client_node),
         }
+    }
+
+    /// Whether `Hold` was entered. Asked **after** the caller has its answer: a
+    /// turn that started did so before the deadline passed, so its signal was sent
+    /// before the notice could be written, and a signal that is not there means the
+    /// message was shed and the scenario did not happen.
+    fn held_a_turn(&mut self) -> bool {
+        self.entered.try_recv().is_ok()
     }
 
     /// Releases the gate after ten seconds whatever happens, so a deadline that
@@ -148,88 +175,115 @@ fn millis(budget: Duration) -> u64 {
 /// finished. The observer counts completed `Hold` turns and sees exactly one, so
 /// the deadline produced one whole turn and not a half one.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `serve_one`'s
-/// `Some((budget, _)) => match n0_future::time::timeout(budget, &mut chain).await {`
-/// (indented eight spaces) and the replacement `Some((budget, _)) => match
-/// Ok::<_, ()>((&mut chain).await) {`, which removes the race: nobody answers at
-/// the deadline. The ten-second fallback releases the gate, the call returns, and
-/// the first assertion fails with `the caller is told the deadline passed: got
-/// Ok(1)`.
+/// Every assertion about the turn comes after the barrier: the handler **entered**
+/// before the caller was answered, or the scenario did not happen and the test
+/// starts again on a fresh service (see the header).
+///
+/// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `race`'s
+/// `match n0_future::time::timeout(budget, call).await {` (indented four spaces;
+/// registered as `DL1`) and the replacement `match Ok::<_, ()>(call.await) {`,
+/// which removes the race: nobody answers at the deadline. The ten-second
+/// fallback releases the gate, the call returns, and the first assertion fails
+/// with `the caller is told the deadline passed: got Ok(1)`.
 #[tokio::test]
 async fn a_deadline_answers_the_caller_and_the_turn_still_finishes() {
-    let fixture = Fixture::new(Some(DEADLINE)).await;
-    let fallback = fixture.release_in_ten_seconds();
+    for _ in 0..ATTEMPTS {
+        let mut fixture = Fixture::new(Some(DEADLINE)).await;
+        let fallback = fixture.release_in_ten_seconds();
 
-    let held = fixture.client.hold().await;
-    assert!(
-        matches!(
-            held,
-            Err(Error::Remote(RemoteError::DeadlinePassed { millis: passed }))
-                if passed == millis(DEADLINE)
-        ),
-        "the caller is told the deadline passed: got {held:?}"
-    );
+        let held = fixture.client.hold().await;
+        if !fixture.held_a_turn() {
+            fallback.abort();
+            continue;
+        }
+        assert!(
+            matches!(
+                held,
+                Err(Error::Remote(RemoteError::DeadlinePassed { millis: passed }))
+                    if passed == millis(DEADLINE)
+            ),
+            "the caller is told the deadline passed: got {held:?}"
+        );
 
-    fixture.gate.notify_one();
-    assert_eq!(fixture.vault.runs().await.expect("running"), 1);
-    assert_eq!(
-        fixture.completed.load(Ordering::SeqCst),
-        1,
-        "one whole Hold turn, never a half one"
-    );
-    fallback.abort();
+        fixture.gate.notify_one();
+        assert_eq!(fixture.vault.runs().await.expect("running"), 1);
+        assert_eq!(
+            fixture.completed.load(Ordering::SeqCst),
+            1,
+            "one whole Hold turn, never a half one"
+        );
+        fallback.abort();
+        return;
+    }
+    panic!("the actor never started a turn inside {DEADLINE:?}, {ATTEMPTS} times in a row");
 }
 
 /// A retry with the same key after a deadline gets the first call's real answer,
 /// and the work ran once.
 ///
+/// What this proves is the answer and the count, over the wire. Whether the retry
+/// attached to a call still running or replayed one that had finished depends on
+/// which the scheduler reached first, and this test does not claim either: the two
+/// orders are `rpc.rs`'s `an_attacher_parked_before_the_settle_is_handed_the_reply`
+/// and `an_attacher_arriving_after_the_settle_is_handed_the_reply`, where the
+/// attacher is parked, or not, before the settle by construction.
+///
 /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `serve_one`'s late
-/// path, the line `let _ = settle_key(Some(guard), &progress, &reply, grant).await;`
-/// (indented twenty spaces) and the replacement `drop((guard, reply, grant));`,
-/// which lets the guard settle on its own instead of from what the
-/// chain really returned. The retry is then refused and the test fails with `the
-/// retry gets the first call's answer: Remote(Idempotency(Interrupted))`.
+/// path, the line `finish_late(said, call).await;` (indented sixteen spaces;
+/// registered as `DL2`) and the replacement `drop(call); let _ = said.await;`, which
+/// stops driving the keyed call, so the guard settles on its own instead of from
+/// what the chain really returned. The retry is then refused and the test fails with `the retry
+/// gets the first call's answer: Remote(Idempotency(Interrupted))`.
 #[tokio::test]
 async fn a_retry_after_a_deadline_gets_the_first_answer_and_runs_once() {
-    let fixture = Fixture::new(Some(DEADLINE)).await;
-    let fallback = fixture.release_in_ten_seconds();
-    let key = IdempotencyKey::new("hold-1").expect("a valid key");
-    let keyed = || {
-        fixture.client.with_idempotency(Idempotency::attaching_for(
-            key.clone(),
-            Duration::from_secs(30),
-        ))
-    };
+    for _ in 0..ATTEMPTS {
+        let mut fixture = Fixture::new(Some(DEADLINE)).await;
+        let fallback = fixture.release_in_ten_seconds();
+        let key = IdempotencyKey::new("hold-1").expect("a valid key");
+        let client = fixture.client.clone();
+        let keyed = || {
+            client.with_idempotency(Idempotency::attaching_for(
+                key.clone(),
+                Duration::from_secs(30),
+            ))
+        };
 
-    let first = keyed().hold().await;
-    assert!(
-        matches!(
-            first,
-            Err(Error::Remote(RemoteError::DeadlinePassed { .. }))
-        ),
-        "the first call is told the deadline passed: got {first:?}"
-    );
+        let first = keyed().hold().await;
+        if !fixture.held_a_turn() {
+            fallback.abort();
+            continue;
+        }
+        assert!(
+            matches!(
+                first,
+                Err(Error::Remote(RemoteError::DeadlinePassed { .. }))
+            ),
+            "the first call is told the deadline passed: got {first:?}"
+        );
 
-    let retry = {
-        let retrying = keyed();
-        tokio::spawn(async move { retrying.hold().await })
-    };
-    fixture.gate.notify_one();
-    assert_eq!(
-        retry
-            .await
-            .expect("the retry does not panic")
-            .expect("the retry gets the first call's answer"),
-        1
-    );
+        let retry = {
+            let retrying = keyed();
+            tokio::spawn(async move { retrying.hold().await })
+        };
+        fixture.gate.notify_one();
+        assert_eq!(
+            retry
+                .await
+                .expect("the retry does not panic")
+                .expect("the retry gets the first call's answer"),
+            1
+        );
 
-    assert_eq!(
-        keyed().hold().await.expect("a settled key replays"),
-        1,
-        "a third call is a replay of the same answer"
-    );
-    assert_eq!(fixture.vault.runs().await.expect("running"), 1);
-    fallback.abort();
+        assert_eq!(
+            keyed().hold().await.expect("a settled key replays"),
+            1,
+            "a third call is a replay of the same answer"
+        );
+        assert_eq!(fixture.vault.runs().await.expect("running"), 1);
+        fallback.abort();
+        return;
+    }
+    panic!("the actor never started a turn inside {DEADLINE:?}, {ATTEMPTS} times in a row");
 }
 
 /// The caller's own deadline ends its wait with a typed local error.
