@@ -4,7 +4,8 @@
 //!
 //! The domain need is small and does not mention a filesystem, a bucket or a
 //! network: **one state, loaded once at start and replaced atomically after
-//! that, written by one process at a time.**
+//! that, plus the log of what changed since it was replaced, written by one
+//! process at a time.**
 //!
 //! That sentence is [`Snapshots`] and [`Claim`]. Everything else is an adapter.
 //!
@@ -17,7 +18,7 @@
 //!            │  Versioned    the frame      │   ← the only writer of a header
 //!            └───────────────┬──────────────┘
 //!            ┌───────────────▼──────────────┐
-//!            │  PORT   Snapshots · Claim    │   ← one whole value at a time
+//!            │  PORT   Snapshots · Claim    │   ← a snapshot, and the log after it
 //!            ├──────────────────────────────┤
 //!            │  PORT   Entries   · Held     │   ← many small ones, separately
 //!            └───┬─────────────┬────────────┘
@@ -38,7 +39,9 @@
 //! whole value, so recording one reply would rewrite every reply already held —
 //! quadratic in the number of records, and the cost is paid on the call path
 //! rather than at a checkpoint. [`Entries`] and [`Held`] are the same sentence
-//! with the granularity the caller actually has.
+//! with the granularity the caller actually has: a keyed set, with replace and
+//! remove. (The log a [`Claim`] carries is a different need: an ordered sequence
+//! that only grows at its end and is cut at its start.)
 //!
 //! One adapter carries both, because a store that can hold one value can hold
 //! many. They stay two traits because a caller needs exactly one of them and
@@ -80,8 +83,10 @@
 //! - **Nothing about other machines.** The file adapter survives a restart of
 //!   the process. It does not survive the loss of the disk. A bucket adapter
 //!   would; that is the reason to write one, and the only reason.
-//! - **No history.** One state, one current value. A journal is a different
-//!   port with different operations.
+//! - **No history beyond the log.** One snapshot, and the records after it. A
+//!   record before the snapshot's [`Seq`] is dropped by
+//!   [`Claim::truncate_before`], so this is a way to recover the present, not a
+//!   way to read the past.
 //! - **No guess about the payload.** Migration walks
 //!   [`Durable::migrate`] one hop at a time and this crate never parses what
 //!   comes back. A state whose encoding changed without
@@ -125,11 +130,73 @@ pub trait Snapshots: Send + Sync + 'static {
     fn claim(&self, id: &StateId) -> impl Future<Output = Result<Self::Claim>> + Send;
 }
 
+/// A position in a state's log: the n-th record that was appended.
+///
+/// `Seq::new(0)` means "before the first", so the first record a log ever holds
+/// is `Seq::new(1)`. The adapter stores the number it is given and never invents
+/// one; whether the numbers are contiguous is the caller's rule and
+/// [`Versioned`](versioned::Versioned) checks it, so that no adapter has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Seq(u64);
+
+impl Seq {
+    /// Wrap a number. An adapter calls this on what it read back off its medium.
+    #[must_use]
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The number, for an adapter to store.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Seq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// What [`Claim::recover`] found at and after the position it was asked for.
+///
+/// Built by adapters, so every field is public and the type is not
+/// `#[non_exhaustive]`: a struct an adapter cannot construct is a port nobody
+/// can implement.
+#[derive(Debug, Default)]
+pub struct Tail {
+    /// Every record at or after the requested position, oldest first, exactly
+    /// as it was appended.
+    pub records: Vec<(Seq, Vec<u8>)>,
+    /// How many records **before** the requested position are still stored. Not
+    /// zero means a [`truncate_before`](Claim::truncate_before) was interrupted:
+    /// the snapshot that made those records redundant is durable and the cut
+    /// never happened.
+    pub earlier: u64,
+    /// How many bytes were cut from the end of the log because the append that
+    /// was writing them never completed. `None` when the log ended cleanly.
+    pub torn: Option<u64>,
+}
+
 /// Exclusive access to one state, for as long as this value lives.
 ///
 /// Dropping it releases the claim. There is deliberately no `release` method:
 /// one way to give it up, and it is the one that also runs when the task
 /// unwinds.
+///
+/// # One claim owns both halves, and that is why they are one trait
+///
+/// A state is **a snapshot plus the log of what happened after it**. The
+/// snapshot says which log records it already contains, and that link is only
+/// atomic if one exclusive holder owns both. With two separate ports, a caller
+/// that stopped replaying the log would read the snapshot, ignore the records and
+/// lose them without a word. A caller that never appends — everything that
+/// stores whole snapshots — never meets the log half, and an adapter for it
+/// implements three methods it is never asked to call.
+///
+/// The log is also useful alone: a caller that keeps a small identity blob in the
+/// snapshot slot and appends batches of records is using the same two halves.
 pub trait Claim: Send + 'static {
     /// The stored bytes, or `None` when this state has never been stored.
     ///
@@ -151,6 +218,60 @@ pub trait Claim: Send + 'static {
     ///
     /// [`Error::Io`] when the write fails. The previous snapshot is intact.
     fn store(&mut self, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Append one record to the log, under `seq`.
+    ///
+    /// **Durable when this resolves `Ok`:** the record is on the storage device
+    /// and survives losing the process. A caller may treat a resolved append as a
+    /// fact and an unresolved one as nothing at all.
+    ///
+    /// **An `Err` leaves the log as it was before the call.** An adapter that
+    /// cannot roll a failed append back must fail every later append instead, so
+    /// that a record a caller was told did not happen is never followed by one
+    /// that did.
+    ///
+    /// The adapter stores `seq` and never checks it against the one before: the
+    /// numbers are the caller's, and [`Versioned`](versioned::Versioned) is what
+    /// reads them back and refuses a gap.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] when the record is over the adapter's cap, and
+    /// [`Error::Io`] when the write fails. Neither disturbs what is stored.
+    fn append(&mut self, seq: Seq, record: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Every record from `from` on, after cutting a torn tail.
+    ///
+    /// The recovery path: call it once, before the first [`append`](Self::append).
+    /// A log with nothing in it is an empty [`Tail`], not an error.
+    ///
+    /// **A damaged last record is torn, not corrupt.** It is cut from the log,
+    /// its size is reported in [`Tail::torn`], and that is not an error: the
+    /// append that was writing it never resolved, so its caller was never told it
+    /// happened. A damaged record with intact data **after** it is different —
+    /// data that was already acknowledged is damaged — and that is
+    /// [`Error::NotAJournal`].
+    ///
+    /// This writes, in that one case, and only to remove bytes that were never
+    /// a record.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the log cannot be read or the cut cannot be made, and
+    /// [`Error::NotAJournal`] when what is stored is not a log this build reads.
+    fn recover(&mut self, from: Seq) -> impl Future<Output = Result<Tail>> + Send;
+
+    /// Drop every record before `seq`.
+    ///
+    /// **Atomic:** a crash leaves the old log or the new one, and both are
+    /// correct against a snapshot that already contains those records. A log
+    /// that is missing or already shorter is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the rewrite fails; what was stored is intact.
+    /// [`Error::NotAJournal`] when what is stored is not a log this build reads.
+    fn truncate_before(&mut self, seq: Seq) -> impl Future<Output = Result<()>> + Send;
 }
 
 // ─────────────────────────────────────────────────── the port, entry by entry
@@ -679,6 +800,44 @@ pub enum EntryFault {
     BadKey(InvalidEntryKey),
 }
 
+/// Which check refused a stored log.
+///
+/// The sibling of [`EntryFault`] for the log a [`Claim`] carries, and it lives
+/// here for the same reason: the layout is this crate's, not each adapter's.
+/// `#[non_exhaustive]` because an adapter over something other than a file can
+/// refuse for reasons a file cannot have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum JournalFault {
+    /// The stored bytes do not begin with the journal's magic.
+    #[error("the stored bytes do not begin with this crate's journal magic")]
+    WrongMagic,
+    /// The journal's layout is newer than this build reads.
+    #[error("the journal layout is version {stored}, newer than the {ours} this build reads")]
+    LayoutFromTheFuture {
+        /// What the header claims.
+        stored: u16,
+        /// What this build understands.
+        ours: u16,
+    },
+    /// The journal's layout is older than this build reads, and there is no
+    /// layout migration.
+    #[error("the journal layout is version {stored}, older than the {ours} this build reads, and there is no layout migration")]
+    LayoutTooOld {
+        /// What the header claims.
+        stored: u16,
+        /// What this build understands.
+        ours: u16,
+    },
+    /// A record fails its checksum and intact bytes follow it: data that was
+    /// already acknowledged is damaged.
+    #[error("a journal record after record {after} is damaged and the log continues past it")]
+    Corrupt {
+        /// The last record that was intact before the damage.
+        after: Seq,
+    },
+}
+
 /// Why a store operation did not happen.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -739,6 +898,19 @@ pub enum Error {
         id: StateId,
         /// Which check refused them.
         fault: EntryFault,
+    },
+
+    /// A stored log that is not one this build can read.
+    ///
+    /// Reported by [`Claim::recover`] and [`Claim::truncate_before`], and a
+    /// refusal to guess for the reason [`Error::NotALog`] gives. **A torn tail is
+    /// not this**: it is cut, reported in [`Tail::torn`], and the log reads on.
+    #[error("the stored journal under {id} could not be read: {fault}")]
+    NotAJournal {
+        /// Whose journal it is.
+        id: StateId,
+        /// Which check refused it.
+        fault: JournalFault,
     },
 
     /// The underlying store failed.

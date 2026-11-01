@@ -153,7 +153,7 @@ use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
 
 use crate::versioned::{Snapshot, Versioned};
-use crate::{Claim, Durable, RestoreError, Result};
+use crate::{Claim, Durable, RestoreError, Result, Seq, Tail};
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
 /// would return, so an inherent method that shadows one is a type error rather
@@ -172,7 +172,7 @@ struct NoSuchMethod;
 /// on the claim *not* being `Sync`, and a supertrait added here would quietly
 /// take that argument away.
 ///
-/// Both methods are written as `-> impl Future` returning
+/// Every method is written as `-> impl Future` returning
 /// [`future::ready`](std::future::ready) rather than as `async fn`. That is
 /// deliberate and it is the reason the probe works: an `async fn load(&self)`
 /// captures `&Self` in its future, and `&Self: Send` requires `Self: Sync`, so
@@ -207,6 +207,18 @@ impl Claim for ProbeClaim {
 
     fn store(&mut self, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send {
         *self.stored.get_mut() = Some(bytes.to_vec());
+        future::ready(Ok(()))
+    }
+
+    fn append(&mut self, _seq: Seq, _record: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        future::ready(Ok(()))
+    }
+
+    fn recover(&mut self, _from: Seq) -> impl Future<Output = Result<Tail>> + Send {
+        future::ready(Ok(Tail::default()))
+    }
+
+    fn truncate_before(&mut self, _seq: Seq) -> impl Future<Output = Result<()>> + Send {
         future::ready(Ok(()))
     }
 }

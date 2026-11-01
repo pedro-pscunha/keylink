@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! <root>/warehouse/sp-01.snapshot     the bytes
+//! <root>/warehouse/sp-01.journal      the log after the snapshot, created by the first append
 //! <root>/warehouse/sp-01.lock         the claim, held by an open file
 //! ```
 //!
@@ -24,6 +25,46 @@
 //! can lose it, leaving the previous snapshot. That is not corruption, but it is
 //! silently weaker than the claim this module makes, so the step is here and it
 //! is why the platform note below exists.
+//!
+//! # The journal, byte for byte
+//!
+//! The file starts with an eight-byte header, written once, and then holds one
+//! frame per [`append`](Claim::append):
+//!
+//! ```text
+//! header   offset 0   6 bytes  magic   b"kljrnl"
+//!          offset 6   2 bytes  layout  u16 little-endian, 1
+//!
+//! record   offset 0   4 bytes  crc     u32 LE, CRC-32C (Castagnoli) of bytes [4, 16 + len)
+//!          offset 4   4 bytes  len     u32 LE, the length of the record
+//!          offset 8   8 bytes  seq     u64 LE
+//!          offset 16  len      record  opaque to this adapter
+//! ```
+//!
+//! The header is created the way a snapshot is replaced (a temporary file,
+//! `sync_all`, `rename`, a directory `sync_all`), so it can never be torn. Each
+//! append is one `write` and one `sync_data`; the file grows, so `fdatasync`
+//! flushes the size too.
+//!
+//! **The checksum covers `len` and `seq`**, so a damaged length is detected as
+//! well as a damaged payload. It is a check against torn and damaged writes and
+//! not against an attacker: the disk is trusted.
+//!
+//! **What reads as torn, and what reads as corrupt.** Recovery walks the frames
+//! from the start. A frame that does not fit in the file, or whose checksum fails
+//! with nothing but zeros after it, is the end of an append that never resolved:
+//! it is cut with `set_len` and reported in [`Tail::torn`]. A frame whose
+//! checksum fails with other bytes after it is [`Error::NotAJournal`]. The zeros
+//! rule is for ext4-family filesystems, where a size-extending append can reach
+//! the disk ahead of its bytes.
+//!
+//! **One case reads wrong, and it is named here instead of hidden.** A middle
+//! record whose *length field* is damaged so that it claims more bytes than the
+//! file holds cannot be told from a torn append, so it is cut together with every
+//! record after it. The size is in [`Tail::torn`], so the loss is reported and
+//! not silent, but it is a loss. Only a second copy of the length, or a checksum
+//! that sits before it, would close it, and neither is worth a second frame
+//! layout for a disk this adapter already trusts.
 //!
 //! # The claim is a file lock, and that choice has a reason
 //!
@@ -71,7 +112,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Claim, Entries, EntryFault, EntryKey, Error, Held, Result, Snapshots, StateId};
+use crate::{
+    Claim, Entries, EntryFault, EntryKey, Error, Held, JournalFault, Result, Seq, Snapshots,
+    StateId, Tail,
+};
 
 /// Snapshots as files under one directory.
 #[derive(Debug, Clone)]
@@ -189,13 +233,18 @@ impl Snapshots for Files {
 
     async fn claim(&self, id: &StateId) -> Result<FileClaim> {
         let (lock, base, parent) = self.locked(id).await?;
-        let mut snapshot = base.into_os_string();
+        let mut snapshot = base.clone().into_os_string();
         snapshot.push(".snapshot");
+        let mut journal = base.into_os_string();
+        journal.push(".journal");
         Ok(FileClaim {
             _lock: lock,
+            id: id.clone(),
             snapshot: PathBuf::from(snapshot),
+            journal: PathBuf::from(journal),
             parent,
             limit: self.limit,
+            appender: Journal::Closed,
         })
     }
 }
@@ -208,9 +257,29 @@ impl Snapshots for Files {
 pub struct FileClaim {
     /// Never read. Its existence *is* the claim: dropping it unlocks.
     _lock: std::fs::File,
+    id: StateId,
     snapshot: PathBuf,
+    journal: PathBuf,
     parent: PathBuf,
     limit: u64,
+    /// The journal's append handle. Taken while a blocking call owns it and put
+    /// back, in whatever state that call left it.
+    appender: Journal,
+}
+
+/// The state of a claim's append handle.
+#[derive(Debug)]
+enum Journal {
+    /// No handle yet. The first append opens the journal, creating it when it is
+    /// not there; [`recover`](Claim::recover) opens it too.
+    Closed,
+    /// A handle on the journal, with the length every acknowledged record ends
+    /// at. A failed append is cut back to it.
+    Open { file: std::fs::File, committed: u64 },
+    /// The journal cannot be trusted with another append: a failed append could
+    /// not be rolled back, or recovery refused what was stored. Every append is
+    /// an error from here to the end of this claim.
+    Broken,
 }
 
 impl Claim for FileClaim {
@@ -232,45 +301,404 @@ impl Claim for FileClaim {
             });
         }
 
-        // The temporary name carries the process id, so two writers that somehow
-        // got past the claim still cannot corrupt each other's temporary file.
-        // They would still race on the rename, which is why the claim exists.
-        let mut temp = self.snapshot.clone().into_os_string();
-        temp.push(format!(".tmp.{}", std::process::id()));
-        let temp = PathBuf::from(temp);
-
         let snapshot = self.snapshot.clone();
         let parent = self.parent.clone();
         let bytes = bytes.to_vec();
 
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write as _;
-
-            // 1 and 2: write it, then put it on the disk.
-            let mut file = std::fs::File::create(&temp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-
-            // 3: the atomic step. A reader sees the old bytes or the new ones.
-            if let Err(err) = std::fs::rename(&temp, &snapshot) {
-                // Leave nothing behind on a failed replace. The previous
-                // snapshot is untouched, which is the promise `store` makes
-                // about its own failure.
-                let _ = std::fs::remove_file(&temp);
-                return Err(err);
-            }
-
-            // 4: the step people skip. Without it the rename can be lost to a
-            // power cut and the previous snapshot comes back — which is not
-            // corruption, but it is weaker than what this module claims.
-            sync_dir(&parent)
-        })
-        .await
-        .map_err(|join| Error::Io(std::io::Error::other(join)))??;
+        tokio::task::spawn_blocking(move || replace_atomically(&snapshot, &parent, &bytes))
+            .await
+            .map_err(|join| Error::Io(std::io::Error::other(join)))??;
 
         Ok(())
     }
+
+    async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> {
+        let offered = record.len() as u64;
+        if offered > self.limit {
+            return Err(Error::TooLarge {
+                offered,
+                limit: self.limit,
+            });
+        }
+        // Refused before it is framed, because the frame's own length field is a
+        // `u32`: `Files::limit` takes any `u64`, and a length that wrapped would
+        // be read back as a different record.
+        let Ok(len) = u32::try_from(record.len()) else {
+            return Err(Error::TooLarge {
+                offered,
+                limit: u64::from(u32::MAX),
+            });
+        };
+        let frame = journal_frame(seq, len, record);
+
+        let state = std::mem::replace(&mut self.appender, Journal::Broken);
+        let journal = self.journal.clone();
+        let parent = self.parent.clone();
+        let (state, wrote) =
+            tokio::task::spawn_blocking(move || append_blocking(state, &journal, &parent, &frame))
+                .await
+                .map_err(|join| Error::Io(std::io::Error::other(join)))?;
+
+        self.appender = state;
+        wrote.map_err(Error::Io)
+    }
+
+    async fn recover(&mut self, from: Seq) -> Result<Tail> {
+        let previous = std::mem::replace(&mut self.appender, Journal::Broken);
+        let journal = self.journal.clone();
+        let id = self.id.clone();
+        let (state, tail) =
+            tokio::task::spawn_blocking(move || recover_blocking(previous, &journal, &id, from))
+                .await
+                .map_err(|join| Error::Io(std::io::Error::other(join)))?;
+
+        self.appender = state;
+        tail
+    }
+
+    async fn truncate_before(&mut self, seq: Seq) -> Result<()> {
+        let previous = std::mem::replace(&mut self.appender, Journal::Broken);
+        let journal = self.journal.clone();
+        let parent = self.parent.clone();
+        let id = self.id.clone();
+        let (state, cut) = tokio::task::spawn_blocking(move || {
+            truncate_blocking(previous, &journal, &parent, &id, seq)
+        })
+        .await
+        .map_err(|join| Error::Io(std::io::Error::other(join)))?;
+
+        self.appender = state;
+        cut
+    }
+}
+
+// ──────────────────────────────────────────────────────── the journal, in bytes
+
+/// What a journal starts with, so that anything else is a loud error rather than
+/// a record read as garbage.
+const JOURNAL_MAGIC: [u8; 6] = *b"kljrnl";
+
+/// This header's own version. Change the table, change the number.
+const JOURNAL_LAYOUT: u16 = 1;
+
+/// Magic and layout.
+const JOURNAL_HEADER_LEN: usize = JOURNAL_MAGIC.len() + 2;
+
+/// A frame's fixed part: checksum, length and sequence number.
+const FRAME_HEADER_LEN: usize = 4 + 4 + 8;
+
+/// The bytes of a fresh journal.
+fn journal_header() -> [u8; JOURNAL_HEADER_LEN] {
+    let mut header = [0_u8; JOURNAL_HEADER_LEN];
+    header[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    header[JOURNAL_MAGIC.len()..].copy_from_slice(&JOURNAL_LAYOUT.to_le_bytes());
+    header
+}
+
+/// One record as it is written: checksum, length, sequence number, record.
+fn journal_frame(seq: Seq, len: u32, record: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + record.len());
+    frame.extend_from_slice(&[0; 4]);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&seq.get().to_le_bytes());
+    frame.extend_from_slice(record);
+    let crc = crc32c(&frame[4..]);
+    frame[..4].copy_from_slice(&crc.to_le_bytes());
+    frame
+}
+
+/// CRC-32C (Castagnoli), reflected polynomial `0x82F6_3B78`.
+///
+/// Twenty lines here rather than a dependency: no checksum crate is in the
+/// lockfile, and a table and a loop is all the algorithm is.
+fn crc32c(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0_u32; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            let mut crc = byte as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    crc >> 1
+                };
+                bit += 1;
+            }
+            table[byte] = crc;
+            byte += 1;
+        }
+        table
+    };
+
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc = TABLE[usize::from((crc as u8) ^ byte)] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// A little-endian `u32` at `at`. The caller has checked the bounds.
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// A little-endian `u64` at `at`. The caller has checked the bounds.
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut eight = [0_u8; 8];
+    eight.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(eight)
+}
+
+/// A journal read back: where each intact frame lies, and where they end.
+struct Scanned {
+    /// `(seq, start, end)` of every intact frame, oldest first. The record is
+    /// `bytes[start + FRAME_HEADER_LEN..end]`.
+    frames: Vec<(Seq, usize, usize)>,
+    /// Where the last intact frame ends: everything after it is a torn tail.
+    intact: usize,
+}
+
+/// Walk a journal's bytes. Pure, so the torn-versus-corrupt rule is one function
+/// with no I/O in it.
+fn scan(bytes: &[u8]) -> std::result::Result<Scanned, JournalFault> {
+    let Some(header) = bytes.get(..JOURNAL_HEADER_LEN) else {
+        return Err(JournalFault::WrongMagic);
+    };
+    if header[..JOURNAL_MAGIC.len()] != JOURNAL_MAGIC {
+        return Err(JournalFault::WrongMagic);
+    }
+    let layout = u16::from_le_bytes([header[6], header[7]]);
+    if layout > JOURNAL_LAYOUT {
+        return Err(JournalFault::LayoutFromTheFuture {
+            stored: layout,
+            ours: JOURNAL_LAYOUT,
+        });
+    }
+    if layout < JOURNAL_LAYOUT {
+        return Err(JournalFault::LayoutTooOld {
+            stored: layout,
+            ours: JOURNAL_LAYOUT,
+        });
+    }
+
+    let mut frames = Vec::new();
+    let mut last = Seq::new(0);
+    let mut at = JOURNAL_HEADER_LEN;
+    while at < bytes.len() {
+        if bytes.len() - at < FRAME_HEADER_LEN {
+            break;
+        }
+        // `checked_add` because the length is read off the disk: it wraps on a
+        // 32-bit target in a release build, and the bound below would then pass
+        // on a wrapped value.
+        let len = u32_at(bytes, at + 4) as usize;
+        let Some(end) = (at + FRAME_HEADER_LEN).checked_add(len) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        if crc32c(&bytes[at + 4..end]) != u32_at(bytes, at) {
+            // A failed checksum with only zeros after it is a torn tail; with
+            // anything else after it, acknowledged data is damaged.
+            if bytes[end..].iter().all(|byte| *byte == 0) {
+                break;
+            }
+            return Err(JournalFault::Corrupt { after: last });
+        }
+        let seq = Seq::new(u64_at(bytes, at + 8));
+        frames.push((seq, at, end));
+        last = seq;
+        at = end;
+    }
+    Ok(Scanned { frames, intact: at })
+}
+
+/// Open the journal for appending, creating it first when it is not there.
+fn open_appender(journal: &Path, parent: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    if !journal.try_exists()? {
+        replace_atomically(journal, parent, &journal_header())?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(journal)?;
+    let len = file.metadata()?.len();
+    Ok((file, len))
+}
+
+/// One append: write the frame, put it on the disk, and on any failure cut the
+/// journal back to what was acknowledged.
+fn append_blocking(
+    state: Journal,
+    journal: &Path,
+    parent: &Path,
+    frame: &[u8],
+) -> (Journal, std::io::Result<()>) {
+    use std::io::Write as _;
+
+    let (mut file, committed) =
+        match state {
+            Journal::Open { file, committed } => (file, committed),
+            Journal::Closed => match open_appender(journal, parent) {
+                Ok(opened) => opened,
+                Err(err) => return (Journal::Closed, Err(err)),
+            },
+            Journal::Broken => return (
+                Journal::Broken,
+                Err(std::io::Error::other(
+                    "the journal cannot be appended to: an earlier append failed and could not \
+                     be rolled back, or recovery refused what was stored",
+                )),
+            ),
+        };
+
+    match file.write_all(frame).and_then(|()| file.sync_data()) {
+        Ok(()) => {
+            let committed = committed + frame.len() as u64;
+            (Journal::Open { file, committed }, Ok(()))
+        }
+        Err(err) => {
+            // Cut back to the last acknowledged byte. If even that fails, the
+            // record may still be on the disk, so no later append may follow it.
+            match file.set_len(committed).and_then(|()| file.sync_data()) {
+                Ok(()) => (Journal::Open { file, committed }, Err(err)),
+                Err(_) => (Journal::Broken, Err(err)),
+            }
+        }
+    }
+}
+
+/// Read the journal, cut a torn tail, and keep an append handle at the end.
+fn recover_blocking(
+    previous: Journal,
+    journal: &Path,
+    id: &StateId,
+    from: Seq,
+) -> (Journal, Result<Tail>) {
+    // Closed before the file is read, so a handle is never left pointing at a
+    // file this call is about to cut.
+    drop(previous);
+    let read = || -> Result<(Journal, Tail)> {
+        let bytes = match std::fs::read(journal) {
+            Ok(bytes) => bytes,
+            // Never appended to is not a failure. It is a state with no log.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Journal::Closed, Tail::default()))
+            }
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let scanned = scan(&bytes).map_err(|fault| Error::NotAJournal {
+            id: id.clone(),
+            fault,
+        })?;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(journal)?;
+        let mut tail = Tail::default();
+        if scanned.intact < bytes.len() {
+            file.set_len(scanned.intact as u64)?;
+            file.sync_data()?;
+            tail.torn = Some((bytes.len() - scanned.intact) as u64);
+        }
+        for (seq, start, end) in scanned.frames {
+            if seq < from {
+                tail.earlier += 1;
+            } else {
+                tail.records
+                    .push((seq, bytes[start + FRAME_HEADER_LEN..end].to_vec()));
+            }
+        }
+        let committed = scanned.intact as u64;
+        Ok((Journal::Open { file, committed }, tail))
+    };
+    match read() {
+        Ok((state, tail)) => (state, Ok(tail)),
+        Err(err) => (Journal::Broken, Err(err)),
+    }
+}
+
+/// Rewrite the journal holding only the frames at or after `seq`.
+fn truncate_blocking(
+    previous: Journal,
+    journal: &Path,
+    parent: &Path,
+    id: &StateId,
+    seq: Seq,
+) -> (Journal, Result<()>) {
+    // Closed first: the rename below leaves the old handle on an unlinked file.
+    drop(previous);
+    let cut = || -> Result<Journal> {
+        let bytes = match std::fs::read(journal) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Journal::Closed),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let scanned = scan(&bytes).map_err(|fault| Error::NotAJournal {
+            id: id.clone(),
+            fault,
+        })?;
+
+        let nothing_to_drop = scanned.frames.iter().all(|(found, _, _)| *found >= seq);
+        if !(nothing_to_drop && scanned.intact == bytes.len()) {
+            let mut kept = Vec::from(journal_header());
+            for (found, start, end) in &scanned.frames {
+                if *found >= seq {
+                    kept.extend_from_slice(&bytes[*start..*end]);
+                }
+            }
+            replace_atomically(journal, parent, &kept)?;
+        }
+        let (file, committed) = open_appender(journal, parent)?;
+        Ok(Journal::Open { file, committed })
+    };
+    match cut() {
+        Ok(state) => (state, Ok(())),
+        // The journal on the disk is whole either way (the rename is atomic), so
+        // the next append may reopen it rather than refuse.
+        Err(err @ Error::NotAJournal { .. }) => (Journal::Broken, Err(err)),
+        Err(err) => (Journal::Closed, Err(err)),
+    }
+}
+
+/// Replace `target` with `bytes`, so that a crash leaves the old file or the
+/// new one: write a temporary file beside it, put that on the disk, rename it
+/// over the target, and put the rename on the disk.
+///
+/// Blocking. The one copy of the four steps the module header lists, used by the
+/// snapshot, by the entry log's compaction and by the journal's header and cut.
+fn replace_atomically(target: &Path, parent: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // The temporary name carries the process id, so two writers that somehow got
+    // past the claim still cannot corrupt each other's temporary file. They would
+    // still race on the rename, which is why the claim exists.
+    let mut temp = target.to_path_buf().into_os_string();
+    temp.push(format!(".tmp.{}", std::process::id()));
+    let temp = PathBuf::from(temp);
+
+    // 1 and 2: write it, then put it on the disk.
+    let mut file = std::fs::File::create(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    // 3: the atomic step. A reader sees the old bytes or the new ones.
+    if let Err(err) = std::fs::rename(&temp, target) {
+        // Leave nothing behind on a failed replace. The previous file is
+        // untouched, which is the promise `store` makes about its own failure.
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+
+    // 4: the step people skip. Without it the rename can be lost to a power cut
+    // and the previous file comes back — which is not corruption, but it is
+    // weaker than what this module claims.
+    sync_dir(parent)
 }
 
 // ───────────────────────────────────────────── entries, as one append-only log
@@ -568,9 +996,6 @@ impl Held for FileLog {
             rewritten.extend_from_slice(&encode(OP_PUT, key, value));
         }
 
-        let mut temp = self.log.clone().into_os_string();
-        temp.push(format!(".tmp.{}", std::process::id()));
-        let temp = PathBuf::from(temp);
         let log = self.log.clone();
         let parent = self.parent.clone();
         // Dropped inside the blocking task, so the old handle is closed before
@@ -578,21 +1003,8 @@ impl Held for FileLog {
         let previous = self.handle.take();
 
         let handle = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-            use std::io::Write as _;
-
             drop(previous);
-            let mut file = std::fs::File::create(&temp)?;
-            file.write_all(&rewritten)?;
-            file.sync_all()?;
-            drop(file);
-
-            if let Err(err) = std::fs::rename(&temp, &log) {
-                // Leave nothing behind on a failed replace.
-                let _ = std::fs::remove_file(&temp);
-                return Err(err);
-            }
-            sync_dir(&parent)?;
-
+            replace_atomically(&log, &parent, &rewritten)?;
             std::fs::OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -1063,6 +1475,390 @@ mod tests {
         // And the store still works, which a taken-and-not-returned handle
         // would have broken.
         log.put(&record("order-3"), b"ok").await.expect("puts");
+    }
+
+    // ───────────────────────────────────────────────────────── the journal
+
+    fn journal_of(scratch: &Scratch) -> PathBuf {
+        scratch.0.join("obra").join("4471.journal")
+    }
+
+    /// Append `records` as turns 1, 2, 3, and so on.
+    async fn append_all(claim: &mut FileClaim, records: &[&[u8]]) {
+        for (n, record) in records.iter().enumerate() {
+            claim
+                .append(Seq::new(n as u64 + 1), record)
+                .await
+                .expect("appends");
+        }
+    }
+
+    fn texts(tail: &Tail) -> Vec<(u64, &[u8])> {
+        tail.records
+            .iter()
+            .map(|(seq, bytes)| (seq.get(), bytes.as_slice()))
+            .collect()
+    }
+
+    /// The Castagnoli check value, from the algorithm's own definition.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `crc32c`'s polynomial
+    /// `0x82F6_3B78` with the CRC-32 (IEEE) one, `0xEDB8_8320`. Watched: left
+    /// 3421780262 (`0xCBF43926`, the CRC-32 check value) against right 3808858755
+    /// (`0xE3069283`), the very pair that tells the two checksums apart.
+    #[test]
+    fn the_checksum_is_crc32c() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        // And the property the zero-tail rule leans on: twelve zero bytes (a
+        // frame header and no record) do not checksum to the zero a zero-filled
+        // tail carries.
+        assert_ne!(crc32c(&[0; 12]), 0);
+    }
+
+    /// A state that only ever stores whole snapshots never gets a journal file,
+    /// and a claim that never appended recovers an empty tail.
+    #[tokio::test]
+    async fn a_journal_is_created_by_the_first_append_and_not_before() {
+        let (scratch, files) = files("journal-lazy").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+
+        claim.store(b"a snapshot").await.expect("stores");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert!(tail.records.is_empty() && tail.earlier == 0 && tail.torn.is_none());
+        assert!(
+            !journal_of(&scratch).exists(),
+            "storing and recovering must not create a journal"
+        );
+
+        claim.append(Seq::new(1), b"first").await.expect("appends");
+        assert_eq!(
+            std::fs::read(journal_of(&scratch)).expect("reads")[..JOURNAL_HEADER_LEN],
+            journal_header()
+        );
+    }
+
+    /// What was appended is what a later claim reads, and the position splits the
+    /// log into what is wanted and what is already folded into a snapshot.
+    #[tokio::test]
+    async fn an_appended_record_comes_back_to_the_next_claim() {
+        let (_scratch, files) = files("journal-roundtrip").await;
+        {
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            append_all(&mut claim, &[b"one", b"", b"three"]).await;
+        }
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(
+            texts(&tail),
+            vec![(1, &b"one"[..]), (2, &b""[..]), (3, &b"three"[..])]
+        );
+        assert_eq!((tail.earlier, tail.torn), (0, None));
+
+        let tail = claim.recover(Seq::new(3)).await.expect("recovers");
+        assert_eq!(texts(&tail), vec![(3, &b"three"[..])]);
+        assert_eq!(tail.earlier, 2, "two records lie before the position asked");
+    }
+
+    /// The recovery path, end to end: five bytes cut from the last append leave
+    /// a torn frame, which is removed, reported in bytes, and does not stop the
+    /// next append from being read back.
+    ///
+    /// Made red by `scripts/break-once.sh`, deleting `recover_blocking`'s
+    /// `file.set_len(scanned.intact as u64)?;` — the cut never made. Watched: the
+    /// length assertion fails, left 62 against right 46, because the file kept its
+    /// torn bytes.
+    #[tokio::test]
+    async fn a_torn_tail_is_cut_and_its_size_reported() {
+        let (scratch, files) = files("journal-torn").await;
+        {
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            append_all(&mut claim, &[b"one", b"two", b"three"]).await;
+        }
+        let path = journal_of(&scratch);
+        let whole = std::fs::metadata(&path).expect("reads").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("opens")
+            .set_len(whole - 5)
+            .expect("truncates");
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(texts(&tail), vec![(1, &b"one"[..]), (2, &b"two"[..])]);
+        let torn = tail.torn.expect("a torn tail is reported");
+        assert_eq!(
+            torn,
+            (FRAME_HEADER_LEN + b"three".len() - 5) as u64,
+            "the report is the bytes of the frame that were there"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("reads").len(),
+            whole - 5 - torn,
+            "the file is shorter by exactly the bytes reported"
+        );
+
+        claim.append(Seq::new(3), b"three").await.expect("appends");
+        drop(claim);
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(tail.records.len(), 3);
+        assert_eq!(tail.torn, None);
+    }
+
+    /// An append that extended the file ahead of its bytes leaves zeros, which
+    /// are a torn tail and not a corrupt log.
+    ///
+    /// Made red by `scripts/break-once.sh`, deleting `scan`'s check that the bytes
+    /// after a failed checksum are all zero (so every failed checksum is
+    /// `Corrupt`). Watched: the recovery is `NotAJournal`.
+    #[tokio::test]
+    async fn a_zero_filled_tail_is_cut() {
+        let (scratch, files) = files("journal-zero").await;
+        {
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            append_all(&mut claim, &[b"one", b"two"]).await;
+        }
+        let path = journal_of(&scratch);
+        let whole = std::fs::metadata(&path).expect("reads").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("opens")
+            .set_len(whole + 64)
+            .expect("extends with zeros");
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(tail.records.len(), 2);
+        assert_eq!(tail.torn, Some(64));
+        assert_eq!(std::fs::metadata(&path).expect("reads").len(), whole);
+    }
+
+    /// A damaged record with intact data after it is acknowledged data that
+    /// went bad, and it is refused with the last record that was good.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing the `Corrupt` return in
+    /// `scan` with a `break` (every failed checksum treated as torn). Watched:
+    /// the recovery succeeds where it must refuse.
+    #[tokio::test]
+    async fn a_damaged_record_before_the_end_is_refused() {
+        let (scratch, files) = files("journal-corrupt").await;
+        {
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            append_all(&mut claim, &[b"one", b"two", b"three", b"four"]).await;
+        }
+        let path = journal_of(&scratch);
+        let mut bytes = std::fs::read(&path).expect("reads");
+        // One byte inside the second record's payload.
+        let second = JOURNAL_HEADER_LEN + FRAME_HEADER_LEN + b"one".len() + FRAME_HEADER_LEN;
+        bytes[second] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("writes");
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let error = claim.recover(Seq::new(1)).await.expect_err("refused");
+        assert!(
+            matches!(
+                error,
+                Error::NotAJournal {
+                    fault: JournalFault::Corrupt { after },
+                    ..
+                } if after == Seq::new(1)
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("reads"),
+            bytes,
+            "a refusal does not rewrite the journal"
+        );
+        // And a claim that refused its recovery does not append after the damage.
+        claim
+            .append(Seq::new(5), b"five")
+            .await
+            .expect_err("a refused recovery leaves the journal unwritable");
+    }
+
+    /// The same damage at the very end is the torn tail of an append that never
+    /// resolved: nothing follows it to be lost.
+    #[tokio::test]
+    async fn a_damaged_last_record_is_a_torn_tail() {
+        let (scratch, files) = files("journal-last").await;
+        {
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            append_all(&mut claim, &[b"one", b"two"]).await;
+        }
+        let path = journal_of(&scratch);
+        let mut bytes = std::fs::read(&path).expect("reads");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("writes");
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(texts(&tail), vec![(1, &b"one"[..])]);
+        assert_eq!(tail.torn, Some((FRAME_HEADER_LEN + b"two".len()) as u64));
+    }
+
+    /// The cut keeps what the snapshot does not contain, replaces the file
+    /// atomically, and leaves a handle that still appends.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `truncate_blocking`'s
+    /// `if *found >= seq {` with `if *found > seq {` (an off-by-one that drops the
+    /// first record the snapshot does not contain). Watched: the record at `seq`
+    /// is missing from what the next claim reads.
+    #[tokio::test]
+    async fn truncating_before_a_position_keeps_the_rest() {
+        let (scratch, files) = files("journal-cut").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        append_all(&mut claim, &[b"one", b"two", b"three", b"four"]).await;
+
+        claim.truncate_before(Seq::new(3)).await.expect("cuts");
+        claim.append(Seq::new(5), b"five").await.expect("appends");
+        drop(claim);
+
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(
+            texts(&tail),
+            vec![(3, &b"three"[..]), (4, &b"four"[..]), (5, &b"five"[..])]
+        );
+        let left: Vec<String> = std::fs::read_dir(scratch.0.join("obra"))
+            .expect("reads")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
+            .collect();
+        assert!(
+            !left.iter().any(|name| name.contains(".tmp.")),
+            "a temporary file survived the cut: {left:?}"
+        );
+
+        // Cutting a journal that is missing, or one already shorter, is not an
+        // error.
+        claim
+            .truncate_before(Seq::new(1))
+            .await
+            .expect("nothing to cut");
+        claim
+            .truncate_before(Seq::new(99))
+            .await
+            .expect("cuts it all");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert!(tail.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cutting_a_state_that_never_appended_is_not_an_error() {
+        let (scratch, files) = files("journal-cut-none").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        claim.truncate_before(Seq::new(7)).await.expect("nothing");
+        assert!(!journal_of(&scratch).exists());
+    }
+
+    /// Bytes that are not this build's journal are refused, by the check that
+    /// names why.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `scan`'s
+    /// `if header[..JOURNAL_MAGIC.len()] != JOURNAL_MAGIC {` with `if false {`.
+    /// Watched: the garbage reads as layout `8302` (the two bytes after its first six)
+    /// and is refused as `LayoutFromTheFuture`, not as a wrong magic.
+    #[tokio::test]
+    async fn bytes_that_are_not_a_journal_are_refused() {
+        let (scratch, files) = files("journal-garbage").await;
+        let path = journal_of(&scratch);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("creates");
+
+        let mut older = journal_header();
+        older[JOURNAL_MAGIC.len()] = 0;
+        let mut newer = journal_header();
+        newer[JOURNAL_MAGIC.len()] = 9;
+        for (bytes, expected) in [
+            (
+                b"written by something else entirely".to_vec(),
+                JournalFault::WrongMagic,
+            ),
+            (b"short".to_vec(), JournalFault::WrongMagic),
+            (
+                newer.to_vec(),
+                JournalFault::LayoutFromTheFuture { stored: 9, ours: 1 },
+            ),
+            (
+                older.to_vec(),
+                JournalFault::LayoutTooOld { stored: 0, ours: 1 },
+            ),
+        ] {
+            std::fs::write(&path, &bytes).expect("writes");
+            let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+            let error = claim.recover(Seq::new(1)).await.expect_err("refused");
+            assert!(
+                matches!(&error, Error::NotAJournal { fault, .. } if *fault == expected),
+                "{bytes:?}: got {error:?}"
+            );
+            let error = claim
+                .truncate_before(Seq::new(1))
+                .await
+                .expect_err("refused");
+            assert!(matches!(error, Error::NotAJournal { .. }), "got {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_over_the_limit_is_refused_and_the_journal_survives() {
+        let (_scratch, files) = files("journal-limit").await;
+        let files = files.limit(8);
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        claim.append(Seq::new(1), b"small").await.expect("appends");
+
+        let error = claim
+            .append(Seq::new(2), b"far too large for the limit")
+            .await
+            .expect_err("over the limit");
+        assert!(matches!(error, Error::TooLarge { .. }), "got {error:?}");
+
+        claim
+            .append(Seq::new(2), b"ok")
+            .await
+            .expect("still writes");
+        let tail = claim.recover(Seq::new(1)).await.expect("recovers");
+        assert_eq!(texts(&tail), vec![(1, &b"small"[..]), (2, &b"ok"[..])]);
+    }
+
+    /// A failed append that cannot be cut back poisons the handle: no later
+    /// record may follow one that might be on the disk. A read-only handle makes
+    /// the write and the cut both fail, which is the one failure a test can make
+    /// on demand.
+    #[test]
+    fn an_append_that_cannot_be_rolled_back_breaks_the_journal() {
+        let scratch = Scratch::new("journal-broken");
+        std::fs::create_dir_all(&scratch.0).expect("creates");
+        let path = scratch.0.join("x.journal");
+        std::fs::write(&path, journal_header()).expect("writes");
+        let read_only = std::fs::File::open(&path).expect("opens");
+
+        let (state, wrote) = append_blocking(
+            Journal::Open {
+                file: read_only,
+                committed: JOURNAL_HEADER_LEN as u64,
+            },
+            &path,
+            &scratch.0,
+            &journal_frame(Seq::new(1), 1, b"x"),
+        );
+        assert!(wrote.is_err());
+        assert!(matches!(state, Journal::Broken), "got {state:?}");
+
+        let (state, wrote) = append_blocking(
+            state,
+            &path,
+            &scratch.0,
+            &journal_frame(Seq::new(2), 1, b"y"),
+        );
+        assert!(wrote.is_err() && matches!(state, Journal::Broken));
+        assert_eq!(
+            std::fs::read(&path).expect("reads"),
+            journal_header(),
+            "nothing was appended"
+        );
     }
 
     #[test]

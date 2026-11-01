@@ -59,7 +59,7 @@ use keylink::{
     Allowlist, Applied, CallId, Caller, Context, IdempotencyKey, KeyState, Node, Persist,
     SecretKey, APPLIED_BOUND, MAX_KEY_LEN,
 };
-use keylink_persist::{Claim, Durable, RestoreError, Snapshots, StateId};
+use keylink_persist::{Claim, Durable, RestoreError, Seq, Snapshots, StateId, Tail};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +160,9 @@ impl Durable for Vault {
 
 // ─────────────────────────────────────────────── the port, written out in full
 
+/// The log half of a state: the records after the snapshot, behind a lock.
+type Log = Arc<Mutex<Vec<(Seq, Vec<u8>)>>>;
+
 /// A store that is one `Vec<u8>` behind a lock.
 ///
 /// Exclusivity is what the port is for, so this one enforces it rather than
@@ -169,6 +172,7 @@ impl Durable for Vault {
 #[derive(Default, Clone)]
 struct Bucket {
     bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    log: Log,
     held: Arc<AtomicBool>,
 }
 
@@ -183,6 +187,7 @@ impl Snapshots for Bucket {
         }
         Ok(BucketClaim {
             bytes: Arc::clone(&self.bytes),
+            log: Arc::clone(&self.log),
             held: Arc::clone(&self.held),
         })
     }
@@ -191,6 +196,7 @@ impl Snapshots for Bucket {
 /// Exclusive access, released by [`Drop`] and by nothing else.
 struct BucketClaim {
     bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    log: Log,
     held: Arc<AtomicBool>,
 }
 
@@ -205,6 +211,31 @@ impl Claim for BucketClaim {
     async fn store(&mut self, bytes: &[u8]) -> keylink_persist::Result<()> {
         if let Ok(mut held) = self.bytes.lock() {
             *held = Some(bytes.to_vec());
+        }
+        Ok(())
+    }
+
+    /// The log half of the port. This example never appends, but the port asks
+    /// for it, and a `Vec` behind a lock is a faithful log.
+    async fn append(&mut self, seq: Seq, record: &[u8]) -> keylink_persist::Result<()> {
+        if let Ok(mut log) = self.log.lock() {
+            log.push((seq, record.to_vec()));
+        }
+        Ok(())
+    }
+
+    async fn recover(&mut self, from: Seq) -> keylink_persist::Result<Tail> {
+        let log = self.log.lock().map(|log| log.clone()).unwrap_or_default();
+        Ok(Tail {
+            earlier: log.iter().filter(|(seq, _)| *seq < from).count() as u64,
+            records: log.into_iter().filter(|(seq, _)| *seq >= from).collect(),
+            torn: None,
+        })
+    }
+
+    async fn truncate_before(&mut self, seq: Seq) -> keylink_persist::Result<()> {
+        if let Ok(mut log) = self.log.lock() {
+            log.retain(|(found, _)| *found >= seq);
         }
         Ok(())
     }

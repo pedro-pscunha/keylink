@@ -147,6 +147,9 @@ fn snapshot_path(scratch: &Scratch) -> std::path::PathBuf {
     scratch.0.join("ledgers").join("sp-01.snapshot")
 }
 
+/// The log half of the state, as a `Vec` behind a lock.
+type Log = std::sync::Arc<std::sync::Mutex<Vec<(keylink_persist::Seq, Vec<u8>)>>>;
+
 /// A **second adapter for the port**, whose `store` can be made to fail exactly
 /// once.
 ///
@@ -171,6 +174,9 @@ struct Flaky {
     failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// What is "on the disk": framed bytes, exactly what `Files` would hold.
     stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// The log after the snapshot. Nothing in this file appends to it; the port
+    /// asks for it, and an empty `Vec` is a faithful one.
+    log: Log,
 }
 
 impl Flaky {
@@ -178,6 +184,7 @@ impl Flaky {
         Self {
             failing: std::sync::Arc::default(),
             stored: std::sync::Arc::default(),
+            log: std::sync::Arc::default(),
         }
     }
 
@@ -202,6 +209,7 @@ impl Snapshots for Flaky {
         Ok(FlakyClaim {
             failing: std::sync::Arc::clone(&self.failing),
             stored: std::sync::Arc::clone(&self.stored),
+            log: std::sync::Arc::clone(&self.log),
         })
     }
 }
@@ -212,6 +220,7 @@ impl Snapshots for Flaky {
 struct FlakyClaim {
     failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    log: Log,
 }
 
 impl Claim for FlakyClaim {
@@ -229,6 +238,42 @@ impl Claim for FlakyClaim {
             )));
         }
         *self.stored.lock().expect("not poisoned") = Some(bytes.to_vec());
+        Ok(())
+    }
+
+    async fn append(
+        &mut self,
+        seq: keylink_persist::Seq,
+        record: &[u8],
+    ) -> keylink_persist::Result<()> {
+        self.log
+            .lock()
+            .expect("not poisoned")
+            .push((seq, record.to_vec()));
+        Ok(())
+    }
+
+    async fn recover(
+        &mut self,
+        from: keylink_persist::Seq,
+    ) -> keylink_persist::Result<keylink_persist::Tail> {
+        let log = self.log.lock().expect("not poisoned");
+        Ok(keylink_persist::Tail {
+            earlier: log.iter().filter(|(seq, _)| *seq < from).count() as u64,
+            records: log
+                .iter()
+                .filter(|(seq, _)| *seq >= from)
+                .cloned()
+                .collect(),
+            torn: None,
+        })
+    }
+
+    async fn truncate_before(&mut self, seq: keylink_persist::Seq) -> keylink_persist::Result<()> {
+        self.log
+            .lock()
+            .expect("not poisoned")
+            .retain(|(found, _)| *found >= seq);
         Ok(())
     }
 }
