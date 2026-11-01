@@ -2131,9 +2131,25 @@ mod stored {
             .await
             .expect("opens")
             .limit(limit);
-        let records = keylink::DurableRecords::open(&files, &ledger_id())
-            .await
-            .expect("nobody else holds this ledger");
+        // A restart test drops the previous fixture and opens the same ledger at
+        // once. The old ledger's claim is released when the last task holding it
+        // is dropped, and the server's connection tasks are dropped by the
+        // runtime after `drop(fixture)` returns: under a load average of about
+        // 110 the reopen ran first and read `Busy`. So `Busy` is waited out, on
+        // a bound that names what it waited for; any other refusal fails at once.
+        let mut records = None;
+        for _ in 0..3000 {
+            match keylink::DurableRecords::open(&files, &ledger_id()).await {
+                Err(keylink::RecordError::Store(keylink_persist::Error::Busy { .. })) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                opened => {
+                    records = Some(opened.expect("nobody else holds this ledger"));
+                    break;
+                }
+            }
+        }
+        let records = records.expect("the previous fixture released the ledger within 30 s");
 
         let reserves = Counter::default();
         let till = Till {

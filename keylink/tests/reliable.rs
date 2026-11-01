@@ -78,6 +78,9 @@ impl orders::Handler for Desk {
 struct Gate {
     allow: Allowlist,
     handshakes: AtomicUsize,
+    /// Woken on every count, so a test waits for the serving side to have seen
+    /// a handshake instead of assuming it already has.
+    counted: tokio::sync::Notify,
     live: Mutex<Option<Revocation>>,
 }
 
@@ -86,12 +89,31 @@ impl Gate {
         Self {
             allow,
             handshakes: AtomicUsize::new(0),
+            counted: tokio::sync::Notify::new(),
             live: Mutex::new(None),
         }
     }
 
     fn handshakes(&self) -> usize {
         self.handshakes.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the serving side has counted `n` handshakes.
+    ///
+    /// The dialler's `connect` resolves when ITS side of the handshake is done,
+    /// which can be before the server's accept loop has called `admits`. Reading
+    /// the count straight after `connect` was a race: under a load average of
+    /// about 110 it read 0.
+    async fn reached(&self, n: usize) {
+        loop {
+            let counted = self.counted.notified();
+            tokio::pin!(counted);
+            counted.as_mut().enable();
+            if self.handshakes() >= n {
+                return;
+            }
+            counted.await;
+        }
     }
 
     /// Close the most recently admitted connection.
@@ -112,6 +134,7 @@ impl Gate {
 impl Admission for Gate {
     fn admits(&self, peer: &ProvenPeer) -> Admittance {
         self.handshakes.fetch_add(1, Ordering::SeqCst);
+        self.counted.notify_waiters();
         if self.allow.admit(*peer).is_some() {
             Admittance::Admitted
         } else {
@@ -168,6 +191,7 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
     let first = peer.connect().await.expect("the first dial");
     let departed = first.watch();
     drop(first);
+    gate.reached(1).await;
     assert_eq!(gate.handshakes(), 1, "one dial, one handshake");
 
     // ── 2. The call reaches the handler, and then its caller goes away. This is
