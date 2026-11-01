@@ -172,8 +172,8 @@ after exactly 100 groups resumed reading 2,556,004 of its 4,194,404 bytes and
 keeping 1,638,400. A request carries at most 64 KiB of ranges; a blob, a closure's
 root, or a window of members with more fragments than that is cut across several
 requests and never refetched whole. `kept` counts each distinct blob once for the
-whole call and never counts bytes the call itself read (32 bytes of accounting for
-each distinct member, so linear in the closure, where planning memory is not).
+whole call and never counts bytes the call itself read (a 32-byte key and table overhead
+for each distinct member, O(distinct members), where planning memory is not).
 `Blobs::missing` (and
 `handle.missing(&store)`) answer what is lacking, from the fetcher's own store.
 

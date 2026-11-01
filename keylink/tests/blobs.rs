@@ -3803,8 +3803,8 @@ mod on_disk {
     /// `a_window_verifies_against_its_address_and_nothing_else_does`.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK67`) by replacing
-    /// `if damaged(&error) {`
-    /// with `if false {` in `keylink/src/blobs.rs`: the store's refusal then
+    /// `return Err(if damaged(&error) && (!short || self.alive().await) {`
+    /// with `return Err(if false {` in `keylink/src/blobs.rs`: the store's refusal then
     /// arrives as `Error::Io` and the typed-error assertion fails. Watched: `expected
     /// BlobCorrupt at the damaged window, got Io(Custom { kind: Other, error: "inner
     /// error: Error::Io" })`.

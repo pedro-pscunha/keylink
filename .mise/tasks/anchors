@@ -2245,7 +2245,7 @@ ANCHORS = [
     ("HK66", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "    if u64::from_le_bytes(*size) != total {"),
     ("HK67", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
-     "                if damaged(&error) {"),
+     "                return Err(if damaged(&error) && (!short || self.alive().await) {"),
     ("HK69", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "            Self::Part(held) => ChunkRanges::all().difference(&held.ranges),"),
     ("HK70", "keylink/src/blobs.rs", "keylink/src/blobs.rs",

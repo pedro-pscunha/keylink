@@ -1249,9 +1249,13 @@ impl Blobs {
 
     /// Read a blob this node holds into memory, verified.
     ///
-    /// For small blobs: `limit` is the most bytes the caller will have held, and
+    /// For small blobs: `limit` bounds the length of the **returned payload**, and
     /// a longer blob is refused with [`Error::BlobTooLarge`] before it is read.
-    /// Anything that might be large is read with [`reader`](Self::reader).
+    /// It does not bound peak memory: reading holds the result and, besides it,
+    /// the reader's verification working set, a window's encoded export and its
+    /// decoded leaves together (a little over twice the 256 KiB payload window,
+    /// see `Blobs::reader`) whatever the blob's size. Anything that might be
+    /// large is read with [`reader`](Self::reader).
     ///
     /// # Errors
     ///
@@ -1590,10 +1594,13 @@ impl Limits {
 /// with the other changes in between, so the 2 KiB figure is evidence for the
 /// direction and not an isolated measurement. It is also far
 /// enough under the limit that a request is never close to being refused, and a
-/// request cut off by a dropped connection loses little. What the provider bounds
-/// is the request (this limit) and the offset it starts a run at (the root's
-/// member count); the response is whatever the ranges ask for, which no request
-/// size bounds.
+/// request cut off by a dropped connection loses little.
+///
+/// This is what the planner emits, and nothing the provider enforces: the
+/// provider accepts a request up to iroh-blobs' 1 MiB framing limit, and the
+/// closure check on its side bounds where a run starts by the root's member
+/// count, not how long the request is. Request size does not bound response
+/// size, which is whatever the ranges ask for.
 ///
 /// A blob with more fragments than fit goes out as several requests, and a
 /// request always holds at least one piece whatever this says.
@@ -2464,8 +2471,9 @@ impl BlobHandle {
     /// several, never refetched whole), so a window keeps both its plan and its
     /// requests small however long the closure is. A blob listed more than once
     /// is asked about once for the whole call, so `kept` counts it once and never
-    /// counts bytes this call read. That accounting is 32 bytes for each distinct
-    /// member, so it is linear in the closure while planning memory is not.
+    /// counts bytes this call read. That accounting is a 32-byte key and hash-table
+    /// overhead for each distinct member, O(distinct members), so it is linear in
+    /// the closure while planning memory is not.
     /// Fetching the sequence in one request would send the whole closure when
     /// the root is absent, because the fetcher cannot know which members it holds
     /// until it holds the list. The holder's grant is its claim that it has the
@@ -2512,9 +2520,9 @@ impl BlobHandle {
         // `touched` is every distinct member this call has counted or asked for,
         // across windows: a blob the sequence lists again later is neither
         // counted as kept (it may be bytes this very call just read) nor asked
-        // about again. That is 32 bytes for each distinct member touched, so
-        // accounting memory is linear in the closure, which planning memory is
-        // not.
+        // about again. That is a 32-byte key and hash-table overhead for each
+        // distinct member touched, so accounting memory is O(distinct members),
+        // linear in the closure, which planning memory is not.
         let mut touched = std::collections::HashSet::new();
         let mut start = 0;
         while start < members {
@@ -2862,6 +2870,36 @@ fn damaged(error: &iroh_blobs::api::RequestError) -> bool {
     }
 }
 
+/// Whether a failed export ended early, as opposed to failing a hash: a plain
+/// `UnexpectedEof`, which is what a truncated file looks like and also what an
+/// export interrupted by its store shutting down looks like. [`Local::fill`]
+/// asks the store whether it is still there before it believes the first.
+///
+/// **If the liveness question cannot be answered** because the store was
+/// healthy when asked and went away just after, the result is wrong in the safe
+/// direction for a damaged blob (reported as corruption) and in the unsafe one
+/// for an interrupted export; a store that answers `status` a moment after its
+/// export failed with `UnexpectedEof` is, as far as keylink can tell, one whose
+/// data is short.
+fn ended_early(error: &iroh_blobs::api::RequestError) -> bool {
+    use bao_tree::io::EncodeError;
+    let iroh_blobs::api::RequestError::Inner {
+        source: iroh_blobs::api::Error::Io(io),
+        ..
+    } = error
+    else {
+        return false;
+    };
+    match io
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<EncodeError>())
+    {
+        Some(EncodeError::Io(inner)) => inner.kind() == std::io::ErrorKind::UnexpectedEof,
+        Some(_) => false,
+        None => io.kind() == std::io::ErrorKind::UnexpectedEof,
+    }
+}
+
 /// Verify one window of a blob that a store exported in the encoded form a
 /// holder would send, against the address `id` of a blob of `total` bytes, and
 /// return its leaves with the offset each starts at. `None` when anything fails:
@@ -2933,6 +2971,13 @@ struct Local {
 }
 
 impl Local {
+    /// Whether the store still answers. A store that has shut down fails every
+    /// question, and an export it was in the middle of ends early because of it,
+    /// which says nothing about the blob.
+    async fn alive(&self) -> bool {
+        self.store.blobs().status(self.id.hash()).await.is_ok()
+    }
+
     /// Read and verify the next window.
     async fn fill(&mut self) -> Result<()> {
         let start = self.next;
@@ -2947,14 +2992,21 @@ impl Local {
             .blobs()
             .export_bao(self.id.hash(), ranges.clone())
             .bao_to_vec()
-            .await
-            .map_err(|error| {
-                if damaged(&error) {
+            .await;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let short = ended_early(&error);
+                // Data that ends early is damage only if the store is still
+                // there to say so: an export cut off by the store shutting down
+                // ends early too.
+                return Err(if damaged(&error) && (!short || self.alive().await) {
                     corrupt()
                 } else {
                     store_error(error)
-                }
-            })?;
+                });
+            }
+        };
         let leaves = verify_window(self.id, self.total, &ranges, &encoded).ok_or_else(corrupt)?;
         self.pending.extend(leaves);
         self.next = end;
@@ -4058,7 +4110,12 @@ mod tests {
     /// A closure root that is itself fragmented is fetched in root-only pieces:
     /// `[A; 50000]` is 1,600,000 bytes in 98 groups, the store holds the even
     /// ones, and the odd ones (the last group among them) come in several
-    /// requests.
+    /// requests. The limits are small enough (48 bytes of ranges for a blob, 256
+    /// for a request) that the 49 missing ranges, about 100 bytes, cannot be one
+    /// piece: the plan the fetch makes from the root's bitfield is computed here
+    /// from the same inputs and must be several requests, each root-only and
+    /// within the limit, whose selections are exactly the missing groups and do
+    /// not overlap.
     #[tokio::test]
     async fn a_fragmented_root_is_fetched_in_root_only_pieces() {
         let a = bytes_of(4, 1000);
@@ -4076,9 +4133,33 @@ mod tests {
         let local = Blobs::with_backing(Backing::Memory(local_store));
         let rig = rig(&holder, Content::Closure(seq.id())).await;
 
+        let limits = Limits {
+            request: 256,
+            spec: 48,
+        };
+        let lacking = local.holding(seq.id()).await.expect("asks").lacking();
+        assert_eq!(lacking, ChunkRanges::all() - alternate(groups, 0));
+        let planned = plan(seq.id(), &[(0, lacking.clone())], limits).expect("plans");
+        assert!(planned.len() > 1, "{} requests", planned.len());
+        let mut seen = ChunkRanges::empty();
+        for request in &planned {
+            assert!(request.ranges.is_blob(), "root only");
+            assert!(wire(request) <= limits.request, "{} bytes", wire(request));
+            let asked = request.ranges[0].clone();
+            assert!(
+                (seen.clone() & asked.clone()).is_empty(),
+                "requests do not overlap"
+            );
+            seen = seen.union(&asked);
+        }
+        assert_eq!(
+            seen, lacking,
+            "and together they are exactly what is missing"
+        );
+
         let fetched = rig
             .handle
-            .fetch_planned(&local, SMALL)
+            .fetch_planned(&local, limits)
             .await
             .expect("completes");
         assert_eq!(fetched.kept, held_bytes);
@@ -4245,6 +4326,62 @@ mod tests {
             verify_window(blob(9), total, &ranges, &encoded).is_none(),
             "another address"
         );
+    }
+
+    /// Which export failures are damage, and which of those are the ambiguous
+    /// "ended early" that needs the store asked whether it is still there.
+    #[test]
+    fn export_failures_are_sorted_into_damage_early_ends_and_the_rest() {
+        use bao_tree::io::EncodeError;
+        let api = |io: std::io::Error| {
+            iroh_blobs::api::RequestError::from(iroh_blobs::api::Error::Io(io))
+        };
+        let kind = |kind| api(std::io::Error::from(kind));
+        let wrapped = |error: EncodeError| api(std::io::Error::other(error));
+
+        let eof = kind(std::io::ErrorKind::UnexpectedEof);
+        assert!(damaged(&eof) && ended_early(&eof));
+        let eof = wrapped(EncodeError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+        assert!(damaged(&eof) && ended_early(&eof));
+
+        let mismatch = wrapped(EncodeError::SizeMismatch);
+        assert!(
+            damaged(&mismatch) && !ended_early(&mismatch),
+            "a mismatch is damage on its own"
+        );
+        let invalid = kind(std::io::ErrorKind::InvalidData);
+        assert!(damaged(&invalid) && !ended_early(&invalid));
+
+        for other in [
+            kind(std::io::ErrorKind::NotFound),
+            kind(std::io::ErrorKind::PermissionDenied),
+            wrapped(EncodeError::Io(std::io::ErrorKind::NotFound.into())),
+        ] {
+            assert!(!damaged(&other) && !ended_early(&other), "{other:?}");
+        }
+    }
+
+    /// A store that has shut down answers no question, which is what
+    /// `Local::alive` asks. Needs the file store to shut one down.
+    #[cfg(feature = "blobs-fs")]
+    #[tokio::test]
+    async fn a_store_that_has_shut_down_is_not_alive() {
+        let dir = std::env::temp_dir().join(format!("keylink-alive-{}", std::process::id()));
+        let fs = iroh_blobs::store::fs::FsStore::load(&dir)
+            .await
+            .expect("opens");
+        let tag = fs.add_bytes(vec![1u8; 100]).await.expect("stores");
+        let local = Local {
+            store: (*fs).clone(),
+            id: BlobId::from_hash(tag.hash),
+            total: 100,
+            next: 0,
+            pending: std::collections::VecDeque::new(),
+        };
+        assert!(local.alive().await);
+        fs.shutdown().await.expect("shuts down");
+        assert!(!local.alive().await);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Review finding 8. An accept that has checked the ledger but not yet
