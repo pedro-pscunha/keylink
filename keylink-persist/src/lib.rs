@@ -225,12 +225,14 @@ pub trait Claim: Send + 'static {
     /// and survives losing the process. A caller may treat a resolved append as a
     /// fact and an unresolved one as nothing at all.
     ///
-    /// **A clean `Err` leaves the log as it was before the call**, so the turn did
-    /// not happen and a retry is safe. The one exception is
-    /// [`Error::Indeterminate`], below: an append that failed and could not be cut
-    /// back. An adapter that cannot roll a failed append back must return that
-    /// and fail every later operation on the claim, so that a record a caller was
-    /// not told about is never followed by one that was.
+    /// **An `Err` leaves the log as it was before the call, except
+    /// [`Error::Indeterminate`].** After any other `Err` the record is not stored,
+    /// the turn did not happen, and a retry is safe. After `Indeterminate` the
+    /// append failed and could not be cut back, so **the record may be stored**,
+    /// and the claim is poisoned: an adapter that returns it must fail every later
+    /// operation on that claim, so that a record a caller was not told about is
+    /// never followed by one that was. The caller's answer is to reopen the state
+    /// and look, not to retry.
     ///
     /// The adapter stores `seq` and never checks it against the one before: the
     /// numbers are the caller's, and [`Versioned`](versioned::Versioned) is what
@@ -238,11 +240,13 @@ pub trait Claim: Send + 'static {
     ///
     /// # Errors
     ///
-    /// [`Error::TooLarge`] when the record, or the log it would make, is over the
-    /// adapter's cap, and [`Error::Io`] when the write fails. Neither disturbs
-    /// what is stored. [`Error::Indeterminate`] when the write failed **and could
-    /// not be undone**: the record may be stored, and the claim must refuse
-    /// everything after it.
+    /// - [`Error::TooLarge`] when the record, or the log it would make, is over the
+    ///   adapter's cap, and [`Error::Io`] when the write fails. **Neither disturbs
+    ///   what is stored**: these are the clean errors the first paragraph promises
+    ///   the log is unchanged after.
+    /// - [`Error::Indeterminate`] when the write failed **and could not be undone**.
+    ///   This is the one exception to that promise: the record may be stored, and
+    ///   the claim is poisoned.
     fn append(&mut self, seq: Seq, record: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Every record from `from` on, after cutting a torn tail.
