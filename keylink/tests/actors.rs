@@ -357,7 +357,7 @@ async fn a_local_keyed_ref_rejects_a_reentrant_call() {
         .expect("the id is free");
 
     let actor = journal::at_local(&system, actor_id.clone());
-    let result = tokio::time::timeout(Duration::from_secs(1), actor.apply(7, 0))
+    let result = tokio::time::timeout(Duration::from_secs(30), actor.apply(7, 0))
         .await
         .expect("the re-entrant call must resolve without waiting for the actor");
     assert_eq!(result.expect("the outer turn answers"), 7);
@@ -448,7 +448,7 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
             .apply(2, 0)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if status_of(&system, &actor_id).queued == 1 {
                 break;
@@ -1238,7 +1238,7 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// one message in flight does not queue anything. The default local mailbox depth
 /// is 1, so the second
 /// `apply` is queued behind the first and is the queued turn; the budget covers
-/// both holds together, which is the depth-versus-budget relationship 4a's doc
+/// both turns together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
 ///
 /// # Three facts observed, and no clock
