@@ -239,6 +239,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let abandoned = ActorId::new("match/abandoned")?;
     let (ticks, tick_rx) = mpsc::channel::<u64>(4);
 
+    let _server = system.serve(&server_node, Allowlist::anyone())?;
+    let north =
+        match_room::RegistryClient::connect(&north_node, server_node.endpoint().addr()).await?;
+    let south =
+        match_room::RegistryClient::connect(&south_node, server_node.endpoint().addr()).await?;
+
+    //  Mounted only now, after both handshakes. The idle policy measures from
+    //  the mount, so mounting before two QUIC handshakes left the first call
+    //  racing the 200 ms sweep: on a loaded machine the handshakes alone could
+    //  outlast it, the sweeper stopped the match before anyone had addressed
+    //  it, and the first call failed with `NoSuchActor { id: "match/derby" }`.
     system.mount(
         derby.clone(),
         match_room::setup(Room::default())
@@ -254,12 +265,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .feeds(match_room::Feeds::new(clock(quiet_rx)))
             .mountable(),
     )?;
-
-    let _server = system.serve(&server_node, Allowlist::anyone())?;
-    let north =
-        match_room::RegistryClient::connect(&north_node, server_node.endpoint().addr()).await?;
-    let south =
-        match_room::RegistryClient::connect(&south_node, server_node.endpoint().addr()).await?;
     println!("two matches mounted, {} live", system.len());
 
     // ── 2. One round, two callers, one answer.
