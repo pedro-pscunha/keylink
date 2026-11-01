@@ -318,8 +318,8 @@ pub enum Missing {
 
 /// How far a grant reaches.
 ///
-/// Ordered, because a closure includes its root: `Closure > Blob`, and a repeat
-/// grant widens an entry and never narrows it.
+/// Ordered, because a closure includes its root: `Closure > Blob`, and a
+/// committed repeat grant widens an entry and never narrows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Scope {
     /// The root blob, and nothing its bytes name.
@@ -340,10 +340,13 @@ impl From<Content> for Scope {
 /// One `(peer, root)` grant.
 #[derive(Debug)]
 struct Entry {
-    scope: Scope,
-    /// Whether a reply that carried this grant has been written. A reserved
-    /// entry that is not live admits nothing.
-    live: bool,
+    /// What replies that were written have granted. `None` while every
+    /// reservation is still pending, and then the entry admits nothing.
+    ///
+    /// **Only a committing permit widens it.** A reservation's scope lives on
+    /// its permit and nowhere else: if the entry took the scope of whichever
+    /// reservation came first, a blob commit would make a pending closure live.
+    committed: Option<Scope>,
     /// Reservations that have not committed or been dropped yet.
     pending: u32,
     /// Which incarnation of this `(peer, root)` pair this is. A revoke removes
@@ -468,8 +471,7 @@ impl Grants {
             book.by_peer.entry(peer).or_default().insert(
                 root,
                 Entry {
-                    scope: content.into(),
-                    live: false,
+                    committed: None,
                     pending: 1,
                     generation,
                 },
@@ -492,8 +494,7 @@ impl Grants {
             .by_peer
             .get(&peer.id())?
             .get(root)
-            .filter(|entry| entry.live)
-            .map(|entry| entry.scope)
+            .and_then(|entry| entry.committed)
     }
 
     /// Whether `peer` holds, or is about to hold, any grant. A reserved entry
@@ -506,7 +507,7 @@ impl Grants {
 
     fn revoke(&self, peer: EndpointId, root: BlobId) -> bool {
         let mut book = self.lock();
-        Self::remove(&mut book, peer, &root).is_some_and(|entry| entry.live)
+        Self::remove(&mut book, peer, &root).is_some_and(|entry| entry.committed.is_some())
     }
 
     fn revoke_peer(&self, peer: EndpointId) -> usize {
@@ -515,7 +516,9 @@ impl Grants {
             return 0;
         };
         book.used -= PEER_COST + GRANT_COST * held.len();
-        held.values().filter(|entry| entry.live).count()
+        held.values()
+            .filter(|entry| entry.committed.is_some())
+            .count()
     }
 
     fn revoke_everywhere(&self, root: BlobId) -> usize {
@@ -529,7 +532,7 @@ impl Grants {
         peers
             .into_iter()
             .filter_map(|peer| Self::remove(&mut book, peer, &root))
-            .filter(|entry| entry.live)
+            .filter(|entry| entry.committed.is_some())
             .count()
     }
 
@@ -564,8 +567,7 @@ impl Permit {
             .filter(|entry| entry.generation == self.generation)
         {
             entry.pending -= 1;
-            entry.live = true;
-            entry.scope = entry.scope.max(self.scope);
+            entry.committed = entry.committed.max(Some(self.scope));
         }
     }
 }
@@ -585,7 +587,7 @@ impl Drop for Permit {
             return;
         };
         entry.pending -= 1;
-        if !entry.live && entry.pending == 0 {
+        if entry.committed.is_none() && entry.pending == 0 {
             Grants::remove(&mut book, self.peer, &self.root);
         }
     }
@@ -2206,9 +2208,42 @@ mod tests {
     /// A reply that was never written grants nothing and costs nothing.
     ///
     /// Watched red with `scripts/break-once.sh` (row `HK53`) by replacing
-    /// `if !entry.live && entry.pending == 0 {`
+    /// `if entry.committed.is_none() && entry.pending == 0 {`
     /// with `if false {`: the dropped reservation stays charged and the
     /// `assert_eq!(grants.lock().used, 0)` fails.
+    /// Review finding 1. A pending closure must not become live because some
+    /// other reservation for the same pair committed.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK54`) by replacing
+    /// `entry.committed = entry.committed.max(Some(self.scope));`
+    /// with `entry.committed = Some(Scope::Closure);`: the blob commit then
+    /// leaves a closure behind and the first assertion fails.
+    #[test]
+    fn a_blob_commit_does_not_activate_a_pending_closure() {
+        let grants = Grants::new();
+        let closure = grants.reserve(&admitted(1), seq(1).into()).expect("fits");
+        let blob_only = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        blob_only.commit();
+        assert_eq!(
+            scope(&grants, 1, blob(1)),
+            Some(Scope::Blob),
+            "only the blob grant committed"
+        );
+
+        // The closure's reply is never written, so its permit drops.
+        drop(closure);
+        assert_eq!(
+            scope(&grants, 1, blob(1)),
+            Some(Scope::Blob),
+            "and a dropped closure reservation leaves it a blob"
+        );
+
+        // The control: a closure that does commit widens it.
+        let widening = grants.reserve(&admitted(1), seq(1).into()).expect("fits");
+        widening.commit();
+        assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Closure));
+    }
+
     #[test]
     fn an_uncommitted_permit_releases_its_charge() {
         let grants = Grants::new();
