@@ -2893,3 +2893,94 @@ async fn a_grant_past_the_budget_answers_grants_exhausted_and_evicts_nothing() {
         .await
         .expect("the second still fetches");
 }
+
+// ═══════════════════════════════════════ a revoke reaches a call already running
+
+keylink::service! {
+    service Turnstile;
+
+    blob Held() -> u32;
+}
+
+/// A handler that stops before it returns, so a test can revoke while the call
+/// is dispatched and has made no reservation yet.
+#[derive(Clone)]
+struct Held {
+    blob: BlobId,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl turnstile::Handler for Held {
+    async fn held(&self, _cx: &Context) -> (u32, Content) {
+        self.entered.notify_one();
+        self.release.notified().await;
+        (1, self.blob.into())
+    }
+}
+
+/// Review finding 5. "Remove the peer from admission, then `revoke_peer`" must
+/// hold for a call that was already inside its handler: the handler has not
+/// reserved anything, so there is no entry for the revoke to remove.
+///
+/// The revoke lands while the handler is paused; the handler then returns.
+/// The caller is told its content was not granted, and holds nothing.
+#[tokio::test]
+async fn a_peer_revoke_lands_on_a_call_whose_handler_is_still_running() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let blobs = Blobs::memory();
+    let blob = blobs
+        .add_bytes(b"granted after the revoke, if the fence is missing".to_vec())
+        .await
+        .expect("stores");
+    let held = Held {
+        blob,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let _running = keylink::Server::builder(&server)
+        .service(
+            turnstile::service(held.clone(), Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
+        )
+        .spawn()
+        .expect("one service with a store");
+    let client = turnstile::Client::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("the caller dials");
+
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move { client.held().await }
+    });
+    // Bounded, because the failure mode of a handler that never starts is a
+    // hang; this is not an assertion about timing.
+    tokio::time::timeout(Duration::from_secs(30), held.entered.notified())
+        .await
+        .expect("the handler was entered");
+
+    assert_eq!(
+        blobs.revoke_peer(caller.id()),
+        0,
+        "the caller holds nothing yet"
+    );
+    held.release.notify_one();
+
+    let answer = call.await.expect("the call task ended");
+    assert!(
+        matches!(
+            answer,
+            Err(Error::Remote(keylink::RemoteError::GrantsWithdrawn))
+        ),
+        "expected the grant to be withdrawn, got {answer:?}"
+    );
+
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(&caller, server.endpoint().addr(), blob)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("the withdrawn grant admits nothing");
+    assert_refused(&error, "content a revoked peer's running call returned");
+}

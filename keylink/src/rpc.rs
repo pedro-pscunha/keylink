@@ -56,7 +56,7 @@ use crate::error::ConfigError;
 // `tests/api.rs` that writes it from a consumer's position. An in-crate
 // `crate::Keyable` would make the library itself the thing that fails when the
 // re-export goes, which would leave that test proving nothing.
-use crate::blobs::Permit;
+use crate::blobs::{Fence, Permit};
 use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
@@ -707,6 +707,9 @@ where
         Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
     };
 
+    // Fenced BEFORE the handler runs, so a revoke that lands while it runs
+    // reaches the grant it is about to make.
+    let fence = blobs.as_ref().map(|blobs| blobs.fence(&admitted));
     let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
 
     // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
@@ -728,7 +731,7 @@ where
     // settle, because a grant made live above and a record refused below would
     // leave the far side holding a live grant for an address this reply never
     // carried. An early return drops the permit, which releases the reservation.
-    let (outcome, permit) = grant_or_refuse(blobs.as_ref(), &admitted, outcome);
+    let (outcome, permit) = grant_or_refuse(blobs.as_ref().zip(fence.as_ref()), &admitted, outcome);
 
     let frame = wire::encode_header(
         body.declared_len(),
@@ -789,7 +792,7 @@ where
 /// A blob reply carries `Body::empty()`, so replacing its outcome needs no body
 /// handling.
 fn grant_or_refuse<Resp: Granting>(
-    blobs: Option<&Blobs>,
+    store: Option<(&Blobs, &Fence)>,
     admitted: &AdmittedPeer,
     outcome: Outcome<Resp>,
 ) -> (Outcome<Resp>, Option<Permit>) {
@@ -797,12 +800,12 @@ fn grant_or_refuse<Resp: Granting>(
         Outcome::Ok(response) => response.granted(),
         Outcome::Err(_) => None,
     };
-    let (Some(blobs), Some(content)) = (blobs, content) else {
+    let (Some((blobs, fence)), Some(content)) = (store, content) else {
         return (outcome, None);
     };
-    match blobs.reserve(admitted, content) {
+    match blobs.reserve(admitted, content, fence) {
         Ok(permit) => (outcome, Some(permit)),
-        Err(full) => (Outcome::Err(crate::blobs::exhausted(&full)), None),
+        Err(refused) => (Outcome::Err(crate::blobs::refusal(&refused)), None),
     }
 }
 

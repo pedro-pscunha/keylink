@@ -287,6 +287,15 @@ pub enum RemoteError {
         /// `u64` and not `usize` for [`AtCapacity`](Self::AtCapacity)'s reason.
         budget: u64,
     },
+
+    /// The handler ran, but the holder withdrew this peer's grants while it was
+    /// running, so the content it returned was not granted.
+    ///
+    /// [`Blobs::revoke_peer`](crate::Blobs::revoke_peer) fences calls that were
+    /// already dispatched, not only the grants already held. The peer was
+    /// admitted when the call started and is not any more.
+    #[error("the holder withdrew this peer's grants while the call ran")]
+    GrantsWithdrawn,
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.

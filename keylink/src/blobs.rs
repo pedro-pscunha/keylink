@@ -377,12 +377,54 @@ struct Book {
     used: usize,
     budget: usize,
     next_generation: u64,
+    /// Calls that were dispatched for a peer and have not finished, with the
+    /// peer's revocation epoch. An entry exists only while one is in flight, so
+    /// this is bounded by the calls the node is already running.
+    inflight: HashMap<EndpointId, Flight>,
 }
 
-/// A grant that would not fit the budget.
+#[derive(Debug, Default)]
+struct Flight {
+    calls: u32,
+    /// Moves on every [`Grants::revoke_peer`].
+    epoch: u64,
+}
+
+/// Why a grant was not made.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotGranted {
+    /// The grant would not fit the budget.
+    Exhausted { budget: usize },
+    /// The peer's grants were withdrawn after the call that produced this one
+    /// was dispatched.
+    Withdrawn,
+}
+
+/// What a dispatched call holds from before its handler runs until its reply is
+/// written, so that [`Blobs::revoke_peer`] can tell a call that started before
+/// it from one that started after.
+///
+/// The reservation is made only when the handler returns, which is too late to
+/// give a revoke anything to invalidate: a handler still running while the peer
+/// is revoked would reserve and commit afterwards, for a peer nobody admits any
+/// more. The fence is taken at dispatch and checked at reservation.
 #[derive(Debug)]
-pub(crate) struct Exhausted {
-    pub(crate) budget: usize,
+pub(crate) struct Fence {
+    grants: Arc<Grants>,
+    peer: EndpointId,
+    epoch: u64,
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let mut book = self.grants.lock();
+        if let Some(flight) = book.inflight.get_mut(&self.peer) {
+            flight.calls -= 1;
+            if flight.calls == 0 {
+                book.inflight.remove(&self.peer);
+            }
+        }
+    }
 }
 
 /// A reservation in the ledger, committed once the reply that carries the
@@ -413,6 +455,7 @@ impl Grants {
                 used: 0,
                 budget,
                 next_generation: 0,
+                inflight: HashMap::new(),
             }),
         })
     }
@@ -430,9 +473,26 @@ impl Grants {
         self.lock().budget = budget;
     }
 
+    /// Fence a call that is about to be dispatched for `peer`.
+    fn fence(self: &Arc<Self>, peer: &AdmittedPeer) -> Fence {
+        let peer = peer.id();
+        let mut book = self.lock();
+        let flight = book.inflight.entry(peer).or_default();
+        flight.calls += 1;
+        let epoch = flight.epoch;
+        Fence {
+            grants: Arc::clone(self),
+            peer,
+            epoch,
+        }
+    }
+
     /// Reserve a grant. Takes an [`AdmittedPeer`], not a [`ProvenPeer`]: a
     /// grant is an authorization record, so writing one must be downstream of
     /// an allowlist saying yes.
+    ///
+    /// Refused as [`NotGranted::Withdrawn`] when `peer` was revoked after
+    /// `fence` was taken.
     ///
     /// A repeat or widening grant for a pair that already has an entry costs
     /// nothing. A new pair costs [`GRANT_COST`], plus [`PEER_COST`] when it is
@@ -441,11 +501,16 @@ impl Grants {
         self: &Arc<Self>,
         peer: &AdmittedPeer,
         content: Content,
-    ) -> std::result::Result<Permit, Exhausted> {
+        fence: &Fence,
+    ) -> std::result::Result<Permit, NotGranted> {
         let peer = peer.id();
         let root = content.root();
         let mut book = self.lock();
         let book = &mut *book;
+        let current = book.inflight.get(&peer).map(|flight| flight.epoch);
+        if fence.peer != peer || current != Some(fence.epoch) {
+            return Err(NotGranted::Withdrawn);
+        }
         let existing = book
             .by_peer
             .get_mut(&peer)
@@ -461,7 +526,7 @@ impl Grants {
                     PEER_COST
                 };
             if book.used.saturating_add(cost) > book.budget {
-                return Err(Exhausted {
+                return Err(NotGranted::Exhausted {
                     budget: book.budget,
                 });
             }
@@ -512,6 +577,10 @@ impl Grants {
 
     fn revoke_peer(&self, peer: EndpointId) -> usize {
         let mut book = self.lock();
+        // Calls dispatched before this point must not grant anything after it.
+        if let Some(flight) = book.inflight.get_mut(&peer) {
+            flight.epoch += 1;
+        }
         let Some(held) = book.by_peer.remove(&peer) else {
             return 0;
         };
@@ -1036,10 +1105,16 @@ impl Blobs {
     /// budget refuses it.
     #[doc(hidden)]
     pub fn grant(&self, peer: &AdmittedPeer, content: Content) -> Result<()> {
-        self.reserve(peer, content)
-            .map_err(|full| Error::Remote(exhausted(&full)))?
+        let fence = self.fence(peer);
+        self.reserve(peer, content, &fence)
+            .map_err(|refused| Error::Remote(refusal(&refused)))?
             .commit();
         Ok(())
+    }
+
+    /// Fence a call about to be dispatched for `peer`. See [`Fence`].
+    pub(crate) fn fence(&self, peer: &AdmittedPeer) -> Fence {
+        self.inner.grants.fence(peer)
     }
 
     /// Reserve a grant, to be committed once the reply that carries it is
@@ -1048,8 +1123,9 @@ impl Blobs {
         &self,
         peer: &AdmittedPeer,
         content: Content,
-    ) -> std::result::Result<Permit, Exhausted> {
-        self.inner.grants.reserve(peer, content)
+        fence: &Fence,
+    ) -> std::result::Result<Permit, NotGranted> {
+        self.inner.grants.reserve(peer, content, fence)
     }
 
     /// The mount, with the ledger attached.
@@ -1118,9 +1194,12 @@ fn store_error(error: impl std::fmt::Display) -> Error {
 }
 
 /// The refusal a caller reads when the ledger will not take its grant.
-pub(crate) fn exhausted(full: &Exhausted) -> RemoteError {
-    RemoteError::GrantsExhausted {
-        budget: full.budget as u64,
+pub(crate) fn refusal(refused: &NotGranted) -> RemoteError {
+    match refused {
+        NotGranted::Exhausted { budget } => RemoteError::GrantsExhausted {
+            budget: *budget as u64,
+        },
+        NotGranted::Withdrawn => RemoteError::GrantsWithdrawn,
     }
 }
 
@@ -2044,10 +2123,19 @@ mod tests {
 
     /// A grant as dispatch records it: reserved, then committed.
     fn grant(grants: &Arc<Grants>, seed: u8, content: impl Into<Content>) {
-        grants
-            .reserve(&admitted(seed), content.into())
+        reserve(grants, seed, content)
             .expect("within budget")
             .commit();
+    }
+
+    /// A reservation as dispatch makes it: under a fence taken at dispatch.
+    fn reserve(
+        grants: &Arc<Grants>,
+        seed: u8,
+        content: impl Into<Content>,
+    ) -> std::result::Result<Permit, NotGranted> {
+        let fence = grants.fence(&admitted(seed));
+        grants.reserve(&admitted(seed), content.into(), &fence)
     }
 
     fn scope(grants: &Grants, seed: u8, root: BlobId) -> Option<Scope> {
@@ -2136,10 +2224,8 @@ mod tests {
         grant(&grants, 1, blob(1));
         grant(&grants, 1, blob(2));
 
-        let refused = grants
-            .reserve(&admitted(1), blob(3).into())
-            .expect_err("the third grant does not fit");
-        assert_eq!(refused.budget, budget);
+        let refused = reserve(&grants, 1, blob(3)).expect_err("the third grant does not fit");
+        assert_eq!(refused, NotGranted::Exhausted { budget });
         assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Blob));
         assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
         assert_eq!(scope(&grants, 1, blob(3)), None);
@@ -2182,7 +2268,7 @@ mod tests {
     #[test]
     fn a_revoke_while_a_grant_is_pending_wins() {
         let grants = Grants::new();
-        let pending = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        let pending = reserve(&grants, 1, blob(1)).expect("fits");
         assert!(
             !grants.revoke(admitted(1).id(), blob(1)),
             "a reserved grant is not a held one"
@@ -2192,9 +2278,9 @@ mod tests {
 
         // The generation: revoke, then another reservation takes the pair, then
         // the STALE permit commits. It must not make the new entry live.
-        let stale = grants.reserve(&admitted(1), blob(2).into()).expect("fits");
+        let stale = reserve(&grants, 1, blob(2)).expect("fits");
         grants.revoke(admitted(1).id(), blob(2));
-        let fresh = grants.reserve(&admitted(1), blob(2).into()).expect("fits");
+        let fresh = reserve(&grants, 1, blob(2)).expect("fits");
         stale.commit();
         assert_eq!(
             scope(&grants, 1, blob(2)),
@@ -2221,8 +2307,8 @@ mod tests {
     #[test]
     fn a_blob_commit_does_not_activate_a_pending_closure() {
         let grants = Grants::new();
-        let closure = grants.reserve(&admitted(1), seq(1).into()).expect("fits");
-        let blob_only = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        let closure = reserve(&grants, 1, seq(1)).expect("fits");
+        let blob_only = reserve(&grants, 1, blob(1)).expect("fits");
         blob_only.commit();
         assert_eq!(
             scope(&grants, 1, blob(1)),
@@ -2239,15 +2325,59 @@ mod tests {
         );
 
         // The control: a closure that does commit widens it.
-        let widening = grants.reserve(&admitted(1), seq(1).into()).expect("fits");
+        let widening = reserve(&grants, 1, seq(1)).expect("fits");
         widening.commit();
         assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Closure));
+    }
+
+    /// Review finding 5. The recipe is "remove the peer from admission, then
+    /// `revoke_peer`", and a handler already running when it lands has no entry
+    /// for the revoke to remove: it would reserve and commit afterwards.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK55`) by replacing
+    /// `flight.epoch += 1;`
+    /// with `flight.epoch += 0;`: the late reservation is then granted and the
+    /// first assertion fails.
+    #[test]
+    fn a_peer_revoke_defeats_a_grant_from_a_call_dispatched_before_it() {
+        let grants = Grants::new();
+        let early = grants.fence(&admitted(1));
+        let other = grants.fence(&admitted(2));
+        assert_eq!(grants.revoke_peer(admitted(1).id()), 0, "nothing held yet");
+
+        assert_eq!(
+            grants
+                .reserve(&admitted(1), blob(1).into(), &early)
+                .expect_err("the call predates the revoke"),
+            NotGranted::Withdrawn
+        );
+        assert!(!grants.knows(&peer(1)), "and nothing was left behind");
+        assert_eq!(grants.lock().used, 0);
+
+        grants
+            .reserve(&admitted(2), blob(1).into(), &other)
+            .expect("another peer's call is not affected")
+            .commit();
+
+        // A call dispatched after the revoke is a new admission decision.
+        let late = grants.fence(&admitted(1));
+        grants
+            .reserve(&admitted(1), blob(1).into(), &late)
+            .expect("dispatched after")
+            .commit();
+        assert_eq!(scope(&grants, 1, blob(1)), Some(Scope::Blob));
+
+        drop((early, other, late));
+        assert!(
+            grants.lock().inflight.is_empty(),
+            "a finished call leaves nothing in the fence table"
+        );
     }
 
     #[test]
     fn an_uncommitted_permit_releases_its_charge() {
         let grants = Grants::new();
-        let permit = grants.reserve(&admitted(1), blob(1).into()).expect("fits");
+        let permit = reserve(&grants, 1, blob(1)).expect("fits");
         assert!(grants.knows(&peer(1)), "a pending peer passes the guard");
         drop(permit);
 

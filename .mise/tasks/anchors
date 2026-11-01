@@ -2188,6 +2188,8 @@ ANCHORS = [
      "            if book.used.saturating_add(cost) > book.budget {"),
     ("HK53", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if entry.committed.is_none() && entry.pending == 0 {"),
+    ("HK55", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            flight.epoch += 1;"),
     ("HK54", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "            entry.committed = entry.committed.max(Some(self.scope));"),
     ("HK7", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
