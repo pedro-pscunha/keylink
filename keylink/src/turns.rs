@@ -34,7 +34,7 @@
 //! - the loop can be given a second input beside the mailbox, because the
 //!   mailbox's item is a value it can match on rather than a call it must make.
 //!
-//! # One loop, two inputs, both paths
+//! # One loop, three inputs, both paths
 //!
 //! The third of those is [`Feeds`], and building it is what finally made the loop
 //! singular. There were two loops until Wave 3 — this one, and a second that
@@ -53,6 +53,15 @@
 //! A feed item and a mailbox message are both a [`Turn`], dispatched at one call
 //! site, so the panic guard, the observer chain and a durability adapter's commit
 //! reach a feed item because there is nowhere else for it to go.
+//!
+//! # A third input: slow work that comes back
+//!
+//! [`Deferred::away`] sends work out of a turn and gets its output back as a turn
+//! of the same actor. The loop owns that work in a `JoinSet` and polls the set
+//! beside the mailbox and the feeds, so the output re-enters through the same
+//! dispatch as everything else. The panic guard, the observers and a durable
+//! actor's commit therefore apply to it for the reason they apply to a feed item.
+//! `away.rs` carries the rest of the argument.
 //!
 //! One boxed closure survives and it is deliberate: [`read`](LocalActor::read).
 //! That one takes an arbitrary caller closure rather than a declared method, so
@@ -155,6 +164,10 @@
 //! worker feels like parallelism and is not. Both halves are guarded in
 //! `tests/blocking_work.rs`.
 //!
+//! What does release the actor is leaving the turn: [`Deferred::away`] runs the
+//! slow step outside it, and the actor serves other messages until the output comes
+//! back as a turn through [`Back`]. The step may itself be a `spawn_blocking`.
+//!
 //! # A panic reaches the caller of an `ask`
 //!
 //! If the handler panics, the panic is caught so the **actor survives**, and
@@ -200,17 +213,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use n0_future::task::JoinHandle;
+use n0_future::task::{JoinHandle, JoinSet};
 use n0_future::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 
 // By module path and not from the crate root: Wave 2's review found `guarded` and
 // `catching` re-exported `pub` with no consumer outside this crate, so they are
 // `pub(crate)` now and the root no longer names them.
+use crate::away::{comeback, Comeback, Intaking};
 use crate::panic::{catching, guarded};
 use crate::parking::{Parking, Verdict};
 use crate::{
-    Body, Context, EndReason, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError,
+    Back, Body, Context, EndReason, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError,
     Serving, Stop, TurnInfo, TurnLost, TurnOutcome, Withheld,
 };
 
@@ -445,6 +459,13 @@ pub struct Reply<T> {
     /// served call would settle its key `Interrupted` on success and refuse every
     /// retry of a call that worked.
     settling: Option<crate::middleware::Progress>,
+    /// The method this answer is for, as `TurnInfo::method` spells it.
+    ///
+    /// Set by `began` and read by [`Deferred::away`], so the turn an away step
+    /// comes back to is observed under the name of the call it answers. `""` from
+    /// `channel` and `wrapping` until then: no handler can be handed a `Reply`
+    /// that did not pass `began`, so the empty name is never observed.
+    method: &'static str,
 }
 
 /// Where a [`Reply`] actually writes.
@@ -473,6 +494,7 @@ impl<T> Reply<T> {
             Self {
                 to: Answerer::Direct(reply),
                 settling: None,
+                method: "",
             },
             answer,
         )
@@ -519,6 +541,7 @@ impl<T> Reply<T> {
         Reply {
             to: Answerer::Wrapped(Box::new(move |answered| self.answer(answered.map(wrap)))),
             settling: None,
+            method: "",
         }
     }
 
@@ -685,7 +708,7 @@ enum Settled<T> {
 /// the loop goes back to polling and can take the peer's message and run it.
 /// [`later`](Reply::later) is what makes returning possible while a caller is
 /// still owed an answer — so park the reply, hand the outbound call to a spawned
-/// task, and return.
+/// task or to [`away`](Self::away), and return.
 ///
 /// Parking on its own fixes nothing. A handler that calls `later` and then awaits
 /// the peer *without returning* hangs exactly as before: the turn has not ended,
@@ -697,6 +720,11 @@ enum Settled<T> {
 /// the hanging case too — a running turn released its own when it took the message
 /// it is running — so a cycle-breaker that only freed a permit would break
 /// nothing. What was missing was a loop that would *run* the message.
+///
+/// When the answer depends on what the outbound call returns, prefer
+/// [`away`](Self::away) to a task of your own: the actor owns the work, starts it
+/// after the turn commits, and runs its output as a turn that can check what the
+/// state looks like by then.
 ///
 /// # What a parked reply resolves to when a LATER turn faults
 ///
@@ -762,6 +790,10 @@ impl<T> Deferred<T> {
     /// a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it`
     /// pins it.
     ///
+    /// A send that must be gated by a turn's commit is made from a turn. For slow
+    /// work whose output decides the answer, [`away`](Self::away) is that: the work
+    /// runs off the turn and the send is made from [`Back::back`].
+    ///
     /// # `T: Send + 'static`, which every method's return type already is
     ///
     /// The parked answer is type-erased into the turn's lot — one turn can hold
@@ -780,6 +812,105 @@ impl<T> Deferred<T> {
             // Dropped, not answered. `Answered::Faulted` needs the `Panic`
             // itself, there is one, and it is the turn's own caller's — see
             // `Verdict::Faulted`.
+            Verdict::Faulted => drop(reply),
+        }));
+    }
+
+    /// Run `work` off the turn, then answer from a new turn on this actor:
+    /// `A::back(output, self)`.
+    ///
+    /// This is the way out of a turn for slow work that has to come back. The
+    /// handler parks the reply with [`Reply::later`], calls this, and returns; the
+    /// work then runs while the actor serves other messages, and its output
+    /// re-enters as an ordinary turn through [`Back`], with the caller still
+    /// waiting.
+    ///
+    /// ```ignore
+    /// async fn land(&mut self, _cx: Caller<'_>, reply: Reply<Landed>, change: Change)
+    ///     -> Replied<Landed>
+    /// {
+    ///     let plan = self.prepare(&change);          // in the turn, fast
+    ///     let (deferred, replied) = reply.later();
+    ///     deferred.away(self, run_checks(plan));     // off the turn, slow
+    ///     replied
+    /// }
+    ///
+    /// impl Back<Checked, Landed> for Repo {
+    ///     async fn back(&mut self, checked: Checked, reply: Deferred<Landed>) {
+    ///         match self.compare_and_swap(checked) { // in a turn again
+    ///             Ok(landed) => reply.send(landed),  // gated by this turn's commit
+    ///             Err(stale) => reply.away(self, recheck(stale)),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # The work belongs to the actor
+    ///
+    /// - **It starts after the launching turn commits.** If an observer refuses
+    ///   that turn, the work never starts and the caller is told
+    ///   [`Withheld::Refused`] (or [`Withheld::ObserverPanicked`]), as for any
+    ///   answer. If the handler panics, the caller is told [`Withheld::Dropped`].
+    ///   For a durable actor this means the work starts only after the turn that
+    ///   decided to run it is on disk.
+    /// - **It is cancelled when the actor ends**, by `stop`, `abort`, a refusal, a
+    ///   feed that ran out, or a restart. The caller is told [`Withheld::Gone`] or
+    ///   [`Withheld::Restarting`], read from the actor's standing, which is settled
+    ///   before the work is cancelled. `stop` does not wait for it.
+    /// - **A panic in the work** tells the caller [`Withheld::Dropped`]. The actor
+    ///   goes on serving.
+    /// - **It is not durable.** A crash loses it. Reconcile what was pending when
+    ///   the actor restarts.
+    ///
+    /// The work must not touch the state: it holds no reference to it. Whatever it
+    /// needs, move it in, and decide what to do with the result in [`Back::back`],
+    /// where the state may be different from what the launching turn saw.
+    ///
+    /// # Why `state` is an argument
+    ///
+    /// It is the witness that names the actor the work comes back to, and it fixes
+    /// `A` for inference. `&mut` and not `&` means only a running turn can call
+    /// this: a [`read`](LocalActor::read) closure holds `&A`, and a spawned task
+    /// holds no state at all.
+    ///
+    /// # Misuse is deterministic and not a compile error
+    ///
+    /// Calling this outside any turn, or with a different state type than the
+    /// running turn's (`&mut self.sub`), drops the work unstarted and the reply with
+    /// it, so the caller is told [`Withheld::Dropped`]. The first call shows the
+    /// mistake. That is the cost of finding the loop through the running turn
+    /// instead of through a handle the `Deferred` would have to carry; `away.rs`
+    /// argues the choice.
+    ///
+    /// # What a deadline does to it
+    ///
+    /// Nothing. A caller that stops waiting leaves the work and the back turn
+    /// running, and a keyed call records the real answer under its key.
+    pub fn away<A, W>(self, _state: &mut A, work: W)
+    where
+        T: Send + 'static,
+        A: Back<W::Output, T>,
+        W: Future + Send + 'static,
+        W::Output: Send + 'static,
+    {
+        let reply = self.0;
+        let method = reply.method;
+        crate::parking::park(Box::new(move |verdict| match verdict {
+            // Pushed from inside the dispatch poll that is releasing this turn's
+            // lot, which is where the loop is collecting launches. A refused or
+            // faulted turn pushes nothing, so the work is never started.
+            Verdict::Committed => crate::away::push::<A>(Box::pin(async move {
+                let out = work.await;
+                (method, comeback::<A, W::Output, T>(out, Deferred(reply)))
+            })),
+            // The three that did not commit, spelled as `send` does and written
+            // with braces so that the anchors that quote `send`'s arms stay unique.
+            Verdict::Refused { name } => {
+                reply.answer(Answered::Refused { name });
+            }
+            Verdict::ObserverPanicked { name } => {
+                reply.answer(Answered::ObserverPanicked { name });
+            }
             Verdict::Faulted => drop(reply),
         }));
     }
@@ -1164,7 +1295,7 @@ where
     // own.
     F: for<'b> FnOnce(Origin, &'b mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'b>> + Send,
 {
-    let reply = began(&origin, reply)?;
+    let reply = began(&origin, method, reply)?;
 
     let (ran, withheld, end) =
         observed_turn(state, hooks, method, move |state| turn(origin, state)).await;
@@ -1241,7 +1372,7 @@ where
         ) -> Pin<Box<dyn Future<Output = Replied<T>> + Send + 'b>>
         + Send,
 {
-    let reply = began(&origin, reply)?;
+    let reply = began(&origin, method, reply)?;
 
     let (ran, withheld, end) = observed_turn(state, hooks, method, move |state| {
         turn(origin, state, reply)
@@ -1267,7 +1398,7 @@ where
 /// the turn must not run. Written once and taken by reference so that the two
 /// turns cannot disagree about when a turn begins — which is the disagreement Wave
 /// 1b found three copies of, two spelling the comparison `>` and one `>=`.
-fn began<T>(origin: &Origin, reply: Reply<T>) -> Option<Reply<T>> {
+fn began<T>(origin: &Origin, method: &'static str, mut reply: Reply<T>) -> Option<Reply<T>> {
     // `Progress` shares its `Arc` on clone deliberately, which is what lets a mark
     // made on the actor's task be read back on the connection's.
     let progress = origin.caller().peer().map(Context::progress);
@@ -1278,6 +1409,7 @@ fn began<T>(origin: &Origin, reply: Reply<T>) -> Option<Reply<T>> {
         .is_some_and(Queueing::expired);
 
     // Installed before anything can answer, including the expiry below.
+    reply.method = method;
     let reply = reply.settling(progress.clone());
 
     if expired {
@@ -1359,6 +1491,33 @@ where
     end.or(faulted)
 }
 
+/// Run the turn an off-turn step comes back to: the handler, the observers, and
+/// nothing else.
+///
+/// The fourth turn, and it is [`observed_turn`] with the method name the call that
+/// launched it was made under. The reply it answers is inside the comeback, so
+/// there is no deadline to read, no origin and no mark to make: the marks travel
+/// with the reply, and [`Reply::answer`] makes `completed` when `back` sends.
+///
+/// # A panic here costs the message and not the actor, as for an `rpc`
+///
+/// Unlike a feed item, a back turn has a caller. The reply was in the comeback and
+/// died in the unwind, so the caller is told [`Withheld::Dropped`], which is the
+/// answer for a handler that panics. Only an observer's refusal ends the actor, and
+/// `observed_turn` already says so in the third slot.
+///
+/// A function that returns a boxed future and is not an `async fn`, for
+/// [`dispatch`]'s reason: the comeback is sized by the caller's `Back` impl and
+/// must not land in the loop's frame, where an idle actor would pay for it.
+fn back_turn<'a, A: Send + 'static>(
+    state: &'a mut A,
+    hooks: &'a mut Hooks<A>,
+    method: &'static str,
+    comeback: Comeback<A>,
+) -> Pin<Box<dyn Future<Output = Option<Ended>> + Send + 'a>> {
+    Box::pin(async move { observed_turn(state, hooks, method, comeback).await.2 })
+}
+
 /// What a poll of an actor's feeds produced.
 ///
 /// Two states and not `Option`, because the second one is not "nothing yet" — it
@@ -1409,13 +1568,16 @@ pub enum Fed<T> {
 ///
 /// # Fairness is keylink's, in two places
 ///
-/// The loop alternates which input it polls first, so neither the mailbox nor the
+/// The loop rotates which input it polls first, so neither the mailbox nor the
 /// feeds can starve the other: a saturated feed delays a message by at most one
 /// item, and the reverse. A generated `poll_next` rotates among *its own* feeds for
-/// the same reason, so a saturated feed cannot starve its siblings either. The
-/// mailbox therefore gets half the turns and each of `n` feeds gets `1/2n` of them
-/// when everything is ready at once — stated, because "fair" without a number is
-/// how a priority knob gets argued for later.
+/// the same reason, so a saturated feed cannot starve its siblings either.
+///
+/// Off-turn work that has finished ([`Deferred::away`]) is a third input in the
+/// same rotation. With the mailbox, the feeds and finished work all ready, each of
+/// the three gets a third of the turns and each of `n` feeds gets `1/3n`; with no
+/// work waiting the mailbox gets half the turns and each feed `1/2n`. Stated,
+/// because "fair" without a number is how a priority knob gets argued for later.
 #[doc(hidden)]
 pub trait Feeds<A>: Send + 'static {
     /// One item from one feed, which is a turn against the state.
@@ -2006,26 +2168,62 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
     }
 }
 
-/// Which of an actor's two inputs produced the next thing to do.
+/// Which of an actor's three inputs produced the next thing to do.
 enum Taken<A, M, T> {
     /// A mailbox message, or `None` for a mailbox nobody can send to any more.
     Mail(Option<Message<A, M>>),
     /// A feed item, or the feed that ended.
     Fed(Fed<T>),
+    /// Off-turn work that finished: the method of the call it answers, and the
+    /// turn it comes back as. See [`Deferred::away`].
+    Back(&'static str, Comeback<A>),
 }
 
-/// Wait until either input has something, without building a future over either.
+impl<A, M, T> Taken<A, M, T> {
+    /// The input that gets first refusal after this one was served.
+    ///
+    /// The next one in the ring, so that of any two inputs that are both ready the
+    /// one that lost last time wins this time. Alternation is the two-input case of
+    /// it, and with all three ready each gets a third.
+    fn next_first(&self) -> u8 {
+        match self {
+            Self::Mail(_) => FEEDS,
+            Self::Fed(_) => AWAY,
+            Self::Back(..) => MAIL,
+        }
+    }
+}
+
+/// The work an actor has sent away, owned by its loop.
 ///
-/// `mail_first` is the fairness knob and it is the loop's, not a caller's: the loop
-/// flips it after every item, so the input that lost the last race gets first
+/// `None` until the first launch, so an actor that never calls [`Deferred::away`]
+/// allocates nothing for it.
+type Away<A> = Option<JoinSet<(&'static str, Comeback<A>)>>;
+
+/// Wait until any input has something, without building a future over any of them.
+///
+/// `first` is the fairness knob and it is the loop's, not a caller's: the loop
+/// advances it after every item, so the input that lost the last race gets first
 /// refusal on the next one. A starved feed is a **correctness** problem — stale
-/// state served as fresh — and a starved mailbox is a latency problem, so neither
-/// wins by default and there is deliberately no way to ask for one to.
+/// state served as fresh — and a starved mailbox is a latency problem, so none of
+/// the three wins by default and there is deliberately no way to ask for one to.
+/// Off-turn work that is done is the same: its caller is waiting.
 ///
-/// The arm that is polled second is skipped entirely when the first is ready, which
-/// is what `select!` does too. It cannot lose a wakeup: the skipped input is polled
-/// on the next iteration, and this future is rebuilt each time round.
-async fn next<A, M, F, I>(inbox: &mut I, feeds: &mut F, mail_first: bool) -> Taken<A, M, F::Item>
+/// The inputs polled after the first ready one are skipped entirely, which is what
+/// `select!` does too. It cannot lose a wakeup: a skipped input is polled on the
+/// next iteration, and this future is rebuilt each time round.
+///
+/// The away set is polled until it is pending or empty, not once. A task that
+/// panicked is a `JoinError` with nothing to run (its reply already died, and the
+/// actor is serving), and returning `Pending` right after consuming one would leave
+/// the set's waker unregistered. An empty set is not ready, and needs no waker: a
+/// task is added only by the loop itself, between two calls of this function.
+async fn next<A: 'static, M, F, I>(
+    inbox: &mut I,
+    feeds: &mut F,
+    away: &mut Away<A>,
+    first: u8,
+) -> Taken<A, M, F::Item>
 where
     I: Inbox<A, M>,
     F: Feeds<A>,
@@ -2033,25 +2231,42 @@ where
     std::future::poll_fn(move |cx| {
         use std::task::Poll;
 
-        if mail_first {
-            if let Poll::Ready(message) = inbox.poll_next(cx) {
-                return Poll::Ready(Taken::Mail(message));
-            }
-            if let Poll::Ready(fed) = feeds.poll_next(cx) {
-                return Poll::Ready(Taken::Fed(fed));
-            }
-        } else {
-            if let Poll::Ready(fed) = feeds.poll_next(cx) {
-                return Poll::Ready(Taken::Fed(fed));
-            }
-            if let Poll::Ready(message) = inbox.poll_next(cx) {
-                return Poll::Ready(Taken::Mail(message));
+        for offset in 0..INPUTS {
+            match (first + offset) % INPUTS {
+                MAIL => {
+                    if let Poll::Ready(message) = inbox.poll_next(cx) {
+                        return Poll::Ready(Taken::Mail(message));
+                    }
+                }
+                FEEDS => {
+                    if let Poll::Ready(fed) = feeds.poll_next(cx) {
+                        return Poll::Ready(Taken::Fed(fed));
+                    }
+                }
+                AWAY => {
+                    if let Some(set) = away.as_mut() {
+                        while let Poll::Ready(Some(done)) = set.poll_join_next(cx) {
+                            if let Ok((method, comeback)) = done {
+                                return Poll::Ready(Taken::Back(method, comeback));
+                            }
+                        }
+                    }
+                }
+                // `% INPUTS` leaves nothing else, and a loop that skipped an input
+                // would be a starved one, so this is not an arm to reach for.
+                _ => {}
             }
         }
         Poll::Pending
     })
     .await
 }
+
+/// How many inputs [`next`] rotates over, and the numbers it gives them.
+const INPUTS: u8 = 3;
+const MAIL: u8 = 0;
+const FEEDS: u8 = 1;
+const AWAY: u8 = 2;
 
 /// **The** place a turn is run, for every input and both paths.
 ///
@@ -2193,20 +2408,27 @@ where
     F: Feeds<A>,
     I: Inbox<A, M>,
 {
-    // **Declared first, so it drops last among this body's locals — and every
+    // The work this actor has sent away with [`Deferred::away`]. **Declared
+    // before `floor`, so it drops after it**: an unwind or an `abort` settles the
+    // verdict first, and only then cancels the tasks, whose dying `Deferred`s read
+    // that verdict. The orderly path settles it explicitly and drops this right
+    // after, below. Every one of these is a body local, so it drops before `state`.
+    let mut away: Away<A> = None;
+    // **Declared next, so it drops last of the locals that follow it — and every
     // body local drops before a parameter.** `state` is a parameter, so an
     // unwind through this function settles the verdict before the state, and
     // therefore before every `Deferred` parked in it, dies. See [`Floor`] for
     // what that is a floor under and what it is not.
     let mut floor = Floor::armed(fate);
     let mut reason = Ended::Stopped;
-    // Which input gets first refusal. Flipped after every item, so the loop
-    // alternates rather than preferring one — see `next`.
-    let mut mail_first = true;
+    // Which input gets first refusal. The one after whichever was just served, so
+    // the loop rotates over mail, feeds and finished away work rather than
+    // preferring one — see `next`.
+    let mut first: u8 = MAIL;
 
     loop {
-        let taken = next(&mut inbox, &mut feeds, mail_first).await;
-        mail_first = !mail_first;
+        let taken = next(&mut inbox, &mut feeds, &mut away, first).await;
+        first = taken.next_first();
 
         match taken {
             Taken::Mail(Some(Message::Mail(mail, chain))) => {
@@ -2218,12 +2440,17 @@ where
                 // The chain the sender was on, plus this actor. Everything sent
                 // from inside the dispatch below carries it, which is what lets
                 // `LocalActor::send` refuse a ring rather than only a self-call.
-                let chained = Chained {
+                //
+                // `Intaking` around it, so a `Deferred::away` made by this turn is
+                // collected here and spawned only after the turn committed. The
+                // same wrapper goes around the other two dispatches.
+                let mut turn = Intaking::new(Chained {
                     chain: chain.with(inbox.identity()),
                     inner: dispatch(mail, &mut state, &mut hooks),
-                };
-                let ended = chained.await;
+                });
+                let ended = (&mut turn).await;
                 inbox.mark_busy(false);
+                send_away(&mut away, turn.take::<A>());
                 if let Some(end) = ended {
                     reason = end;
                     break;
@@ -2242,12 +2469,30 @@ where
                 // starts a fresh chain holding this actor alone. A ring closed
                 // through a feed is one of the residuals, and it is this line:
                 // nothing upstream of the stream is named here.
-                let chained = Chained {
+                let mut turn = Intaking::new(Chained {
                     chain: Chain::Empty.with(inbox.identity()),
                     inner: dispatch(item, &mut state, &mut hooks),
-                };
-                let ended = chained.await;
+                });
+                let ended = (&mut turn).await;
                 inbox.mark_busy(false);
+                send_away(&mut away, turn.take::<A>());
+                if let Some(end) = ended {
+                    reason = end;
+                    break;
+                }
+            }
+            // Off-turn work that finished. A turn like the other two, with no
+            // sender behind it, so a fresh chain holding this actor alone. The
+            // reply it answers is inside the comeback, still pending.
+            Taken::Back(method, comeback) => {
+                inbox.mark_busy(true);
+                let mut turn = Intaking::new(Chained {
+                    chain: Chain::Empty.with(inbox.identity()),
+                    inner: back_turn(&mut state, &mut hooks, method, comeback),
+                });
+                let ended = (&mut turn).await;
+                inbox.mark_busy(false);
+                send_away(&mut away, turn.take::<A>());
                 if let Some(end) = ended {
                     reason = end;
                     break;
@@ -2281,6 +2526,11 @@ where
     floor.disarm();
     let verdict = inbox.ending(&reason);
     fate.settle(verdict.clone());
+    // The settled verdict first, and then the work: each task holds a parked
+    // caller, and the caller reads that verdict when its task is cancelled. The
+    // work is cancelled before `finish`, which flushes the state and has no use
+    // for it.
+    drop(away);
 
     for observer in &mut hooks {
         // Shared reborrow first, and the `FnOnce`-forcing rebind inside, for the
@@ -2312,6 +2562,15 @@ where
     drop(feeds);
     drop(state);
     (reason, verdict)
+}
+
+/// Start the work a turn sent away, now that the turn is committed.
+///
+/// Lazily creates the set, so an actor that never sends work away holds `None`.
+fn send_away<A: 'static>(away: &mut Away<A>, started: Vec<crate::away::Started<A>>) {
+    for work in started {
+        away.get_or_insert_with(JoinSet::new).spawn(work);
+    }
 }
 
 /// Run one keyed actor: the same loop, entered from a

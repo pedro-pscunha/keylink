@@ -28,6 +28,7 @@ gate_modules! {
     actors => "../tests/actors.rs",
     admission => "../tests/admission.rs",
     api => "../tests/api.rs",
+    away => "../tests/away.rs",
     blobs => "../tests/blobs.rs",
     blocking_work => "../tests/blocking_work.rs",
     compose => "../tests/compose.rs",

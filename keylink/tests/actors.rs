@@ -3598,7 +3598,7 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
 /// alternation gives the **feed** first refusal on turn two. A mailbox-first loop
 /// puts the tick last instead.
 ///
-/// Red-tested by deleting the loop's alternation — `mail_first = true` in
+/// Red-tested by deleting the loop's alternation — `first = MAIL` in
 /// `keylink/src/turns.rs` — which is `tests/feeds.rs`'s break for the same rule.
 /// Watched: the tick arrives fourth.
 #[tokio::test]

@@ -281,7 +281,7 @@ async fn hold(
 /// its place in a queue.
 ///
 /// Made red by `scripts/break-once.sh`, replacing the loop's
-/// `mail_first = !mail_first;` with `mail_first = true;` — the alternation deleted
+/// `first = taken.next_first();` with `first = MAIL;` — the alternation deleted
 /// and the mailbox given first refusal every time. Watched: left
 /// `[Held, Note(7), Fill(1), Fill(2), Fill(3)]` against right
 /// `[Held, Fill(1), Note(7), Fill(2), Fill(3)]`, which is the batching this test
@@ -466,7 +466,7 @@ async fn a_feed_that_ends_ends_the_actor_and_names_it() {
 /// is a `Feed`, there is no `Mail` variant for one, and `Feeds` never names an
 /// `mpsc`. This test is that property's behavioural witness, not its proof.
 ///
-/// Red-tested with the loop's alternation deleted — `mail_first = true` — which puts
+/// Red-tested with the loop's alternation deleted — `first = MAIL` — which puts
 /// `Note(1)` first.
 #[tokio::test]
 async fn a_full_mailbox_still_admits_feed_items() {
@@ -528,7 +528,7 @@ async fn a_full_mailbox_still_admits_feed_items() {
 /// the note at 1 — and it was watched to pass with the fairness deleted. `== 2` is
 /// the assertion that discriminates.
 ///
-/// Red-tested with `mail_first = true`.
+/// Red-tested with `first = MAIL`.
 #[tokio::test]
 async fn neither_input_starves_the_other() {
     let (wired, gate) = wired(Vec::new());

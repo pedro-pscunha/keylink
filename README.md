@@ -370,8 +370,10 @@ state. Under the concurrent model that same edit fails the build, because
 
 Two costs, both structural. A turn is not cancellable: dropping the call does
 not stop the handler, and a layer such as `Timeout` refuses the caller without
-ending the turn. And an actor must not call itself: keylink detects a re-entrant
-local call by actor identity and refuses it instead of relying on mailbox depth.
+ending the turn. The way to keep a slow step from holding the actor is to take it
+out of the turn with `Deferred::away`, below. And an actor must not call itself:
+keylink detects a re-entrant local call by actor identity and refuses it instead
+of relying on mailbox depth.
 
 ### Local mailbox policy
 
@@ -464,12 +466,56 @@ let warehouse = inventory::setup(Warehouse::seeded())
     .actor();
 ```
 
-Feed items and mailbox messages are interleaved fairly: with everything ready at
-once the mailbox takes half the turns and each of `n` feeds takes `1/2n`. A feed
-is **local only and never on the wire**, so declaring one does not move the ALPN.
-A feed that ends, and a feed handler that panics, both end the actor — a fault
-with no caller to resume it into would otherwise be dropped onto a state the
-handler may have left half applied — and `Ended` names which happened.
+Feed items and mailbox messages are interleaved fairly: with no off-turn work
+waiting, the mailbox takes half the turns and each of `n` feeds takes `1/2n`; with
+finished off-turn work ready too (next section), each of the three inputs takes a
+third. A feed is **local only and never on the wire**, so declaring one does not
+move the ALPN. A feed that ends, and a feed handler that panics, both end the
+actor — a fault with no caller to resume it into would otherwise be dropped onto a
+state the handler may have left half applied — and `Ended` names which happened.
+
+### Slow work, off the turn
+
+A turn holds its actor until it returns, so a handler that spends an hour on a
+check holds the actor for an hour. `#[defer]` lets the handler return without
+answering: `reply.later()` parks the caller. `Deferred::away` finishes the job.
+It sends the slow work out of the turn, and the work's output comes back as a new
+turn on the same actor, with the caller still waiting:
+
+```rust
+#[defer]
+rpc Land(change: Change) -> Landed;
+
+async fn land(&mut self, _cx: Caller<'_>, reply: Reply<Landed>, change: Change)
+    -> Replied<Landed>
+{
+    let plan = self.prepare(&change);          // in the turn, fast
+    let (deferred, replied) = reply.later();
+    deferred.away(self, run_checks(plan));     // off the turn, slow
+    replied
+}
+
+impl Back<Checked, Landed> for Repo {
+    async fn back(&mut self, checked: Checked, reply: Deferred<Landed>) {
+        match self.compare_and_swap(checked) { // in a turn again
+            Ok(landed) => reply.send(landed),  // gated by this turn's commit
+            Err(stale) => reply.away(self, recheck(stale)),
+        }
+    }
+}
+```
+
+The work belongs to the actor. It starts only after the launching turn commits, so
+an observer that refuses that turn stops it from ever starting, and a durable
+actor's work starts only after the turn that chose it is on disk. It is cancelled
+when the actor ends, and the parked caller is told `Gone` or `Restarting`. The
+`back` turn is an ordinary turn: the panic guard, the observers and the commit all
+apply, and other turns ran while the work was away, so `back` re-checks what the
+launching turn assumed. The work itself holds no reference to the state. It is not
+durable: a crash loses it, and the actor reconciles what was pending on restart.
+`stop` does not wait for it. Calling `away` outside a turn, or with another state
+type than the running turn's, drops the work and tells the caller `Dropped` on the
+first call.
 
 ### Many instances behind one ALPN
 
@@ -1071,7 +1117,8 @@ Known gaps, in rough priority order:
   leaves `Interrupted`, which is the truth — but the retry does not receive the
   turn's real reply either. `QueueTimeout` is the half that does shed load: it
   refuses a message that has not started, and leaves its key claimable, because
-  nothing ran. Past that point, bound the work inside the method. RFC-05 §7.
+  nothing ran. Past that point, bound the work inside the method, or take the slow
+  step out of the turn with `Deferred::away`. RFC-05 §7.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - Idempotency records are in memory by default, so a retry across a restart
