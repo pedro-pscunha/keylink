@@ -1002,7 +1002,45 @@ where
     // carries. `ObserverVerdict::Refused` holds [`Stop::is_fatal`] as well, because that is
     // the one thing about a refusal a supervisor reads and nothing else does.
     let mut withheld: Option<(ObserverVerdict, Arc<dyn Error + Send + Sync>)> = None;
+
+    // **Every observer is asked whether it can take this turn before any of them
+    // is allowed to commit it.** `after_turn` stops at the first refusal, but it
+    // cannot take back what the observers ahead of it already stored, and a caller
+    // refused after one of them had committed is told "it was not committed" about
+    // a turn that was. This pass catches the refusals that need no write to make.
+    // A panic in `prepare` is an observer panic, like one in `after_turn`.
     for observer in hooks.iter_mut() {
+        let name = observer.name();
+        let shared: &A = &*state;
+        let watching: &mut dyn Observer<A> = &mut **observer;
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let watching = watching;
+            watching.prepare(shared, info)
+        }));
+        match checked {
+            Ok(Ok(())) => {}
+            Ok(Err(stop)) => {
+                let (reason, stance) = stop.into_parts();
+                let verdict = match stance {
+                    Stance::Retryable => ObserverVerdict::Refused { name, fatal: false },
+                    Stance::Fatal => ObserverVerdict::Refused { name, fatal: true },
+                    Stance::Indeterminate => ObserverVerdict::Indeterminate { name },
+                };
+                withheld = Some((verdict, Arc::from(reason)));
+                break;
+            }
+            Err(payload) => {
+                let reason: Box<dyn Error + Send + Sync> =
+                    Panic::caught(payload).to_string().into();
+                withheld = Some((ObserverVerdict::Panicked { name }, Arc::from(reason)));
+                break;
+            }
+        }
+    }
+
+    // A refusal above commits nothing: no observer's `after_turn` runs.
+    let committing = if withheld.is_some() { 0 } else { hooks.len() };
+    for observer in hooks.iter_mut().take(committing) {
         let name = observer.name();
         // TWO catches, because `after_turn` has two halves that can panic and
         // `guarded` only covers one of them.

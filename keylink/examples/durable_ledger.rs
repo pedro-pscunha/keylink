@@ -30,7 +30,8 @@ use std::time::Duration;
 
 use keylink::{Allowlist, Caller, Deltas, Node, Opened, Own, Persist, Servable};
 use keylink_persist::file::Files;
-use keylink_persist::{Changes, Durable, Journaled, RestoreError, StateId};
+use keylink_persist::versioned::FrameFault;
+use keylink_persist::{Changes, Durable, JournalFault, Journaled, RestoreError, StateId};
 
 keylink::service! {
     service Ledger;
@@ -162,9 +163,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  than none, and writing the truncation back would be worse still.
     //
     //  **This directory outlives the process on purpose, so it can outlive the
-    //  build that wrote it.** A file layout this build cannot read stops here as
-    //  `NotAJournal` or `NotAFrame`, and for a demo that is a reason to start
-    //  over and say so. A real program would not delete its state.
+    //  build that wrote it.** A file layout OLDER than this build's stops here as
+    //  `LayoutTooOld`, and for a demo that is a reason to start over and say so.
+    //  Nothing else is: a journal recovery refused as damaged is evidence, a layout
+    //  from a newer build is somebody else's data, and both stay where they are and
+    //  stop the example. A real program would not delete its state at all.
     let (_store, opened) = match open_state(&root, &id).await {
         Ok(opened) => opened,
         Err(keylink_persist::Error::Busy { id }) => {
@@ -175,11 +178,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         Err(
-            keylink_persist::Error::NotAJournal { .. }
-            | keylink_persist::Error::Restore(keylink_persist::RestoreError::NotAFrame { .. }),
+            keylink_persist::Error::NotAJournal {
+                fault: JournalFault::LayoutTooOld { .. },
+                ..
+            }
+            | keylink_persist::Error::Restore(keylink_persist::RestoreError::NotAFrame {
+                fault: FrameFault::LayoutTooOld { .. },
+                ..
+            }),
         ) => {
             println!(
-                "{} holds state in a layout this build cannot read; starting a new one",
+                "{} holds state in an older layout; starting a new one",
                 root.display()
             );
             std::fs::remove_dir_all(&root)?;

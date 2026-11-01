@@ -114,6 +114,27 @@ pub trait Observer<A>: Send + 'static {
     /// Names this observer in [`Ended`] and in the refusal a peer sees.
     fn name(&self) -> &'static str;
 
+    /// Called for **every** observer, in order, before **any** observer's
+    /// [`after_turn`](Self::after_turn) runs. Returning `Err` refuses the turn
+    /// before anything has committed it.
+    ///
+    /// For a check an observer can make without writing, whose failure must not
+    /// leave an earlier observer having stored a turn the caller is then told was
+    /// refused. The chain's first `Err` from `after_turn` stops the rest, but it
+    /// cannot take back what the observers before it did; this can. Defaulted:
+    /// most observers have nothing to check.
+    ///
+    /// A plain `fn`, for the reason `after_turn` is: it can look at `state` without
+    /// that borrow reaching a future. A refusal made here ends the actor like any
+    /// other, and the first `Err` stops the rest.
+    ///
+    /// # Errors
+    ///
+    /// [`Stop`], with the same meaning as from `after_turn`.
+    fn prepare(&mut self, _state: &A, _turn: TurnInfo<'_>) -> Result<(), Stop> {
+        Ok(())
+    }
+
     /// Called inside the turn, after the handler and **before the reply**.
     ///
     /// Returning `Err` ends the actor, and the first `Err` stops the rest.
@@ -174,6 +195,10 @@ where
 {
     fn name(&self) -> &'static str {
         (**self).name()
+    }
+
+    fn prepare(&mut self, state: &A, turn: TurnInfo<'_>) -> Result<(), Stop> {
+        (**self).prepare(state, turn)
     }
 
     fn after_turn<'a>(&'a mut self, state: &'a A, turn: TurnInfo<'a>) -> TurnFut<'a> {
@@ -335,18 +360,15 @@ pub enum TurnOutcome<'a> {
 /// `pub(crate) enum Severity { Retryable, Fatal }` here would have no coherence
 /// problem at all — nothing converts *from* it — and would compile.
 ///
-/// It is a `bool` for a weaker and more ordinary reason, and the reason is
-/// written down rather than implied because the first version of this note let
-/// the coherence argument carry the field's *type*, which it does not reach.
-/// **The two-state fact is already on the public surface as a `bool`, twice**:
-/// [`is_fatal`](Self::is_fatal) here, and `fatal` on
-/// [`Ended::Observer`] — which is argued separately and
-/// on its own merits further down. `into_parts` is `pub(crate)` and has two
-/// callers, both in `turns.rs`, so an internal enum would buy a self-describing
-/// return at those two sites and be a private synonym for a shape the public API
-/// spells as a `bool` anyway. That is a judgement about one type against three
-/// call sites, not a constraint — and calling it a constraint is what this
-/// paragraph is fixing.
+/// The discriminator is a private three-state `Stance` (retryable, fatal,
+/// indeterminate), and it was a `bool` until a third state existed: a refusal can
+/// now also say that the turn **may have been committed**
+/// ([`indeterminate`](Self::indeterminate)), which is neither of the other two and
+/// is the one a caller must not be told "not committed" about. The public
+/// surface keeps [`is_fatal`](Self::is_fatal) and `fatal` on
+/// [`Ended::Observer`], because a supervisor reads one bit and that bit is the
+/// same as it was; `into_parts` is `pub(crate)` and returns the stance to the two
+/// callers in `turns.rs`, which map it to the verdict a caller is told.
 pub struct Stop(Box<dyn Error + Send + Sync>, Stance);
 
 /// What a refusal says about the turn and about another incarnation.

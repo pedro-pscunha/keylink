@@ -580,6 +580,10 @@ pub struct Versioned<C: Claim> {
     /// A cut that should have followed a snapshot did not happen. The next
     /// snapshot repeats it, and so does `open`.
     stale: bool,
+    /// An earlier write was [`Error::Indeterminate`]. Nothing more is written
+    /// through this wrapper: the state it holds may contain a record the log may
+    /// or may not, and storing it would stamp that record as already contained.
+    poisoned: bool,
 }
 
 /// The next session number. A process-wide counter and not a random value: two
@@ -677,6 +681,7 @@ impl<C: Claim> Versioned<C> {
                 snapshot_bytes,
                 log_bytes,
                 stale: false,
+                poisoned: false,
             },
             state,
             records: tail.records,
@@ -716,12 +721,29 @@ impl<C: Claim> Versioned<C> {
     ///   reached the adapter, which is [`FRAME_LEN`] more than the payload.
     /// - [`Error::Io`] when the write fails. The previous
     ///   snapshot is intact.
+    /// - [`Error::Indeterminate`] when the new snapshot may be the one that is
+    ///   stored. This wrapper is finished from then on: every later write is
+    ///   [`Error::Poisoned`].
+    /// - [`Error::Poisoned`] after an earlier indeterminate write, and
+    ///   [`Error::SeqExhausted`] when the log has no positions left, which is a
+    ///   snapshot this crate would refuse to reopen.
     pub async fn store<D: Durable>(&mut self, snapshot: &Snapshot<D>) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        // A snapshot that contains the last number there is could never be
+        // reopened, so it is refused before anything is written.
+        if self.next.is_none() {
+            return Err(Error::SeqExhausted);
+        }
         // Everything appended so far is in this snapshot: it was taken in the
         // turn that appended the last of it.
         let through = self.appended_through();
         let framed = frame(D::VERSION, through, &snapshot.bytes);
-        self.claim.store(&framed).await?;
+        if let Err(error) = self.claim.store(&framed).await {
+            self.poisoned |= matches!(error, Error::Indeterminate { .. });
+            return Err(error);
+        }
 
         let records_may_exist = through > self.through || self.stale;
         self.through = through;
@@ -754,6 +776,12 @@ impl<C: Claim> Versioned<C> {
         } else {
             Err(Error::ForeignChanges)
         }
+    }
+
+    /// Whether `state`'s change buffer is this wrapper's. Read-only, for a check
+    /// that must not drain anything.
+    pub fn owns<D: Journaled>(&self, state: &D) -> bool {
+        state.changes().owned_by(self.session)
     }
 
     /// Drain this turn's changes and decide what to write. Synchronous in what it
@@ -800,6 +828,8 @@ impl<C: Claim> Versioned<C> {
     ///
     /// # Errors
     ///
+    /// - [`Error::Poisoned`] after an earlier indeterminate write. Nothing is
+    ///   drained.
     /// - [`Error::ForeignChanges`] when `state`'s changes are not this wrapper's
     ///   (never adopted, or adopted by another). Nothing is drained.
     /// - [`Error::TooLarge`] when a turn recorded more changes, or one change was
@@ -808,6 +838,9 @@ impl<C: Claim> Versioned<C> {
     /// - [`Error::SeqExhausted`] when an append would need a position that does
     ///   not exist.
     pub fn stage<D: Journaled>(&mut self, state: &D, when: Compaction) -> Result<Staged<'_, C, D>> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
         // Ownership and exhaustion are checked before anything is drained, so a
         // stage refused for either loses no change.
         let changes = state.changes();
@@ -889,13 +922,22 @@ impl<C: Claim, D: Durable> Staged<'_, C, D> {
     /// told that a retry is safe.
     pub async fn commit(self) -> Result<()> {
         let Self { versioned, step } = self;
+        if versioned.poisoned {
+            return Err(Error::Poisoned);
+        }
         match step {
             Step::Nothing => Ok(()),
             Step::Append(record) => {
                 // Checked before any I/O. Counters move only after the append
                 // resolved, so a refused append leaves them as they were.
                 let seq = versioned.next.ok_or(Error::SeqExhausted)?;
-                versioned.claim.append(seq, &record).await?;
+                if let Err(error) = versioned.claim.append(seq, &record).await {
+                    // The record may be stored. This wrapper is finished: a later
+                    // snapshot would stamp it as contained, and recovery would
+                    // apply it a second time.
+                    versioned.poisoned |= matches!(error, Error::Indeterminate { .. });
+                    return Err(error);
+                }
                 versioned.next = seq.get().checked_add(1).map(Seq::new);
                 versioned.log_bytes += record.len() as u64;
                 Ok(())

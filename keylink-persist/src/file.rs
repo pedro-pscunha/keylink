@@ -78,12 +78,34 @@
 //! is refused as [`Error::TooLarge`] **before any of it is read**, and an
 //! [`append`](Claim::append) that would take the journal past the budget is
 //! refused before it is written, so the adapter never writes a journal it would
-//! refuse to open. The default is [`Files::DEFAULT_RECOVERY_BUDGET`]. Peak memory
-//! during recovery is about twice the journal's size (the file, and the records
-//! copied out of it into the [`Tail`]), so the budget is the number to size a
-//! process by. What the budget does not do is make a journal smaller: a fold that
-//! keeps failing leaves the journal growing until appends are refused at the
-//! budget, and that refusal is the loud failure.
+//! refuse to open. The default is [`Files::DEFAULT_RECOVERY_BUDGET`].
+//!
+//! **It bounds the journal's bytes on the disk, and that is all it bounds.**
+//! Recovery holds the file, and then a `(Seq, Vec<u8>)` for every record it hands
+//! back in the [`Tail`]: a record's descriptor is 32 bytes on a 64-bit target plus
+//! its own allocation, and the smallest record takes 20 on disk, so a journal of
+//! tiny records needs several times its size in memory, not twice. There is no
+//! record-count budget, and nothing here turns the byte budget into a memory
+//! figure. Size a process from the budget and the smallest record you write.
+//! What the budget does not do is make a journal smaller: a fold that keeps
+//! failing leaves the journal growing until appends are refused at the budget,
+//! and that refusal is the loud failure.
+//!
+//! # What reaches the disk, and what the adapter assumes
+//!
+//! A write is durable when the file, and the directory entry that names it, have
+//! been synced. The adapter syncs **the directory that directly contains the
+//! state's files**, after every rename that creates or replaces one and every
+//! time it opens an append handle. It does **not** sync the directories above
+//! that one. [`Files::open`] and the first claim on a state create the root and
+//! the state's directories with `create_dir_all`, and nothing makes those
+//! creations durable, so on a filesystem that needs the parent synced to keep a
+//! new directory, a state's very first write can be lost with its whole
+//! directory in a power cut even though it was acknowledged. The adapter
+//! therefore requires the root to be a durable, already existing directory tree:
+//! create it, and sync it, before the first claim. After that first claim's
+//! directories exist and have been synced by the caller or by an earlier run,
+//! every later write is as durable as this paragraph says.
 //!
 //! # Cancellation does not release the claim early
 //!
@@ -148,6 +170,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{
@@ -179,6 +202,10 @@ impl Files {
 
     /// Store snapshots under `root`, creating it if it is not there.
     ///
+    /// **Creating it does not make it durable.** The root should be a directory
+    /// that already exists and has been synced; see "What reaches the disk" in the
+    /// module header for exactly what this adapter syncs and what it assumes.
+    ///
     /// # Errors
     ///
     /// [`Error::Io`] when the directory cannot be created.
@@ -196,9 +223,11 @@ impl Files {
     /// write one that would be.
     ///
     /// Recovery and [`truncate_before`](Claim::truncate_before) read the whole
-    /// journal into memory, and peak memory is about twice its size. This is the
-    /// number that bounds it. It is counted on the journal file, header and frames
-    /// included: an open of a larger journal is [`Error::TooLarge`] with the file's
+    /// journal into memory. This is the number that bounds how large that journal
+    /// can be on the disk, which is **not** a memory figure: records are held
+    /// again, each with a descriptor and an allocation, and a journal of tiny
+    /// records needs several times its size. It is counted on the journal file,
+    /// header and frames included: an open of a larger journal is [`Error::TooLarge`] with the file's
     /// size as `offered`, decided from its length and **before anything is
     /// read**, and an append that would take the file past it is refused before it
     /// is written.
@@ -308,7 +337,7 @@ impl Snapshots for Files {
         let mut journal = base.into_os_string();
         journal.push(".journal");
         Ok(FileClaim {
-            lock,
+            hold: Hold::new(lock),
             id: id.clone(),
             snapshot: PathBuf::from(snapshot),
             journal: PathBuf::from(journal),
@@ -326,11 +355,11 @@ impl Snapshots for Files {
 /// process ends first.
 #[derive(Debug)]
 pub struct FileClaim {
-    /// The lock file. Its existence *is* the claim, and it is shared with every
-    /// blocking operation in flight (see [`blocking`]): the lock is released when
-    /// the last holder drops it, which is the claim and the last of its
-    /// operations, whichever finishes later.
-    lock: Arc<std::fs::File>,
+    /// The lock file and the flag that says an operation is still running. Both are
+    /// shared with every blocking operation in flight (see [`blocking`]): the lock
+    /// is released when the last holder drops it, which is the claim and the last
+    /// of its operations, whichever finishes later.
+    hold: Hold,
     id: StateId,
     snapshot: PathBuf,
     journal: PathBuf,
@@ -360,22 +389,66 @@ enum Journal {
     Broken,
 }
 
-/// Run blocking work that keeps `lock` alive until it has finished.
+/// What a blocking operation keeps alive until it has finished: the lock that
+/// makes the claim exclusive, and a flag that says one is running.
+#[derive(Debug, Clone)]
+struct Hold {
+    /// Never read. Its existence *is* the claim: the last handle to drop unlocks.
+    _lock: Arc<std::fs::File>,
+    running: Arc<AtomicBool>,
+}
+
+impl Hold {
+    fn new(lock: Arc<std::fs::File>) -> Self {
+        Self {
+            _lock: lock,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Clears [`Hold::running`] when the blocking work ends, however it ends, and
+/// only then lets the lock go: the flag is cleared in `drop`, before the fields.
+struct Running(Hold);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Run blocking work that keeps the claim's lock alive, and the claim busy, until
+/// it has finished.
 ///
-/// **This is what makes cancellation safe.** A blocking closure runs on its own
-/// thread whether or not anyone is still awaiting it, so a caller that is dropped
-/// mid-append drops its [`FileClaim`] while the write may still be queued or
-/// running. If the lock lived only in the claim, a replacement could take it,
-/// recover, acknowledge an append at the same sequence number, and then have the
-/// old append land after it. With the lock moved into the closure the replacement
-/// is [`Error::Busy`] until this returns.
+/// **This is what makes cancellation safe, in two ways.**
+///
+/// A blocking closure runs on its own thread whether or not anyone is still
+/// awaiting it, so a caller that is dropped mid-append drops its [`FileClaim`]
+/// while the write may still be queued or running. If the lock lived only in the
+/// claim, a replacement could take it, recover, acknowledge an append at the same
+/// sequence number, and then have the old append land after it. With the lock
+/// moved into the closure the replacement is [`Error::Busy`] until this returns.
+///
+/// And a caller that is dropped while **keeping** its claim (a `timeout` around a
+/// snapshot store, say) must not be able to start a second operation beside the
+/// first. The `running` flag is set before the work is dispatched and cleared by
+/// the work itself, not by whoever awaits it, so until the cancelled operation has
+/// finished every other operation on this claim is refused. Two writers of one
+/// file are what the claim exists to prevent, and the lock alone only excludes
+/// other claims.
 async fn blocking<T: Send + 'static>(
-    lock: &Arc<std::fs::File>,
+    hold: &Hold,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T> {
-    let held = Arc::clone(lock);
+    if hold.running.swap(true, Ordering::SeqCst) {
+        return Err(Error::Io(std::io::Error::other(
+            "an earlier operation on this claim is still running: its caller was cancelled \
+             before it finished, and the claim stays busy until it has",
+        )));
+    }
+    let running = Running(hold.clone());
     tokio::task::spawn_blocking(move || {
-        let _held = held;
+        let _running = running;
         work()
     })
     .await
@@ -401,16 +474,42 @@ impl Claim for FileClaim {
             });
         }
 
+        // A claim that has had an uncertain write is finished, snapshots included:
+        // storing a state that contains a record nobody can vouch for would stamp
+        // it as contained and then have it replayed on top.
+        if matches!(self.appender, Journal::Broken) {
+            return Err(broken());
+        }
+
         let snapshot = self.snapshot.clone();
         let parent = self.parent.clone();
         let bytes = bytes.to_vec();
+        #[cfg(test)]
+        let paused = pause::Pause::at(&snapshot);
 
-        blocking(&self.lock, move || {
+        let replaced = blocking(&self.hold, move || {
+            #[cfg(test)]
+            paused.wait();
             replace_atomically(&snapshot, &parent, &bytes)
         })
-        .await??;
-
-        Ok(())
+        .await?;
+        match replaced {
+            Ok(()) => Ok(()),
+            Err(Replaced::Failed(err)) => Err(Error::Io(err)),
+            // The new snapshot is visible and its name may not survive a power
+            // cut. It is not "not stored", and it is not "stored": the caller is
+            // told which, and the claim is finished.
+            Err(Replaced::Visible(err)) => {
+                self.appender = Journal::Broken;
+                Err(Error::Indeterminate {
+                    cause: err,
+                    undo: std::io::Error::other(
+                        "the replacement had already been renamed into place, and a rename \
+                         cannot be undone",
+                    ),
+                })
+            }
+        }
     }
 
     async fn append(&mut self, seq: Seq, record: &[u8]) -> Result<()> {
@@ -436,7 +535,7 @@ impl Claim for FileClaim {
         let journal = self.journal.clone();
         let parent = self.parent.clone();
         let budget = self.recovery_budget;
-        let (state, wrote) = blocking(&self.lock, move || {
+        let (state, wrote) = blocking(&self.hold, move || {
             append_blocking(state, &journal, &parent, budget, &frame)
         })
         .await?;
@@ -451,7 +550,7 @@ impl Claim for FileClaim {
         let parent = self.parent.clone();
         let id = self.id.clone();
         let budget = self.recovery_budget;
-        let (state, tail) = blocking(&self.lock, move || {
+        let (state, tail) = blocking(&self.hold, move || {
             recover_blocking(previous, &journal, &parent, &id, from, budget)
         })
         .await?;
@@ -466,7 +565,7 @@ impl Claim for FileClaim {
         let parent = self.parent.clone();
         let id = self.id.clone();
         let budget = self.recovery_budget;
-        let (state, cut) = blocking(&self.lock, move || {
+        let (state, cut) = blocking(&self.hold, move || {
             truncate_blocking(previous, &journal, &parent, &id, seq, budget)
         })
         .await?;
@@ -657,7 +756,7 @@ fn within_budget(journal: &Path, budget: u64) -> Result<Option<u64>> {
 /// acknowledge records against a name a power cut can take back.
 fn open_appender(journal: &Path, parent: &Path) -> std::io::Result<(std::fs::File, u64)> {
     if !journal.try_exists()? {
-        replace_atomically(journal, parent, &journal_header())?;
+        replace_atomically(journal, parent, &journal_header()).map_err(Replaced::into_io)?;
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -689,10 +788,24 @@ fn append_blocking(
 
     let (mut file, committed) = match state {
         Journal::Open { file, committed } => (file, committed),
-        Journal::Closed => match open_appender(journal, parent) {
-            Ok(opened) => opened,
-            Err(err) => return (Journal::Closed, Err(Error::Io(err))),
-        },
+        Journal::Closed => {
+            // Before the journal is created: a budget that cannot hold the header
+            // and this frame would otherwise get a file it then refuses to open.
+            let floor = (JOURNAL_HEADER_LEN + frame.len()) as u64;
+            if floor > budget && !matches!(journal.try_exists(), Ok(true)) {
+                return (
+                    Journal::Closed,
+                    Err(Error::TooLarge {
+                        offered: floor,
+                        limit: budget,
+                    }),
+                );
+            }
+            match open_appender(journal, parent) {
+                Ok(opened) => opened,
+                Err(err) => return (Journal::Closed, Err(Error::Io(err))),
+            }
+        }
         Journal::Broken => return (Journal::Broken, Err(broken())),
     };
 
@@ -726,8 +839,8 @@ fn append_blocking(
                 Err(rollback) => (
                     Journal::Broken,
                     Err(Error::Indeterminate {
-                        append: err,
-                        rollback,
+                        cause: err,
+                        undo: rollback,
                     }),
                 ),
             }
@@ -849,42 +962,160 @@ fn truncate_blocking(
     }
 }
 
+/// Why a replacement did not complete, and what that leaves behind.
+#[derive(Debug)]
+enum Replaced {
+    /// It failed before the rename. The old file is untouched and nothing changed.
+    Failed(std::io::Error),
+    /// The rename happened and the directory sync after it failed. **The new file
+    /// is visible**, and whether its name survives a power cut is unknown.
+    Visible(std::io::Error),
+}
+
+impl Replaced {
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Failed(err) | Self::Visible(err) => err,
+        }
+    }
+}
+
+impl From<Replaced> for Error {
+    fn from(replaced: Replaced) -> Self {
+        Self::Io(replaced.into_io())
+    }
+}
+
+/// A temporary name beside `target` that no other call in this process has used.
+fn temp_path(target: &Path) -> PathBuf {
+    let mut temp = target.to_path_buf().into_os_string();
+    temp.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(temp)
+}
+
+/// The next temporary-file number. Per operation, not per process: two
+/// replacements of one file must never share a temporary inode.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
 /// Replace `target` with `bytes`, so that a crash leaves the old file or the
 /// new one: write a temporary file beside it, put that on the disk, rename it
 /// over the target, and put the rename on the disk.
 ///
 /// Blocking. The one copy of the four steps the module header lists, used by the
 /// snapshot, by the entry log's compaction and by the journal's header and cut.
-fn replace_atomically(target: &Path, parent: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn replace_atomically(
+    target: &Path,
+    parent: &Path,
+    bytes: &[u8],
+) -> std::result::Result<(), Replaced> {
     use std::io::Write as _;
 
-    // The temporary name carries the process id, so two writers that somehow got
-    // past the claim still cannot corrupt each other's temporary file. They would
-    // still race on the rename, which is why the claim exists.
-    let mut temp = target.to_path_buf().into_os_string();
-    temp.push(format!(".tmp.{}", std::process::id()));
-    let temp = PathBuf::from(temp);
+    // The temporary name carries the process id **and an operation number**. The
+    // process id alone made two replacements in one process (a cancelled one
+    // still running, and its successor) write through one inode, so the
+    // survivor's rename could publish bytes the other was still writing.
+    let temp = temp_path(target);
 
     // 1 and 2: write it, then put it on the disk.
-    let mut file = std::fs::File::create(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Replaced::Failed(err));
+    }
 
     // 3: the atomic step. A reader sees the old bytes or the new ones.
     if let Err(err) = std::fs::rename(&temp, target) {
         // Leave nothing behind on a failed replace. The previous file is
         // untouched, which is the promise `store` makes about its own failure.
         let _ = std::fs::remove_file(&temp);
-        return Err(err);
+        return Err(Replaced::Failed(err));
     }
 
     // 4: the step people skip. Without it the rename can be lost to a power cut
     // and the previous file comes back — which is not corruption, but it is
     // weaker than what this module claims. A failure here leaves the new file
     // visible and its name not durable: the journal re-syncs the directory
-    // before it appends again (`open_appender`).
-    sync_dir(parent)
+    // before it appends again (`open_appender`), and a snapshot store reports it
+    // as indeterminate.
+    sync_dir(parent).map_err(Replaced::Visible)
+}
+
+/// Test-only pause points, so a test can hold the real blocking writer of a real
+/// operation at a known place while it cancels the caller.
+#[cfg(test)]
+mod pause {
+    #![allow(clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+
+    /// A place the writer for one path waits at.
+    pub(super) struct Gate {
+        started: Mutex<Sender<()>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    static GATES: Mutex<Option<HashMap<PathBuf, Arc<Gate>>>> = Mutex::new(None);
+
+    /// Pause the next writer for `path`. Returns what tells the test it has
+    /// arrived, and what lets it go.
+    pub(super) fn arm(path: &Path) -> (Receiver<()>, Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(Gate {
+            started: Mutex::new(started_tx),
+            release: Mutex::new(release_rx),
+        });
+        GATES
+            .lock()
+            .expect("not poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), gate);
+        (started_rx, release_tx)
+    }
+
+    /// What a writer carries into its blocking closure.
+    pub(super) struct Pause(Option<Arc<Gate>>);
+
+    impl Pause {
+        /// Taken when the operation is dispatched, so a gate armed afterwards
+        /// does not catch an operation already on its way.
+        pub(super) fn at(path: &Path) -> Self {
+            Self(
+                GATES
+                    .lock()
+                    .expect("not poisoned")
+                    .as_mut()
+                    .and_then(|gates| gates.remove(path)),
+            )
+        }
+
+        /// Report arrival and wait to be released. A no-op without a gate.
+        pub(super) fn wait(&self) {
+            if let Some(gate) = &self.0 {
+                gate.started
+                    .lock()
+                    .expect("not poisoned")
+                    .send(())
+                    .expect("the test is listening");
+                gate.release
+                    .lock()
+                    .expect("not poisoned")
+                    .recv()
+                    .expect("the test releases it");
+            }
+        }
+    }
 }
 
 // ───────────────────────────────────────────── entries, as one append-only log
@@ -1038,34 +1269,27 @@ impl Entries for Files {
     /// Take hold of this state's entry log, creating it if it is not there.
     async fn hold(&self, id: &StateId) -> Result<FileLog> {
         let (lock, base, parent) = self.locked(id).await?;
+        let hold = Hold::new(lock);
         let mut log = base.into_os_string();
         log.push(".log");
         let log = PathBuf::from(log);
 
+        // Through `blocking`, like every other writer: this creates the log and
+        // writes its magic, and a caller cancelled here would otherwise drop the
+        // lock while it ran, letting a second holder initialize the same file.
         let opening = log.clone();
         let creating = parent.clone();
-        let handle = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-            use std::io::Write as _;
-
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(&opening)?;
-            // A fresh log gets its magic, and both the magic and the directory
-            // entry that holds it reach the disk before the first entry does.
-            if file.metadata()?.len() == 0 {
-                file.write_all(&LOG_MAGIC)?;
-                file.sync_all()?;
-                sync_dir(&creating)?;
-            }
-            Ok(file)
+        #[cfg(test)]
+        let paused = pause::Pause::at(&log);
+        let handle = blocking(&hold, move || -> std::io::Result<std::fs::File> {
+            #[cfg(test)]
+            paused.wait();
+            open_log(&opening, &creating)
         })
-        .await
-        .map_err(|join| Error::Io(std::io::Error::other(join)))??;
+        .await??;
 
         Ok(FileLog {
-            lock,
+            hold,
             id: id.clone(),
             log,
             parent,
@@ -1073,6 +1297,32 @@ impl Entries for Files {
             handle: Some(handle),
         })
     }
+}
+
+/// Open the entry log for appending, creating it with its magic when it is not
+/// there, and **put its directory entry on the disk, every time**.
+///
+/// The sync is unconditional for the reason the journal's is: a compaction whose
+/// rename landed and whose directory sync failed leaves a log that is visible and
+/// not yet durable, and the next holder finds it non-empty. Skipping the sync
+/// because the log "already exists" would acknowledge later entries against a name
+/// a power cut can take back.
+fn open_log(log: &Path, parent: &Path) -> std::io::Result<std::fs::File> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(log)?;
+    // A fresh log gets its magic, and the magic reaches the disk before the first
+    // entry does.
+    if file.metadata()?.len() == 0 {
+        file.write_all(&LOG_MAGIC)?;
+        file.sync_all()?;
+    }
+    sync_dir(parent)?;
+    Ok(file)
 }
 
 /// One state's entries, as an append-only log under a held lock.
@@ -1095,9 +1345,9 @@ impl Entries for Files {
 /// and it is why the port says calling it is never required for correctness.
 #[derive(Debug)]
 pub struct FileLog {
-    /// The lock file, shared with every blocking operation in flight for the
-    /// reason [`blocking`] gives.
-    lock: Arc<std::fs::File>,
+    /// The lock file and the running flag, shared with every blocking operation in
+    /// flight for the reason [`blocking`] gives.
+    hold: Hold,
     id: StateId,
     log: PathBuf,
     parent: PathBuf,
@@ -1127,7 +1377,7 @@ impl FileLog {
             )));
         };
 
-        let (file, wrote) = blocking(&self.lock, move || {
+        let (file, wrote) = blocking(&self.hold, move || {
             use std::io::Write as _;
 
             let wrote = file.write_all(&record).and_then(|()| file.sync_data());
@@ -1188,14 +1438,10 @@ impl Held for FileLog {
         // the rename rather than left pointing at an unlinked file.
         let previous = self.handle.take();
 
-        let handle = blocking(&self.lock, move || -> std::io::Result<std::fs::File> {
+        let handle = blocking(&self.hold, move || -> std::io::Result<std::fs::File> {
             drop(previous);
-            replace_atomically(&log, &parent, &rewritten)?;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(&log)
+            replace_atomically(&log, &parent, &rewritten).map_err(Replaced::into_io)?;
+            open_log(&log, &parent)
         })
         .await?;
 
@@ -2437,19 +2683,19 @@ mod tests {
     /// `FileLog` goes through.
     ///
     /// Made red by `scripts/break-once.sh`, deleting `blocking`'s
-    /// `let _held = held;`. Watched: the second claim succeeds while the
+    /// `let _running = running;`. Watched: the second claim succeeds while the
     /// operation is still paused.
     #[tokio::test]
     async fn a_cancelled_caller_does_not_free_the_claim_while_its_operation_runs() {
         let (_scratch, files) = files("cancel").await;
         let claim = files.claim(&id("obra/4471")).await.expect("claims");
-        let lock = Arc::clone(&claim.lock);
+        let hold = claim.hold.clone();
 
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
         let caller = tokio::spawn(async move {
-            blocking(&lock, move || {
+            blocking(&hold, move || {
                 started_tx.send(()).expect("the test is listening");
                 release_rx.recv().expect("the test releases it");
                 finished_tx.send(()).expect("the test is listening");
@@ -2489,6 +2735,226 @@ mod tests {
                 .expect("joins");
         }
         assert!(freed, "the claim is free once the operation is over");
+    }
+
+    /// Wait, off the async threads, for a paused writer to say it has arrived.
+    async fn arrived(started: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || started.recv().expect("the writer arrived"))
+            .await
+            .expect("joins");
+    }
+
+    /// **A cancelled snapshot store leaves the claim it was cancelled on busy.**
+    /// The first store is held in its real blocking writer, its caller is dropped
+    /// (the claim is kept), and a second store is refused instead of starting a
+    /// second writer beside the first. Once the first has finished the claim works
+    /// again, and the last store is the file's content.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `blocking`'s
+    /// `if hold.running.swap(true, Ordering::SeqCst) {` with `if false {`.
+    /// Watched: the second store is accepted while the first is still paused.
+    #[tokio::test]
+    async fn a_cancelled_snapshot_store_leaves_the_retained_claim_busy() {
+        let (scratch, files) = files("cancel-store").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        claim.store(b"zero").await.expect("stores");
+        let snapshot = scratch.0.join("obra").join("4471.snapshot");
+
+        let (started, release) = pause::arm(&snapshot);
+        {
+            let mut first = Box::pin(claim.store(b"first"));
+            let waiting = tokio::spawn(arrived(started));
+            tokio::select! {
+                _ = &mut first => panic!("the writer is paused and cannot have finished"),
+                _ = waiting => {}
+            }
+            // `first` is dropped here: its caller is cancelled, its writer is not.
+        }
+
+        let error = claim
+            .store(b"second")
+            .await
+            .expect_err("the first writer is still running");
+        assert!(
+            matches!(&error, Error::Io(err) if err.to_string().contains("still running")),
+            "got {error:?}"
+        );
+        assert_eq!(std::fs::read(&snapshot).expect("reads"), b"zero");
+
+        release.send(()).expect("the writer is waiting");
+        let mut stored = false;
+        for _ in 0..200_000 {
+            match claim.store(b"third").await {
+                Ok(()) => {
+                    stored = true;
+                    break;
+                }
+                Err(error) if error.to_string().contains("still running") => {}
+                Err(other) => panic!("got {other:?}"),
+            }
+            tokio::task::spawn_blocking(std::thread::yield_now)
+                .await
+                .expect("joins");
+        }
+        assert!(stored, "the claim works again once the writer has finished");
+        assert_eq!(std::fs::read(&snapshot).expect("reads"), b"third");
+        let left: Vec<String> = std::fs::read_dir(scratch.0.join("obra"))
+            .expect("reads")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
+            .collect();
+        assert!(
+            !left.iter().any(|name| name.contains(".tmp.")),
+            "a temporary file survived: {left:?}"
+        );
+    }
+
+    /// Two replacements of one file never share a temporary file, so a survivor's
+    /// rename cannot publish bytes another writer is still producing.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `temp_path`'s
+    /// `NEXT_TEMP.fetch_add(1, Ordering::Relaxed)` with `0`. Watched: the two names
+    /// are equal.
+    #[test]
+    fn two_replacements_in_one_process_use_two_temporary_files() {
+        let target = Path::new("/nowhere/x.snapshot");
+        assert_ne!(temp_path(target), temp_path(target));
+    }
+
+    /// `Files::hold` initializes the log inside the same guarded blocking call as
+    /// every other writer. Its caller is cancelled while the initializer is held,
+    /// and a second holder is `Busy` until it has finished.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `hold`'s
+    /// `let handle = blocking(&hold, move || -> std::io::Result<std::fs::File> {`
+    /// with a raw `tokio::task::spawn_blocking(move || ...` that does not keep the
+    /// lock. Watched: the second `hold` succeeds while the first is paused.
+    #[tokio::test]
+    async fn a_cancelled_hold_does_not_free_the_lock_while_it_initializes_the_log() {
+        let (scratch, files) = files("cancel-hold").await;
+        let log = scratch.0.join("treasury").join("ledger.log");
+        let (started, release) = pause::arm(&log);
+        {
+            let ledger = id("treasury/ledger");
+            let mut first = Box::pin(files.hold(&ledger));
+            let waiting = tokio::spawn(arrived(started));
+            tokio::select! {
+                _ = &mut first => panic!("the initializer is paused"),
+                _ = waiting => {}
+            }
+        }
+
+        let error = files
+            .hold(&id("treasury/ledger"))
+            .await
+            .expect_err("the first initializer is still running");
+        assert!(matches!(error, Error::Busy { .. }), "got {error:?}");
+
+        release.send(()).expect("the initializer is waiting");
+        let mut held = None;
+        for _ in 0..200_000 {
+            if let Ok(log) = files.hold(&id("treasury/ledger")).await {
+                held = Some(log);
+                break;
+            }
+            tokio::task::spawn_blocking(std::thread::yield_now)
+                .await
+                .expect("joins");
+        }
+        assert!(
+            held.is_some(),
+            "the log is free once the initializer is over"
+        );
+        assert_eq!(
+            std::fs::read(&log).expect("reads"),
+            LOG_MAGIC,
+            "the magic was written once"
+        );
+    }
+
+    /// A snapshot whose rename landed and whose directory sync failed is neither
+    /// "stored" nor "not stored": it is `Indeterminate`, the claim is finished, and
+    /// no further store goes through it.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `FileClaim::store`'s
+    /// `Err(Replaced::Visible(err)) => {` arm with one that returns
+    /// `Err(Error::Io(err))`. Watched: the first assertion, "got Io(..)".
+    #[tokio::test]
+    async fn a_snapshot_renamed_into_place_and_not_synced_is_indeterminate() {
+        let (scratch, files) = files("store-visible").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        claim.store(b"before").await.expect("stores");
+        let snapshot = scratch.0.join("obra").join("4471.snapshot");
+
+        // The rename happens in the real directory; the sync is aimed at one that
+        // does not exist.
+        let real = std::mem::replace(&mut claim.parent, scratch.0.join("no-such-directory"));
+        let error = claim.store(b"after").await.expect_err("the sync failed");
+        assert!(
+            matches!(error, Error::Indeterminate { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&snapshot).expect("reads"),
+            b"after",
+            "the replacement is visible, which is why it is not a clean failure"
+        );
+
+        claim.parent = real;
+        let error = claim
+            .store(b"again")
+            .await
+            .expect_err("the claim is finished");
+        assert!(matches!(error, Error::Io(_)), "got {error:?}");
+        assert_eq!(std::fs::read(&snapshot).expect("reads"), b"after");
+    }
+
+    /// A claim whose journal is broken stores no snapshot either.
+    #[tokio::test]
+    async fn a_broken_claim_stores_no_snapshot() {
+        let (scratch, files) = files("store-broken").await;
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+        claim.store(b"before").await.expect("stores");
+        claim.appender = Journal::Broken;
+
+        claim.store(b"after").await.expect_err("poisoned");
+        assert_eq!(
+            std::fs::read(scratch.0.join("obra").join("4471.snapshot")).expect("reads"),
+            b"before"
+        );
+    }
+
+    /// The entry log syncs its directory every time it opens an append handle,
+    /// including for a log that already has entries: a compaction whose rename
+    /// landed and whose sync failed leaves exactly that log.
+    ///
+    /// Made red by `scripts/break-once.sh`, deleting `open_log`'s `sync_dir(parent)?;`.
+    /// Watched: the open through the bad directory succeeds.
+    #[test]
+    fn an_entry_log_that_exists_is_still_synced_before_it_is_appended_to() {
+        let scratch = Scratch::new("log-dir");
+        std::fs::create_dir_all(&scratch.0).expect("creates");
+        let log = scratch.0.join("x.log");
+        std::fs::write(&log, LOG_MAGIC).expect("writes");
+        let nowhere = scratch.0.join("no-such-directory");
+
+        open_log(&log, &nowhere).expect_err("a name that cannot be synced is not appended to");
+        open_log(&log, &scratch.0).expect("and once it can, it is");
+    }
+
+    /// The budget's floor: a journal that could not hold even its header and one
+    /// frame is not created.
+    #[tokio::test]
+    async fn a_budget_too_small_for_the_header_creates_no_journal() {
+        let (scratch, files) = files("budget-floor").await;
+        let files = files.recovery_budget(5);
+        let mut claim = files.claim(&id("obra/4471")).await.expect("claims");
+
+        let error = claim.append(Seq::new(1), b"x").await.expect_err("refused");
+        assert!(matches!(error, Error::TooLarge { .. }), "got {error:?}");
+        assert!(
+            !journal_of(&scratch).exists(),
+            "the refusal must not leave behind a journal the adapter would refuse to open"
+        );
     }
 
     #[test]

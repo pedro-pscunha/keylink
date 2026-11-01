@@ -325,15 +325,26 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// is told anything, so an answered `rpc` is a stored `rpc` — and so is a
 /// `#[defer]` method's parked answer, which waits for the same chain. The
 /// converse matters just as much and is easier to lose: **a turn that was not
-/// answered is not stored either.**
+/// answered is not stored either** — with one exception that is named rather than
+/// hidden, below.
 ///
-/// A `store` that returns `Err` refuses the turn, which ends the actor and
+/// A `store` that returns a clean `Err` refuses the turn, which ends the actor and
 /// hands the caller
 /// [`Withheld::Refused`](crate::Withheld::Refused) — whose text is *"it ran and
 /// was not committed"*, and which crosses the wire to a peer as that same
 /// value, naming `persist`, under the same sentence. That is a promise, and
 /// the only thing the caller has to act on. A caller who believes it replays;
 /// an operator who reads it replays.
+///
+/// **The exception is a write that failed and could not be undone**: an append
+/// whose cut failed, or a snapshot that was renamed into place and whose
+/// directory sync failed. The record or the snapshot may be stored, so *"it was
+/// not committed"* would be false, and a replay would apply it twice. That
+/// outcome ([`keylink_persist::Error::Indeterminate`]) is refused as
+/// [`Stop::indeterminate`], the caller is told
+/// [`Withheld::Indeterminate`](crate::Withheld::Indeterminate), and the store is
+/// finished: nothing more is written through it. The cure is to reopen the state
+/// and look, which a restart does.
 ///
 /// So **this adapter does not write anything on the way out.** It implements
 /// no [`Observer::finish`], and it keeps no flag that would give one something
@@ -734,6 +745,20 @@ where
     /// A handler that recorded a change and then panicked left the state
     /// half-applied. Its changes are drained and thrown away, so a restart
     /// reproduces the state from before the turn and not the half of it.
+    /// Whether this store owns the state's changes, asked before any observer in
+    /// the chain commits. A second journaled store on the same actor fails here, at
+    /// the first turn, with nothing stored by either: its sibling ahead of it in
+    /// the chain has not yet written the turn it would otherwise have written and
+    /// then seen refused.
+    fn prepare(&mut self, state: &D, _turn: TurnInfo<'_>) -> Result<(), Stop> {
+        if self.durable.owns(state) {
+            Ok(())
+        } else {
+            // Fatal: another incarnation would find the same two stores.
+            Err(Stop::fatal(keylink_persist::Error::ForeignChanges))
+        }
+    }
+
     fn after_turn<'a>(&'a mut self, state: &'a D, turn: TurnInfo<'a>) -> TurnFut<'a> {
         let staged = match turn.outcome {
             TurnOutcome::Completed => match self.durable.stage(state, self.strategy.0) {

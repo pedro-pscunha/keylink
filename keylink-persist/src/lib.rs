@@ -225,10 +225,12 @@ pub trait Claim: Send + 'static {
     /// and survives losing the process. A caller may treat a resolved append as a
     /// fact and an unresolved one as nothing at all.
     ///
-    /// **An `Err` leaves the log as it was before the call.** An adapter that
-    /// cannot roll a failed append back must fail every later append instead, so
-    /// that a record a caller was told did not happen is never followed by one
-    /// that did.
+    /// **A clean `Err` leaves the log as it was before the call**, so the turn did
+    /// not happen and a retry is safe. The one exception is
+    /// [`Error::Indeterminate`], below: an append that failed and could not be cut
+    /// back. An adapter that cannot roll a failed append back must return that
+    /// and fail every later operation on the claim, so that a record a caller was
+    /// not told about is never followed by one that was.
     ///
     /// The adapter stores `seq` and never checks it against the one before: the
     /// numbers are the caller's, and [`Versioned`](versioned::Versioned) is what
@@ -1228,26 +1230,42 @@ pub enum Error {
         fault: JournalFault,
     },
 
-    /// An append failed, and the cut that should have undone it failed too: **the
-    /// record may be stored.**
+    /// A write failed, and **what it did cannot be ruled out or undone**: the
+    /// record, or the replacement, may be stored.
     ///
-    /// Distinct from [`Io`](Self::Io) on purpose. A clean `Io` from
-    /// [`Claim::append`] promises the log is as it was before the call, so the
-    /// turn did not happen and a retry is safe. This one promises nothing: the
-    /// record may survive, be replayed on the next recovery, and be applied a
-    /// second time by a caller that retried. An adapter that returns it must also
-    /// fail every later operation on that claim.
+    /// Distinct from [`Io`](Self::Io) on purpose. A clean `Io` from a claim's
+    /// write promises the store is as it was before the call, so the turn did not
+    /// happen and a retry is safe. This one promises nothing, and arises two ways:
+    /// an append failed and the cut that should have undone it failed too, or a
+    /// snapshot was renamed into place and the directory sync after it failed. The
+    /// work may survive, be replayed on the next recovery, and be applied a second
+    /// time by a caller that retried.
     ///
-    /// The right response is to recover and look, not to retry.
+    /// An adapter that returns it must also fail every later operation on that
+    /// claim, and [`Versioned`](versioned::Versioned) does the same for itself
+    /// ([`Poisoned`](Self::Poisoned)). The right response is to reopen and look,
+    /// not to retry.
     #[error(
-        "the append failed ({append}) and could not be rolled back ({rollback}): the record may be stored"
+        "the write failed ({cause}) and could not be undone ({undo}): what it wrote may be stored"
     )]
     Indeterminate {
-        /// Why the append failed.
-        append: std::io::Error,
-        /// Why undoing it failed.
-        rollback: std::io::Error,
+        /// Why the write failed.
+        cause: std::io::Error,
+        /// Why undoing it failed, or why it cannot be undone.
+        undo: std::io::Error,
     },
+
+    /// An earlier write on this state was [`Indeterminate`](Self::Indeterminate),
+    /// so nothing more is written through the same handle.
+    ///
+    /// Storing a state that contains a record nobody can vouch for would stamp it
+    /// as already contained in the snapshot, and the next recovery would then
+    /// apply it over its own effect. Reopen the state: recovery decides what is
+    /// stored.
+    #[error(
+        "an earlier write on this state was indeterminate: reopen it to find out what is stored"
+    )]
+    Poisoned,
 
     /// A journaled state's changes belong to another persistence session.
     ///

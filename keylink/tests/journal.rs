@@ -324,8 +324,8 @@ impl Claim for MemoryClaim {
         }
         if std::mem::take(&mut inner.indeterminate) {
             return Err(Error::Indeterminate {
-                append: std::io::Error::other("the log said no, once"),
-                rollback: std::io::Error::other("and could not take it back"),
+                cause: std::io::Error::other("the log said no, once"),
+                undo: std::io::Error::other("and could not take it back"),
             });
         }
         inner.written += record.len() as u64;
@@ -551,7 +551,10 @@ async fn an_append_that_cannot_be_undone_is_reported_as_indeterminate_to_the_cal
 ///
 /// Made red by `scripts/break-once.sh`, replacing `Opened::start_from`'s
 /// `self.saver.durable.adopt(&state)?;` with `let _ = self.saver.durable.adopt(&state);`.
-/// Watched: the second `start_from` succeeds.
+/// Watched: the second `start_from` succeeds. And by deleting `Persist`'s
+/// `prepare` (so ownership is only found by `after_turn`): the first store writes
+/// the turn the caller is then told was refused, and the `written` assertion
+/// fails.
 #[tokio::test]
 async fn a_journaled_state_cannot_have_two_stores() {
     let first = Memory::default();
@@ -594,6 +597,20 @@ async fn a_journaled_state_cannot_have_two_stores() {
         shelf.add(1).await.is_err(),
         "the second store does not own this state's changes"
     );
+
+    // **And the refusal means what it says.** The first store was ahead of the
+    // second in the chain, and the caller was told the turn was not committed: it
+    // must not have written it. Both stores are asked before either writes.
+    assert_eq!(
+        (first.written(), first.stores()),
+        (0, 0),
+        "a turn refused for ownership was committed by the store ahead of the refuser"
+    );
+    assert_eq!(second.written(), 0);
+    match shelf.ended().await {
+        Ended::Observer { name, fatal, .. } => assert_eq!((name, fatal), ("persist", true)),
+        other => panic!("got {other:?}"),
+    }
 }
 
 /// A journaled state that is persisted whole never records, so its buffer cannot

@@ -33,7 +33,7 @@
 use keylink_persist::file::{FileClaim, Files};
 use keylink_persist::versioned::{Compaction, FrameFault, Snapshot, Versioned, FRAME_LEN};
 use keylink_persist::{
-    Changes, Claim, Durable, Error, Journaled, RestoreError, Seq, Snapshots, StateId,
+    Changes, Claim, Durable, Error, Journaled, RestoreError, Seq, Snapshots, StateId, Tail,
 };
 
 // ────────────────────────────────────────────── three versions of one ledger
@@ -1217,7 +1217,9 @@ async fn a_change_buffer_has_one_owner() {
 /// Made red by `scripts/break-once.sh`, replacing `Versioned::open`'s
 /// `.checked_add(1).ok_or(Error::SeqExhausted)?` with `.wrapping_add(1)` — the
 /// wrap the review named. Watched: the open of the exhausted state is not refused
-/// and cuts the torn tail it was meant to leave alone.
+/// and cuts the torn tail it was meant to leave alone. And by deleting `store`'s
+/// `if self.next.is_none() {` guard: the snapshot that could never be reopened is
+/// accepted.
 #[tokio::test]
 async fn the_last_sequence_number_is_used_once_and_never_wrapped() {
     // ── a snapshot that already contains the last number
@@ -1282,5 +1284,148 @@ async fn the_last_sequence_number_is_used_once_and_never_wrapped() {
         pending(&ledger),
         "Changes { owned: true, pending: 1 }",
         "a refused stage drains nothing"
+    );
+
+    // A snapshot would contain the last number there is, and the state could then
+    // never be reopened: refused before it is written.
+    let stored = versioned.store(&Snapshot::of(&ledger)).await;
+    assert!(matches!(stored, Err(Error::SeqExhausted)), "got {stored:?}");
+    drop(versioned);
+    let reopened = replayed(&files)
+        .await
+        .expect("the exhausted log still opens");
+    assert_eq!(reopened.expect("stored").entries, vec![1, 2]);
+}
+
+// ─────────────────────────────────────── after an indeterminate write, nothing more
+
+/// A claim over memory shared with the test, whose next append can be made to
+/// **store the record and then report that it cannot say so**: the case where
+/// the uncertain write did survive.
+#[derive(Clone, Default)]
+struct Shared {
+    inner: std::sync::Arc<std::sync::Mutex<SharedInner>>,
+}
+
+#[derive(Default)]
+struct SharedInner {
+    snapshot: Option<Vec<u8>>,
+    log: Vec<(Seq, Vec<u8>)>,
+    indeterminate: bool,
+}
+
+struct SharedClaim(Shared);
+
+impl Claim for SharedClaim {
+    async fn load(&self) -> keylink_persist::Result<Option<Vec<u8>>> {
+        Ok(self.0.inner.lock().expect("not poisoned").snapshot.clone())
+    }
+
+    async fn store(&mut self, bytes: &[u8]) -> keylink_persist::Result<()> {
+        self.0.inner.lock().expect("not poisoned").snapshot = Some(bytes.to_vec());
+        Ok(())
+    }
+
+    async fn append(&mut self, seq: Seq, record: &[u8]) -> keylink_persist::Result<()> {
+        let mut inner = self.0.inner.lock().expect("not poisoned");
+        inner.log.push((seq, record.to_vec()));
+        if std::mem::take(&mut inner.indeterminate) {
+            return Err(Error::Indeterminate {
+                cause: std::io::Error::other("the write failed"),
+                undo: std::io::Error::other("and could not be undone"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn recover(&mut self, from: Seq) -> keylink_persist::Result<Tail> {
+        let inner = self.0.inner.lock().expect("not poisoned");
+        Ok(Tail {
+            earlier: inner.log.iter().filter(|(seq, _)| *seq < from).count() as u64,
+            records: inner
+                .log
+                .iter()
+                .filter(|(seq, _)| *seq >= from)
+                .cloned()
+                .collect(),
+            torn: None,
+        })
+    }
+
+    async fn truncate_before(&mut self, seq: Seq) -> keylink_persist::Result<()> {
+        self.0
+            .inner
+            .lock()
+            .expect("not poisoned")
+            .log
+            .retain(|(found, _)| *found >= seq);
+        Ok(())
+    }
+}
+
+/// **An indeterminate append finishes the wrapper.** The uncertain record
+/// survived (it is in the log at position 2), the live state contains its effect,
+/// and a snapshot stored now would stamp that effect as contained while the record
+/// stayed in the log: recovery would apply it a second time. So no snapshot and
+/// no staged turn goes through the wrapper after it, and a reopen applies the
+/// record exactly once.
+///
+/// Made red by `scripts/break-once.sh`, deleting `Versioned::store`'s
+/// `if self.poisoned {` guard (replacing the condition with `false`). Watched:
+/// the store is accepted ("got Ok(())") and the reopen would have the third
+/// entry twice.
+#[tokio::test]
+async fn an_indeterminate_append_finishes_the_wrapper_and_recovery_applies_it_once() {
+    let shared = Shared::default();
+    let (_, mut versioned) = Versioned::open::<Journal>(SharedClaim(shared.clone()))
+        .await
+        .expect("opens")
+        .replayed()
+        .expect("replays");
+    let mut ledger = Journal::default();
+    versioned.adopt(&ledger).expect("adopts");
+    let big = Compaction::new(std::num::NonZeroU32::MAX, u64::MAX);
+
+    async fn turn(
+        versioned: &mut Versioned<SharedClaim>,
+        ledger: &mut Journal,
+        entry: u64,
+        when: Compaction,
+    ) -> keylink_persist::Result<()> {
+        ledger.apply(Posted(entry));
+        ledger.changes.record(Posted(entry));
+        versioned.stage(ledger, when)?.commit().await
+    }
+
+    turn(&mut versioned, &mut ledger, 1, big)
+        .await
+        .expect("the first snapshot");
+    turn(&mut versioned, &mut ledger, 2, big)
+        .await
+        .expect("an append");
+
+    shared.inner.lock().expect("not poisoned").indeterminate = true;
+    let error = turn(&mut versioned, &mut ledger, 3, big)
+        .await
+        .expect_err("indeterminate");
+    assert!(
+        matches!(error, Error::Indeterminate { .. }),
+        "got {error:?}"
+    );
+
+    let stored = versioned.store(&Snapshot::of(&ledger)).await;
+    assert!(matches!(stored, Err(Error::Poisoned)), "got {stored:?}");
+    let staged = versioned.stage(&ledger, big);
+    assert!(matches!(staged, Err(Error::Poisoned)), "got {staged:?}");
+
+    let (reopened, _) = Versioned::open::<Journal>(SharedClaim(shared))
+        .await
+        .expect("opens")
+        .replayed()
+        .expect("replays");
+    assert_eq!(
+        reopened.expect("stored").entries,
+        vec![1, 2, 3],
+        "the record that may have been stored is applied once"
     );
 }
