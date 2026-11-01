@@ -283,10 +283,10 @@ description = "Every test once, with native integration suites sharing one proce
 #
 # `gate-tests/gate.rs` is the middle ground: ordinary native integration files
 # remain independently runnable, while this command includes the safe ones as
-# modules in one libtest process. Five suites stay separate: two use process-wide
-# measurements, drift runs nested Cargo, `keyed_topic_allocation` owns a
-# process-global allocator, and reliable needs scheduling-sensitive handshake
-# evidence. The manifest marks the aggregate `test = false`, so an ordinary
+# modules in one libtest process. Six suites stay separate: two use process-wide
+# measurements, drift runs nested Cargo, `keyed_topic_allocation` and
+# `grant_allocation` own a process-global allocator, and reliable needs
+# scheduling-sensitive handshake evidence. The manifest marks the aggregate `test = false`, so an ordinary
 # `cargo test` does not run everything twice. Its inventory test fails if a test
 # file is omitted or an isolated suite loses its exact native/browser selector.
 #
@@ -296,7 +296,7 @@ description = "Every test once, with native integration suites sharing one proce
 # exceptional selection. `--no-fail-fast` reports later targets after one fails.
 # Doctests need their own command whenever Cargo target selectors are present.
 run = [
-    "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test keyed_topic_allocation --test mailbox_latency --test reliable --no-fail-fast",
+    "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test grant_allocation --test keyed_topic_allocation --test mailbox_latency --test reliable --no-fail-fast",
     "cargo test --workspace --exclude keylink --test '*' --no-fail-fast",
     "cargo test --workspace --doc --no-fail-fast",
 ]
@@ -331,6 +331,7 @@ run = [
     "cargo run -p keylink --example waypoint",
     "cargo run -p keylink --example wire_contract",
     "cargo run -p keylink --example fault_lines",
+    "cargo run -p keylink --example closure_share",
     # The one example that is not at default features. `blobs-fs` is off by
     # default and `required-features` makes cargo SKIP the target rather than
     # build it, so without this flag the line below would run nothing and say
@@ -339,6 +340,14 @@ run = [
     { task = "http-smoke" },
     { task = "http-smoke-full" },
 ]
+
+[tasks.closure-300k]
+description = "NOT in `gate`: fetch a 300,000-member closure with alternating gaps (100 to 266 s)"
+# The gate runs the same case at 3 * 4096 + 1 members, which crosses several fetch
+# windows. This is the large one, kept out of it for its cost and run by hand
+# when the closure fetch changes: `--ignored` selects it and `--exact` makes the
+# name a whole-name match, so it runs this test and nothing else.
+run = "cargo test -p keylink --test blobs a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched -- --ignored --exact"
 
 # ── documentation ───────────────────────────────────────────────────────────
 

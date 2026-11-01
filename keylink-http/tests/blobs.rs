@@ -9,7 +9,7 @@
 use axum::{middleware, response::Response, Router};
 use http::Request;
 use iroh::{endpoint::presets, Endpoint};
-use keylink::{Allowlist, BlobId, Blobs, Context, Node};
+use keylink::{Allowlist, BlobId, Blobs, Context, Grant, Node};
 use keylink_http::{
     Access, AccessError, Addressing, Call, Challenge, Gateway, HttpSurface, Principal,
     StreamingLimits,
@@ -40,12 +40,12 @@ struct Handler {
 }
 
 impl vault::Handler for Handler {
-    async fn fetch(&self, _cx: &Context, name: String) -> (u64, BlobId) {
+    async fn fetch(&self, _cx: &Context, name: String) -> (u64, Grant) {
         let (id, size) = self.known.get(&name).copied().expect("a known name");
-        (size, id)
+        (size, id.into())
     }
 
-    async fn absent(&self, cx: &Context, name: String) -> (u64, BlobId) {
+    async fn absent(&self, cx: &Context, name: String) -> (u64, Grant) {
         self.fetch(cx, name).await
     }
 }
@@ -124,9 +124,20 @@ fn challenge() -> Challenge {
 }
 
 async fn start_with(limits: StreamingLimits) -> Running {
+    start_with_grant_limit(limits, None).await
+}
+
+/// The same, over a store whose grant ledger holds `limit` grants.
+async fn start_with_grant_limit(
+    limits: StreamingLimits,
+    limit: Option<std::num::NonZeroUsize>,
+) -> Running {
     let server_node = local_node().await;
     let client_node = local_node().await;
     let blobs = Blobs::memory();
+    if let Some(limit) = limit {
+        blobs.set_grant_limit(limit);
+    }
     let content = payload(SPANNING);
 
     let mut known = std::collections::HashMap::new();
@@ -624,6 +635,35 @@ async fn blob_lookup_returns_exact_value_location_and_no_fetch() {
         SPANNING.to_string(),
         "the declared value, and nothing else"
     );
+}
+
+/// Review finding 9. A full grant ledger is a capacity condition, and the
+/// gateway reports it as one (`503 upstream_unavailable`, as for the other
+/// capacity refusals) and not as a broken upstream (`502`).
+///
+/// The limit is one grant, and the gateway has one peer. The first
+/// lookup takes it; the second is a different blob and does not fit.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK60`) by replacing
+/// `| keylink::RemoteError::GrantsExhausted { .. }`
+/// with nothing, in `keylink-http/src/error.rs`: the refusal then falls to the
+/// catch-all and the second lookup is a `502`.
+#[tokio::test]
+async fn a_full_grant_ledger_is_a_503_and_not_a_502() {
+    let one_grant = std::num::NonZeroUsize::new(1).expect("non-zero");
+    let running = start_with_grant_limit(limits(), Some(one_grant)).await;
+
+    let first = running.lookup("datasheet").await;
+    assert_eq!(
+        first.status(),
+        http::StatusCode::CREATED,
+        "control: it fits"
+    );
+
+    let second = running.lookup("tiny").await;
+    assert_eq!(second.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = second.text().await.expect("a body");
+    assert!(body.contains("upstream_unavailable"), "{body}");
 }
 
 /// A range header on a lookup names nothing, and is ignored rather than

@@ -56,11 +56,12 @@ use crate::error::ConfigError;
 // `tests/api.rs` that writes it from a consumer's position. An in-crate
 // `crate::Keyable` would make the library itself the thing that fails when the
 // re-export goes, which would leave that test proving nothing.
+use crate::blobs::{Fence, Permit};
 use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
-    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, CallId,
+    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, Blobs, Body, BodyReader, CallId, Content,
     Context, Error, Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState,
     Middleware, Next, Node, Outcome, RemoteError, Result, Rpc, WireRequest, WireResponse,
 };
@@ -629,7 +630,7 @@ async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
     required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
     keys: Keys,
-    blobs: Option<Blobs>,
+    grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
     mut send: SendStream,
     recv: RecvStream,
@@ -706,28 +707,35 @@ where
         Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
     };
 
+    // The fence in `grants` was taken when this stream was accepted, before the
+    // request was read or the key claimed, so a revoke that lands at any point
+    // after that reaches the grant this call is about to make.
     let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
 
-    // The grant is recorded BEFORE the reply is written, and that order is the
-    // whole property: the address reaches the caller only in this reply, so a
-    // peer cannot race ahead and fetch content it has not been told about.
+    // The grant is reserved BEFORE the reply is encoded and made live BEFORE it
+    // is written, and that order is the whole property: the address reaches the
+    // caller only in this reply, so a peer cannot race ahead and fetch content
+    // it has not been told about.
     //
     // This is also the only place both halves exist. The handler returned the
-    // id and knows nothing about peers; `accept` proved the peer and knows
-    // nothing about ids. Neither could record this on its own, which is why the
-    // reply carries the address back here through `Granting` rather than the
-    // store being threaded down into dispatch.
+    // content and knows nothing about peers; `accept` proved the peer and knows
+    // nothing about content. Neither could record this on its own, which is why
+    // the reply carries the content back here through `Granting` rather than
+    // the store being threaded down into dispatch.
     //
-    // **Read here and recorded after the ledger settles**, which is a
-    // consequence of a durable ledger being able to refuse. A grant written
-    // above and a record refused below would leave the far side holding a live
-    // grant for an address this reply never carried — reachable only since
-    // `record` gained a failure, and closed by moving the write rather than by
-    // narrowing it.
-    let granting = match (&blobs, &outcome) {
-        (Some(_), Outcome::Ok(response)) => response.granted(),
-        _ => None,
-    };
+    // **Two phases, because the ledger can refuse and a durable idempotency
+    // ledger can too.** Reserving is where the byte budget answers: a reply that
+    // cannot be granted is replaced by `GrantsExhausted` before it is encoded, so
+    // the caller is never handed an address it cannot spend, and that refusal is
+    // what a keyed retry replays. Committing waits for the idempotency ledger to
+    // settle, because a grant made live above and a record refused below would
+    // leave the far side holding a live grant for an address this reply never
+    // carried. An early return drops the permit, which releases the reservation.
+    let (outcome, permit) = grant_or_refuse(
+        grants.as_ref().map(|(blobs, fence)| (blobs, fence)),
+        &admitted,
+        outcome,
+    );
 
     let frame = wire::encode_header(
         body.declared_len(),
@@ -773,13 +781,36 @@ where
             Reached::Dispatched => drop(guard),
         }
     }
-    if let (Some(blobs), Some(id)) = (&blobs, granting) {
-        blobs.grant(&admitted, id);
+    if let Some(permit) = permit {
+        permit.commit();
     }
     wire::write_frame(&mut send, frame).await?;
     body.write_to(&mut send).await?;
     send.finish()?;
     Ok(())
+}
+
+/// Reserve the grant a successful reply carries, or turn the reply into the
+/// refusal that says the ledger is full.
+///
+/// A blob reply carries `Body::empty()`, so replacing its outcome needs no body
+/// handling.
+fn grant_or_refuse<Resp: Granting>(
+    store: Option<(&Blobs, &Fence)>,
+    admitted: &AdmittedPeer,
+    outcome: Outcome<Resp>,
+) -> (Outcome<Resp>, Option<Permit>) {
+    let content = match &outcome {
+        Outcome::Ok(response) => response.granted(),
+        Outcome::Err(_) => None,
+    };
+    let (Some((blobs, fence)), Some(content)) = (store, content) else {
+        return (outcome, None);
+    };
+    match blobs.reserve(admitted, content, fence) {
+        Ok(permit) => (outcome, Some(permit)),
+        Err(refused) => (Outcome::Err(crate::blobs::refusal(&refused)), None),
+    }
 }
 
 /// Tell "your peer runs a different schema" apart from "the network is down".
@@ -859,11 +890,24 @@ where
 
             match accepted {
                 Ok(Stream::Bi((send, recv))) => {
+                    // Fenced here and not inside the spawned task, which may not
+                    // run until after a revoke has. A call arriving on a
+                    // connection that has been closed since it was admitted
+                    // (the first step of removing a peer) is dropped unread.
+                    let grants = match self.blobs.clone() {
+                        None => None,
+                        Some(blobs) => {
+                            match blobs.fence(&admitted, || connection.close_reason().is_none()) {
+                                Ok(fence) => Some((blobs, fence)),
+                                Err(_) => continue,
+                            }
+                        }
+                    };
                     calls.spawn(serve_one(
                         self.next.clone(),
                         self.required_authorization.clone(),
                         self.keys.clone(),
-                        self.blobs.clone(),
+                        grants,
                         admitted,
                         send,
                         recv,
@@ -2113,8 +2157,8 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// case that would break it.
     #[doc(hidden)]
     #[must_use]
-    pub fn blob_handle(&self, id: BlobId) -> BlobHandle {
-        BlobHandle::on(self.endpoint.clone(), self.conn.remote_id(), id)
+    pub fn blob_handle(&self, content: Content) -> BlobHandle {
+        BlobHandle::on(self.endpoint.clone(), self.conn.remote_id(), content)
     }
 
     /// Scope this client to one idempotency key, so a call it makes runs at
@@ -2228,8 +2272,8 @@ impl<Req, Resp> IdempotentClient<Req, Resp> {
     /// [`RpcClient::blob_handle`].
     #[doc(hidden)]
     #[must_use]
-    pub fn blob_handle(&self, id: BlobId) -> BlobHandle {
-        self.inner.blob_handle(id)
+    pub fn blob_handle(&self, content: Content) -> BlobHandle {
+        self.inner.blob_handle(content)
     }
 }
 

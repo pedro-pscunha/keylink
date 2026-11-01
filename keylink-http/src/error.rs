@@ -192,9 +192,10 @@ impl GatewayError {
                 keylink::RemoteError::Unauthorized(_) => Self::Forbidden,
                 keylink::RemoteError::TimedOut { .. } => Self::UpstreamTimeout,
                 keylink::RemoteError::NoSuchActor { .. } => Self::ActorNotFound,
-                keylink::RemoteError::AtCapacity { .. } | keylink::RemoteError::MailboxFull => {
-                    Self::UpstreamUnavailable
-                }
+                keylink::RemoteError::AtCapacity { .. }
+                | keylink::RemoteError::MailboxFull
+                | keylink::RemoteError::GrantsExhausted { .. }
+                | keylink::RemoteError::GrantsWithdrawn => Self::UpstreamUnavailable,
                 keylink::RemoteError::Idempotency(refusal) => match refusal {
                     keylink::IdempotencyRefusal::Malformed(_) => Self::InvalidIdempotencyKey,
                     keylink::IdempotencyRefusal::NotKeyable { .. } => Self::IdempotencyNotSupported,
@@ -442,6 +443,14 @@ mod tests {
             ),
             (
                 Error::Remote(RemoteError::AtCapacity { capacity: 7 }),
+                GatewayError::UpstreamUnavailable,
+            ),
+            (
+                Error::Remote(RemoteError::GrantsExhausted { limit: 7 }),
+                GatewayError::UpstreamUnavailable,
+            ),
+            (
+                Error::Remote(RemoteError::GrantsWithdrawn),
                 GatewayError::UpstreamUnavailable,
             ),
             (

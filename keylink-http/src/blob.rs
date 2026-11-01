@@ -1,4 +1,8 @@
 //! Byte-resource tickets: which principal may fetch which content.
+//!
+//! A ticket is minted from [`keylink::BlobHandle::id`], which is the root. Over
+//! HTTP a [`keylink::Content::Closure`] therefore reads as its member list, and
+//! its members cannot be reached through the gateway.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError};

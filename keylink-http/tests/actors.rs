@@ -54,8 +54,8 @@ impl ledger::Actor for Book {
         self.ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 
-    async fn take(&mut self, _cx: Caller<'_>) -> (u64, BlobId) {
-        (self.blob.1, self.blob.0)
+    async fn take(&mut self, _cx: Caller<'_>) -> (u64, keylink::Grant) {
+        (self.blob.1, self.blob.0.into())
     }
 
     async fn read(&mut self, _cx: Caller<'_>, chunks: u64) -> (String, keylink::Body) {

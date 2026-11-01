@@ -38,7 +38,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Node, Server};
+use keylink::{
+    Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Grant, Node, Server,
+};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -92,12 +94,12 @@ struct Depot {
 }
 
 impl depot::Handler for Depot {
-    async fn image(&self, _cx: &Context, channel: String) -> (Release, BlobId) {
+    async fn image(&self, _cx: &Context, channel: String) -> (Release, Grant) {
         let (version, id) = match channel.as_str() {
             "beta" => (91, self.beta),
             _ => (90, self.stable),
         };
-        (Release { channel, version }, id)
+        (Release { channel, version }, id.into())
     }
 
     async fn diagnostics(&self, _cx: &Context, device: String, mut body: BodyReader) -> Receipt {

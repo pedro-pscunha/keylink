@@ -2181,7 +2181,29 @@ ANCHORS = [
     ("HK5", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if self.emitted == self.len {"),
     ("HK6", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
-     "    if !msg.request.ranges.is_blob() {"),
+     "    if msg.request.ranges.is_blob() {"),
+    ("HK50", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    if scope != Scope::Closure {"),
+    ("HK52", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            if book.grants >= book.limit {"),
+    ("HK53", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if entry.committed.is_none() && entry.pending == 0 {"),
+    ("HK60", "keylink-http/tests/blobs.rs", "keylink-http/src/error.rs",
+     "                | keylink::RemoteError::GrantsExhausted { .. }"),
+    ("HK63", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+    ("HK62", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+    ("HK59", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if grants.knows(&peer) {"),
+    ("HK57", "keylink/tests/grant_allocation.rs", "keylink/src/blobs.rs",
+     "            self.map.shrink_to_fit();"),
+    ("HK56", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    size.is_multiple_of(32) && furthest <= size / 32"),
+    ("HK55", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            flight.epoch += 1;"),
+    ("HK54", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            entry.committed = entry.committed.max(Some(self.scope));"),
     ("HK7", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
      "        while let Some(chunk) = self.next_chunk().await? {"),
     ("HK8", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
@@ -4002,7 +4024,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 338
+RECORD_BLOCKS = 352
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

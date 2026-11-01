@@ -1356,3 +1356,157 @@ Section 4.4 records the last two.
 
 Plus a `blobs-fs` cargo feature, and `iroh-blobs` with
 `default-features = false`.
+
+## 13. Closure grants, revocation, and the end of `MAX_GRANTS`
+
+Appended. Sections 5.7 and 9 (Risk 3) above record what was believed when they
+were written, and they are not edited. This section says what replaced them and why.
+
+### 13.1 What §5.7 and Risk 3 left open
+
+The ledger kept 4096 `(peer, hash)` pairs and evicted the oldest across every
+peer. Nothing revoked a grant. That bound was a judgement, not a measurement, and
+it failed in two ways. A peer fetching a tree of more than 4096 blobs needed more
+grants than the ledger would hold. And an evicted grant took its capability with it
+without anybody deciding to withdraw it, so a peer could lose access because
+another peer was busy.
+
+### 13.2 Decisions
+
+1. **A grant is `(peer, root, scope)`, and the scope is `Blob` or `Closure`.** A
+   closure grant admits any `GetRequest` whose hash is the root, with any ranges.
+   That is safe because iroh-blobs serves exactly the members the holder's own copy
+   of the root lists, by offset. A requester names offsets, never hashes. Admission
+   reads nothing from the store, so it costs the same for 5 members and for 50,000.
+2. **A member is reached through its root, by index.** A request for member *i* is
+   `GetRequest { hash: root, ranges: [empty, ..., ranges at offset i + 1] }`. A bare
+   request for a member by its own hash is refused unless that member was granted on
+   its own. Admitting a bare member would need a reverse index from member to roots,
+   which grows with the total number of chunks. That is the cost this change removes.
+3. **Nested sequences are not followed.** The HashSeq format does not say which
+   children are sequences. Treating "parses as a sequence" as intent is the alignment
+   hole §5.7 already closed for `Blob` grants: any 32-aligned member would grant every
+   hash its bytes spell. A tree with sub-sequences is flattened into one sequence.
+4. **An iroh-blobs `Collection` needs no special case.** Its root is a HashSeq whose
+   child 0 is the metadata blob, so a closure grant on it covers both. keylink adds no
+   `Collection` type, because iroh-blobs calls that format subject to change.
+5. **Have/want is computed in the fetcher's own store.** `fetch_into` fetches the
+   root alone when the store lacks it, then fetches the sequence, and iroh-blobs asks
+   only for the members the store does not hold. Fetching the sequence in one request
+   would send the whole closure when the root is absent, because the fetcher cannot
+   know what it holds until it holds the list. `Blobs::missing` answers the same
+   question without the network. The holder's grant is its claim that it has the
+   closure. GetMany and Observe stay refused, because no caller uses either.
+6. **Revocation is explicit.** `revoke(peer, root)`, `revoke_peer(peer)` and
+   `revoke_everywhere(root)`. The per-root calls refuse the next request and let one
+   already admitted run to completion. `revoke_peer` also closes that peer's live
+   blobs connections, so a transfer in flight stops. Nothing recalls bytes already
+   delivered.
+7. **The bound is bytes, and it fails loudly.** Each grant is charged `GRANT_COST`
+   and each peer `PEER_COST` against `GRANT_BUDGET` (64 MiB). A grant past the budget
+   is answered `RemoteError::GrantsExhausted` and nothing is evicted. Grants do not
+   expire: a clock would drop capabilities silently, which is the failure eviction had.
+8. **A grant is made in two steps.** The ledger reserves it before the reply is
+   encoded, so a full ledger replaces the reply and the caller is never handed an
+   address it cannot spend. It commits once the idempotency ledger has settled, so a
+   refused record leaves no live grant behind. A generation number on each entry stops
+   a reservation from before a revoke from reviving a grant made after it.
+
+### 13.3 Risks and what is not possible
+
+- **A closure authorizes every hash its sequence lists.** If an application builds a
+  granted sequence from hashes a peer supplied, that peer can list any hash the store
+  holds and read it. `SeqId` stops the accidental form (a closure over uploaded bytes)
+  and not this one. The rule is in the `Blobs::add_seq` documentation.
+- **The request cap.** iroh-blobs refuses a request over 1 MiB. An estimate, not
+  measured: a closure of about 150,000 members with scattered gaps can pass it. The fix,
+  if it happens, is to split the second fetch into windows of indices.
+- **Fetcher memory.** During the second fetch iroh-blobs keeps about 100 bytes per
+  member for the length of the fetch. That is the fetcher's memory, not admission's.
+- **`GRANT_COST` and `PEER_COST` are derived from `size_of`, not measured.** A
+  counting-allocator test could pin them.
+- **Restarts.** Grants die with the process while a durable idempotency record
+  survives. A replay after a restart carries an address with no grant, and the fetch is
+  refused. That predates this change.
+- **Removing a peer from an `Allowlist` or `DynamicAdmission` does not touch its blob
+  grants.** The ledger is per node and does not record which service granted what.
+  Drop the peer from admission, then call `revoke_peer`.
+- **Not possible within these bounds:** admitting a bare member by its own hash with
+  constant memory per closure; stopping one admitted request without closing its
+  connection (the only per-transfer hook costs a round trip per 16 KiB); recalling
+  bytes already delivered.
+
+### 13.4 Rejected
+
+- **A membership index so a bare member is admitted.** See decision 2. It also adds
+  state that must be kept in step with revocation, and no have/want caller needs it.
+- **A second macro kind `closure F() -> R` with its own handle.** It doubles every
+  `blob` arm in the macros, the HTTP gateway and OpenAPI, and the two handles would
+  differ in one method's behaviour. The scope belongs to the value a handler returns,
+  not to the method's name. One kind returns `Content`.
+- **Expiring idle grants.** It drops capabilities silently, it needs a sweep, and with
+  explicit revocation and a budget that fails loudly it buys nothing.
+
+### 13.5 Corrections found at the merge gate
+
+Appended. The text above stays as it was written; these are the places where it was wrong.
+
+**13.5.1 `SeqId` did not stop a peer choosing a closure.** §13.3 says `SeqId` "stops the accidental form (a closure over uploaded bytes)". It did not. `SeqId` derived `Deserialize`, so a handler that took a `SeqId` as an argument and returned it granted a closure over whatever bytes the peer had uploaded, with no call to `Blobs::add_seq`. The same was true of `Content`, which is deserializable because the caller reads it off every reply.
+
+The shape that replaced it: `SeqId` has no serde and no `Schema`, and its only constructor is `Blobs::add_seq`. `Content` is the wire value and is `Content::Blob(BlobId)` or `Content::Closure(BlobId)`, where naming a closure grants nothing. A handler returns a `Grant`, which converts from a `BlobId` or a `SeqId` and from nothing else, so the only closures a handler can grant are sequences this node built. The conversions that would reopen it are probed at compile time in `representability.rs`. What it still does not stop is a handler building a sequence from hashes a peer supplied; that is the first risk in §13.3 and is unchanged.
+
+**13.5.2 A holder could make the fetcher plan without end.** §13.3 called fetcher memory "the fetcher's own memory, not admission's" and left it unbounded, and listed the 1 MiB request cap as a risk to fix "if it happens". Both were wrong to leave. The member list is the holder's to make as long as it likes, and `missing` and `fetch_into` downloaded the root unchecked and handed iroh-blobs the whole closure to plan in one request.
+
+Now: a closure lists at most `MAX_CLOSURE_MEMBERS` (262,144) members, and the fetcher checks the root's size, proved by the last chunk, before it downloads or plans anything. `fetch_into` then asks for the members 4096 at a time, so a plan and a request stay small whatever the length, which also removes the request-cap risk. `BlobFault::TooManyMembers` is the refusal.
+
+**13.5.3 A closure grant admitted any offset.** §13.2 decision 1 says admission is O(1) "for any ranges". A request can select nothing until offset `1 << 60` in a few bytes, and iroh-blobs walks the empty offsets one at a time before it looks at the sequence, so one request held a thread of the holder for good. Admission now refuses a request whose encoded runs start a non-empty run past `MAX_CLOSURE_MEMBERS`, reading the runs and never expanding them.
+
+**13.5.4 `fetch_into` accepted a root that was not a sequence.** `missing` refused it and `fetch_into` did not, because upstream derives the member count from the size and a bad list has none. Both now check the root first, whether it is fetched or already held.
+
+**13.5.5 A pending reservation shared the entry's scope, and a revoke missed calls already running.** §13.2 decision 8 says a generation stops a stale reservation. It did not stop a blob commit from making a still-pending closure live, because both wrote one scope field; the entry now holds only what was committed and a permit widens it. And a handler already running when `revoke_peer` landed had no entry for the revoke to remove, so it reserved and committed afterwards; calls now take a fence at dispatch and a reservation made under a fence from before a peer revoke is refused as `GrantsWithdrawn`.
+
+**13.5.6 The budget bounded entries, not memory.** Revoking refunded the charge while the hash tables kept their buckets, so churn could retain several times the budget. Both tables are trimmed whenever their capacity passes twice their length, which keeps the retained buckets inside the charge the constants were derived from.
+
+### 13.6 Corrections after the second review
+
+Appended to §13.5, which stays as it was written. These are the places where §13.5 or the code under it was wrong.
+
+**13.6.1 The fence was taken too late.** §13.5.5 says calls take a fence at dispatch. The fence was taken inside `serve_one`, after the request was read and the idempotency key claimed, and admission is decided once per connection and copied into every call. A call accepted before the peer was removed could still be on its way to its fence when the removal and `revoke_peer` both landed, take the new epoch, and look like a call admitted afterwards. The fence is now taken in the accept loop, in the same step that accepts the stream and before the task is spawned, and the connection is asked whether it is still open only after that. Removing a peer closes its connection first, so a fence taken after `revoke_peer` finds the connection closed, and one taken before carries the old epoch: either way the call cannot grant. A call on a closed connection is dropped unread.
+
+**13.6.2 Trimming on `capacity()` did not bound allocation.** §13.5.6 says both tables are trimmed whenever their capacity passes twice their length. hashbrown reports capacity as live entries plus room before the next growth, and a deleted slot is a tombstone that lowers it without freeing anything, so the rule could stay false while the allocation stayed large, and the test that checked it rebuilt the allocation from the same number. Each table now keeps a high-water mark, the most entries it has held at once since it was last rebuilt. hashbrown grows a table only when its live entries need it, so a table's allocation follows that mark. The ledger charges for the mark, not the length, and rebuilds the table (`shrink_to_fit`, or a fresh one when it is empty) when its length falls under half the mark, which is the only thing that lowers the charge. The same rule applies to the table of calls in flight, which is not charged. The test now counts the bytes the thread allocates and compares them with what the ledger has charged, after fill-and-revoke churn, a generation of peers leaving, and insert-and-delete cycles that churn a table without changing its size.
+
+What the budget bounds is entries times a per-entry cost derived from type sizes. It does not bound the allocator's own overhead, or the smallest peers' table (about 340 bytes), which sit outside it. A consequence worth stating: a revoked peer's slot stays charged until its table is rebuilt, so the charge can run up to twice the live entries.
+
+**13.6.3 Fetch windows were not window-sized.** §13.5.2 says `fetch_into` asks for members 4096 at a time so a plan stays small. It called `Remote::local_for_request` once per window, and that indexes every member of the root before it looks at the window, so the memory was the whole root's and the work was repeated for every window. Each window now reads only its own slice of the root off the store, asks the store which of those members it holds in full, and requests the rest as one run per stretch. A member held only in part is requested whole again; what is already there is verified and rewritten. The planning is linear in the closure across all windows. A 20,000-member closure, and an interrupted fetch that resumes, are tested.
+
+**13.6.4 The size proof's bytes went uncounted.** `fetch_into` returns the payload bytes that crossed the wire, and the root's size proof (the root's last chunk) crossed it before the root did. It is counted now.
+
+**13.6.5 The holder-side check bounds where a run starts, not where it ends.** §13.5.3 and the `MAX_CLOSURE_MEMBERS` documentation said a holder refuses a request that selects a member past the limit. It refuses a non-empty run that starts past the limit, which is what makes the walk to it long. A run that starts below the limit may go on as far as the holder's sequence does, as an open-ended request for a whole closure legitimately does. `Blobs::add_seq` does not refuse a longer sequence; the fetcher will not read one. The documentation says so.
+
+**13.6.6 Stale documentation.** `BlobHandle::new` said a `SeqId` is `Serialize`; the local-calls paragraph in `turns.rs` said a blob call returns `Content`; the `closure_share` header linked `Content::Closure` without importing it; and the `fetch_into` documentation said there is no size preflight for a closure. All four are corrected.
+
+### 13.7 Both limits gone, and the budget is a count
+
+Appended to §13.6. Pedro asked for two limits to be removed completely and simply.
+
+**13.7.1 The byte budget is a count of grants.** §13.2 decision 7, and §13.6.2 after it, charged each table a per-entry cost derived from `size_of` and tracked a high-water mark per table to make the charge follow the allocation. That was a model of hashbrown's allocator, checked against another model of it. The ledger now holds at most `GRANT_LIMIT` grants (524,288) across every peer, `Blobs::set_grant_limit` changes it, and the refusal is `RemoteError::GrantsExhausted { limit }`. `GRANT_BUDGET`, `GRANT_COST`, `PEER_COST` and `set_grant_budget` are deleted. A peer has an entry only while it holds at least one grant, so peers never outnumber grants and one count bounds both tables. The rebuild rule stays (a table is rebuilt when its length falls under half the most entries it has held since it was last rebuilt, and an empty one is dropped), so allocation per live grant stays bounded under churn; the high-water mark is now only that rule's memory and charges nothing.
+
+What it costs is measured, not derived. `keylink/tests/grant_allocation.rs`, an isolated target with a counting global allocator, fills a ledger over eight real peers and prints bytes of heap per grant: 568 for a lone grant, 101.8 at 1,000, 64.2 at 100,000, 100.7 per grant held after revoke-and-regrant churn, and 128.5 for 100,000 held after 300,000 one-for-one trades, on aarch64 macOS. The last is the most: deleted slots are tombstones, and hashbrown answers a table full of them by doubling it, so a table that trades at a steady size sits at about twice the size it needs, and the rebuild rule, which looks at length against high-water mark, does not see that. The default limit is about 64 MiB at that worst figure. The test asserts a ceiling on each run and was watched red with a ceiling less than half what the runs need.
+
+**13.7.2 `MAX_CLOSURE_MEMBERS` is gone.** §13.5.2 and §13.5.3 capped a closure at 262,144 members on both ends. The holder-side half existed to stop a request naming an offset near `u64::MAX`; the cap only moved the line and made a legitimate fetch of a larger closure fail with a refusal that looked like a permission problem (`BlobRefused`: the holder refused the one request whose runs started past the cap). It is replaced by the check the cap stood in for: the holder reads the root's size from the store, once, after the grant has been found, and refuses a request whose furthest non-empty run starts past the members the root lists. Nothing is expanded, and a hash nobody was granted is still refused without touching the store. The fetcher-side half is gone because windowing already bounds it: each window of 4096 members is planned from its own slice of the root, and a window's request has at most 4096 entries, which a compile-time check holds far under `iroh_blobs::protocol::MAX_MESSAGE_SIZE`. `BlobFault::TooManyMembers` is deleted.
+
+A closure of 300,000 tiny members, of which the fetcher holds every other one, is fetched in the suite. Before the change it failed with `BlobRefused { id: BlobId(0eed953e…) }` on the tree that asked for the whole closure in one request.
+
+**13.7.3 No rpc sends a list of what is missing.** `Missing` has no `Serialize`, so a handler that wanted to tell a peer what a store lacks would have to convert it by hand, and the oracle warning on `Blobs::missing` still applies.
+
+### 13.8 Corrections after the last review
+
+Appended to §13.7. The limit changes here, so the figure in §13.7.1 is superseded.
+
+**13.8.1 The revoke recipe needs every connection closed.** §13.6.1 says removing a peer closes its connection first, so a fence taken after `revoke_peer` finds it closed. That holds for each connection admission closes. `DynamicAdmission` keeps one revocation handle per peer, so a second live connection of the same peer survives a `replace`, is still open, and can take a fresh fence after `revoke_peer`. The documentation of `revoke_peer` and the README now say so. The `trust` branch fixes the registry, which already tracks connections by id; admission is not changed here.
+
+**13.8.2 Windowing bounds memory and request size, not work.** §13.6.3 says the planning is linear in the closure across all windows. iroh-blobs 0.104 walks a request's offsets one at a time (`iter_non_empty_infinite`) on both ends, so a window that starts at member `k` costs `k` steps before its first member, and a closure of `N` members costs about `N^2 / 4096`. That is not measured on its own. What is measured: a 300,000-member closure with alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, which also adds both stores' members and makes about a million store round trips), and 12,289 members take 8 s, in the gate.
+
+**13.8.3 The sparse shape costs more per grant, and sets the default.** §13.7.1 measured only grants concentrated on a few peers. With one grant per peer each grant also pays for a slot in the peers' table and a table of its own: 386.3 bytes at 1,000 peers and 320.7 at 100,000 (a unit test in `src/blobs.rs`, because real connections cannot supply that many peers). `GRANT_LIMIT` is 172,032, about 64 MiB at 386.3 bytes; at the dense figures the same limit is 11 MB to 22 MB.
+
+**13.8.4 A blob listed twice in one window crossed the wire twice.** Each place a member lacked was requested. Now only the first occurrence of a lacking hash in a window is; the sequence keeps its order and its repeats, and `missing` still lists them.

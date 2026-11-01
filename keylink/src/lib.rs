@@ -256,7 +256,8 @@ pub use actor::{
 pub use admission::{Admission, Admittance, DynamicAdmission, Refusal, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{
-    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS,
+    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Grant, Granting, Missing,
+    Retention, SeqId, GRANT_LIMIT,
 };
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};

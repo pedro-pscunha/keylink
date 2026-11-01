@@ -165,6 +165,17 @@ pub enum BlobFault {
         /// Where the previous leaf ended.
         expected: u64,
     },
+
+    /// A closure's root is not a whole number of 32-byte addresses.
+    ///
+    /// A hash sequence is its members' addresses laid end to end, so the root
+    /// of a [`Content::Closure`](crate::Content::Closure) must divide by 32.
+    /// This one does not, so there is no member list to read.
+    #[error("a closure's root is {len} bytes, which is not a whole number of 32-byte addresses")]
+    NotASequence {
+        /// The length of the root.
+        len: u64,
+    },
 }
 
 impl Error {
@@ -391,9 +402,10 @@ pub enum Error {
     /// is available and only needed carrying up.
     ///
     /// The cause is a missing grant: this peer was never handed this address,
-    /// or the address is a child of a hash sequence rather than the blob it was
-    /// granted, or the grant fell off the end of a ledger bounded by
-    /// [`MAX_GRANTS`](crate::MAX_GRANTS).
+    /// or it asked for a member of a hash sequence by the member's own address
+    /// (a member is reached through its root), or for the members of a root it
+    /// holds only a [`Content::Blob`](crate::Content::Blob) grant on, or the
+    /// holder revoked the grant.
     #[error("the holder refused to serve blob {id}")]
     BlobRefused {
         /// The content that was refused.

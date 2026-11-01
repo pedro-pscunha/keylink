@@ -100,9 +100,9 @@ use std::ops::DerefMut;
 use crate::compose::{BroadcastDepth, Lossy, LossySubscription, LossyTopic, Overflow, Topic};
 use crate::{
     ActorId, ActorStatus, Addressed, Admission, Admittance, AdmittedPeer, Allowlist, Authorization,
-    Backpressure, BlobId, Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey,
-    Intensity, Keyable, LocalActor, Middleware, MountError, Observer, Origin, ProvenPeer, Records,
-    Retention, TurnFut, TurnInfo, TurnOutcome, Unanswered,
+    Backpressure, BlobId, Caller, Content, DynamicAdmission, Ended, Eviction, FinishFut, Grant,
+    IdempotencyKey, Intensity, Keyable, LocalActor, Middleware, MountError, Observer, Origin,
+    ProvenPeer, Records, Retention, SeqId, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -762,10 +762,13 @@ trait BlobIdHasNoMutableAccessor {
 }
 
 impl BlobIdHasNoMutableAccessor for BlobId {}
+impl BlobIdHasNoMutableAccessor for SeqId {}
 
-fn a_content_address_cannot_be_edited(mut id: BlobId) {
+fn a_content_address_cannot_be_edited(mut id: BlobId, mut seq: SeqId) {
     let _: NoSuchMethod = id.as_mut_bytes();
     let _: NoSuchMethod = id.as_mut();
+    let _: NoSuchMethod = seq.as_mut_bytes();
+    let _: NoSuchMethod = seq.as_mut();
 }
 
 /// A `From<[u8; 32]>` would be a public constructor for a capability, reachable
@@ -779,6 +782,29 @@ fn a_content_address_cannot_be_edited(mut id: BlobId) {
 trait BlobIdIsNotBuiltFromRawBytes {}
 impl<T: From<[u8; 32]>> BlobIdIsNotBuiltFromRawBytes for T {}
 impl BlobIdIsNotBuiltFromRawBytes for BlobId {}
+/// A [`SeqId`](crate::SeqId) is a capability for every blob its sequence lists,
+/// so it has no public constructor beyond `Blobs::add_seq` either.
+impl BlobIdIsNotBuiltFromRawBytes for SeqId {}
+
+/// A deserializable [`SeqId`] is a closure a peer can choose: a handler that
+/// takes one as an argument and returns it would grant whatever the peer named.
+/// The same goes for a [`Grant`] that deserializes or that [`Content`] converts
+/// into, because `Content` is the deserializable one. These are the two facts
+/// the handler-side boundary rests on, and each probe is a coherence conflict
+/// that stops compiling the day the type gains the impl. Watched: adding
+/// `Deserialize` to `SeqId`'s derive fails the build with `E0119: conflicting
+/// implementations of trait SeqIdIsNotDeserializable for type SeqId`.
+trait SeqIdIsNotDeserializable {}
+impl<T: serde::de::DeserializeOwned> SeqIdIsNotDeserializable for T {}
+impl SeqIdIsNotDeserializable for SeqId {}
+
+trait GrantIsNotDeserializable {}
+impl<T: serde::de::DeserializeOwned> GrantIsNotDeserializable for T {}
+impl GrantIsNotDeserializable for Grant {}
+
+trait GrantIsNotBuiltFromContent {}
+impl<T: From<Content>> GrantIsNotBuiltFromContent for T {}
+impl GrantIsNotBuiltFromContent for Grant {}
 
 // ──────────────────────────────── a validated key cannot be edited afterwards
 

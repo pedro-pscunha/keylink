@@ -83,6 +83,14 @@ impl ProvenPeer {
     pub(crate) fn for_tests(seed: u8) -> Self {
         Self(iroh::SecretKey::from_bytes(&[seed; 32]).public())
     }
+
+    /// The same, for tests that need more than 256 distinct peers.
+    #[cfg(test)]
+    pub(crate) fn for_tests_wide(seed: u64) -> Self {
+        let mut bytes = [7u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        Self(iroh::SecretKey::from_bytes(&bytes).public())
+    }
 }
 
 /// A [`ProvenPeer`] that an [`Allowlist`] admitted.
