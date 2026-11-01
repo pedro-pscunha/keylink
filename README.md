@@ -236,7 +236,7 @@ end, in one process or between two machines.
 
 postcard is not self-describing: swapping two same-shaped enum variants silently changes their meaning. A service's ALPN is `<crate>/<Service>/<version label>/<shape hash>`. The label names a version; the derived hash still decides whether two declarations agree. A field added or renamed anywhere in the contract moves the hash. Renaming a type or moving its module does not.
 
-With no common contract, the dial returns `Error::SchemaMismatch(Box<Mismatch>)`. An admitted peer answers a per-service probe in the same handshake, so the error names both windows. If both sides claim one label with different shapes, it names that too. A peer that serves neither a matching version nor the probe is reported as unknown, not as a guessed version.
+With no common contract, the dial returns `Error::SchemaMismatch(Box<Mismatch>)`. An admitted peer answers a per-service probe in the same handshake, so the error names both windows. A probe that does not finish within five seconds is closed and reported as unknown. If both sides claim one label with different shapes, it names that too. A peer that serves neither a matching version nor the probe is reported as unknown, not as a guessed version.
 
 ### Contract windows
 

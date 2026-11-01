@@ -561,18 +561,29 @@ impl ProtocolHandler for Probe {
         result.map_err(AcceptError::from_err)
     }
 }
+// A diagnostic must not turn a completed TLS handshake into an unbounded dial.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+async fn bounded_probe(
+    exchange: impl std::future::Future<Output = Result<ProbeReply>>,
+) -> Option<ProbeReply> {
+    n0_future::time::timeout(PROBE_TIMEOUT, exchange)
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+}
+
 pub(crate) async fn read_probe(connection: &Connection, service: &str) -> PeerWindow {
-    let result: Result<ProbeReply> = async {
+    let result = bounded_probe(async {
         let recv = connection.accept_uni().await?;
         let bytes = FrameReader::new(recv)
             .read_frame()
             .await?
             .ok_or(Error::Closed)?;
         Ok(postcard::from_bytes(&bytes)?)
-    }
+    })
     .await;
     match result {
-        Ok(reply)
+        Some(reply)
             if !reply.versions.is_empty()
                 && reply.versions.len() <= MAX_WINDOW
                 && reply.versions.windows(2).all(|v| v[0].label > v[1].label) =>
@@ -657,7 +668,7 @@ mod tests {
         let current = wire::encode_header(Some(17), None, &WireResponse::Call(Outcome::Ok(7_u8)))
             .expect("encodes");
         let encoded = codec
-            .reencode_response(current, None)
+            .reencode_response(current, GrantSource::Current(None))
             .expect("refusal encodes");
         let frame = encoded.frame;
         let carry_body = encoded.carry_body;
@@ -721,5 +732,49 @@ mod tests {
         ));
         assert_eq!((recorded.upgrade)(current, &encoded), Some(encoded.clone()));
         assert!((recorded.upgrade)(Version::__new(3, hash), &encoded).is_none());
+    }
+    /// Watched red: double the exchange timeout without moving the outer test
+    /// budget. The paused-clock test failed, 0 passed/1 failed, with no wall-clock
+    /// upper bound. Restored the service probe deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_probe_deadline_bounds_application_progress() {
+        let outer = tokio::time::timeout(
+            PROBE_TIMEOUT + std::time::Duration::from_secs(1),
+            bounded_probe(std::future::pending()),
+        )
+        .await;
+        assert!(
+            matches!(outer, Ok(None)),
+            "the probe's own deadline must finish before the outer test budget"
+        );
+    }
+    #[tokio::test]
+    async fn a_peer_that_selects_the_probe_but_withholds_a_reply_is_unknown() {
+        #[derive(Debug)]
+        struct Withhold(Arc<tokio::sync::Notify>);
+        impl ProtocolHandler for Withhold {
+            async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+                connection.closed().await;
+                self.0.notify_one();
+                Ok(())
+            }
+        }
+        let server = crate::Node::bind_local().await.expect("binds");
+        let caller = crate::Node::bind_local().await.expect("binds");
+        let lineage = Box::leak(Box::new(Lineage::new::<Here<u8, u8>>(
+            "withheld/probe",
+            Version::__new(1, crate::__schema_hash::<u8>("withheld/probe")),
+        )));
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let _router = iroh::protocol::Router::builder(server.endpoint().clone())
+            .accept(lineage.probe.clone(), Withhold(closed.clone()))
+            .spawn();
+        let error = crate::RpcClient::connect(&caller, server.endpoint().addr(), lineage)
+            .await
+            .expect_err("a probe is not an agreed contract");
+        assert!(
+            matches!(error, Error::SchemaMismatch(m) if matches!(m.theirs(), PeerWindow::Unknown))
+        );
+        closed.notified().await;
     }
 }
