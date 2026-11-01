@@ -3037,3 +3037,120 @@ async fn a_far_offset_in_a_closure_request_is_refused_and_not_walked() {
         );
     }
 }
+
+// ═══════════════════════════════════════ a holder cannot make the fetcher plan without end
+
+/// Review finding 6. The member list is the holder's to make as long as it likes
+/// and the fetcher's memory pays for planning around it. A valid root one
+/// member past the limit is refused before it is downloaded or planned, by
+/// `missing` and by `fetch_into`, and nothing lands in the store.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK58`) by replacing
+/// `count_members(self.id(), size)?;`
+/// with `let _ = size;` in `keylink/src/blobs.rs`: the root is then downloaded
+/// before it is judged, and the last assertion fails with `answers:
+/// BlobUnverified { .. TooManyMembers { members: 262145, limit: 262144 } }`,
+/// which is the store refusing to plan around a root it should never have held.
+/// (The first version of this test went red on that line for real:
+/// `BlobHandle::missing` still fetched the root unchecked.)
+#[tokio::test]
+async fn a_root_listing_more_members_than_the_limit_is_refused_before_it_is_downloaded() {
+    let cluster = cluster().await;
+    // Members the holder does not even hold: the list alone is the attack, and
+    // it is a valid sequence, so every byte of it verifies.
+    let listed = (0..=keylink::MAX_CLOSURE_MEMBERS as u32).map(|nth| {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&nth.to_le_bytes());
+        address_of(iroh_blobs::Hash::from(bytes))
+    });
+    let seq = cluster
+        .blobs
+        .add_seq(listed)
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+    let handle = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), seq);
+    let local = Blobs::memory();
+
+    for (what, error) in [
+        (
+            "missing",
+            handle.missing(&local).await.expect_err("too long"),
+        ),
+        (
+            "fetch_into",
+            handle
+                .fetch_into(&local)
+                .await
+                .map(drop)
+                .expect_err("too long"),
+        ),
+    ] {
+        assert!(
+            matches!(
+                error,
+                Error::BlobUnverified {
+                    fault: keylink::BlobFault::TooManyMembers { members, limit },
+                    ..
+                } if members == keylink::MAX_CLOSURE_MEMBERS as u64 + 1
+                    && limit == keylink::MAX_CLOSURE_MEMBERS as u64
+            ),
+            "{what}: expected TooManyMembers, got {error:?}"
+        );
+    }
+    assert_eq!(
+        local.missing(handle.content()).await.expect("answers"),
+        keylink::Missing::All,
+        "the root was never downloaded"
+    );
+}
+
+/// Review finding 7. `fetch_into` used to succeed for a root that is not a
+/// sequence, because upstream reads the member count off the size and a bad
+/// list has none, while `missing` refused the same content. Both refuse it now,
+/// whether the root is fetched or already held.
+#[tokio::test]
+async fn a_root_that_is_not_a_whole_number_of_addresses_is_refused_by_both_calls() {
+    let cluster = cluster().await;
+    for bytes in [vec![7u8], [vec![1u8; 32], vec![9u8]].concat()] {
+        let len = bytes.len() as u64;
+        let root = cluster.add_bytes(&bytes).await;
+        cluster
+            .grant_content(&cluster.peer, &[Content::Closure(root)])
+            .await;
+        let handle = BlobHandle::new(
+            &cluster.peer,
+            cluster.server.endpoint().addr(),
+            Content::Closure(root),
+        );
+        let refused = |error: &Error| {
+            matches!(
+                error,
+                Error::BlobUnverified {
+                    fault: keylink::BlobFault::NotASequence { len: got },
+                    ..
+                } if *got == len
+            )
+        };
+
+        // Fetched from the holder.
+        let fresh = Blobs::memory();
+        let error = handle.fetch_into(&fresh).await.expect_err("not a sequence");
+        assert!(refused(&error), "{len} bytes, fetched: {error:?}");
+        let error = handle.missing(&fresh).await.expect_err("not a sequence");
+        assert!(refused(&error), "{len} bytes, missing: {error:?}");
+
+        // Already held, so nothing is downloaded to notice it.
+        let held = Blobs::memory();
+        held.add_bytes(bytes.clone()).await.expect("stores");
+        let error = handle.fetch_into(&held).await.expect_err("not a sequence");
+        assert!(refused(&error), "{len} bytes, held: {error:?}");
+        let error = held
+            .missing(Content::Closure(root))
+            .await
+            .expect_err("not a sequence");
+        assert!(refused(&error), "{len} bytes, held missing: {error:?}");
+    }
+}

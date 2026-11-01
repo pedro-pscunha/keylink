@@ -161,9 +161,16 @@ tree with sub-sequences is flattened into one sequence that lists every blob.
 **A closure authorizes every hash it lists**: list only what the recipient may
 read, and never hashes a peer supplied.
 
-`handle.fetch_into(&store)` fetches a closure in two steps on one dial, the
-root and then only the members the store lacks. `Blobs::missing` (and
+`handle.fetch_into(&store)` fetches a closure on one dial: the root, then only
+the members the store lacks, 4096 members per request. `Blobs::missing` (and
 `handle.missing(&store)`) answer what that is, from the fetcher's own store.
+
+A closure lists at most `MAX_CLOSURE_MEMBERS` (262,144) members, and both ends
+hold the line. The fetcher checks the root's size, which the holder proves with
+the last chunk, before it downloads or plans anything, and refuses a longer one
+or one that is not a whole number of addresses with `BlobFault::TooManyMembers`
+or `NotASequence`. The holder refuses a request that selects a member past it,
+because a request can name an offset near `u64::MAX` in a few bytes.
 
 A grant lasts until it is revoked. `Blobs::revoke(peer, root)` and
 `Blobs::revoke_everywhere(root)` refuse the next request; a request already

@@ -91,7 +91,7 @@ use bytes::Bytes;
 use iroh::endpoint::{ConnectError, Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use iroh_blobs::api::blobs::AddBytesOptions;
+use iroh_blobs::api::blobs::{AddBytesOptions, BlobStatus};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::request::get_verified_size;
 use iroh_blobs::get::{fsm, GetError};
@@ -1029,12 +1029,19 @@ impl Blobs {
     /// 32-byte addresses.
     pub async fn missing(&self, content: Content) -> Result<Missing> {
         let root = content.root();
-        if !self.has(root).await? {
+        let Content::Closure(_) = content else {
+            return Ok(if self.has(root).await? {
+                Missing::Nothing
+            } else {
+                Missing::All
+            });
+        };
+        // The root is checked before it is read: a longer list than
+        // `MAX_CLOSURE_MEMBERS` is refused here, so the list of what is missing
+        // below is bounded by it.
+        if self.members(root).await?.is_none() {
             return Ok(Missing::All);
         }
-        let Content::Closure(_) = content else {
-            return Ok(Missing::Nothing);
-        };
         let mut lacking = Vec::new();
         let mut offset = 0u64;
         loop {
@@ -1069,6 +1076,23 @@ impl Blobs {
         } else {
             Missing::Members(lacking)
         })
+    }
+
+    /// How many members the sequence at `root` lists, if this store holds it in
+    /// full, and an error when what it holds is not a closure this crate will
+    /// plan for: not a whole number of addresses, or more than
+    /// [`MAX_CLOSURE_MEMBERS`].
+    async fn members(&self, root: BlobId) -> Result<Option<u64>> {
+        let status = self
+            .store()
+            .blobs()
+            .status(root.hash())
+            .await
+            .map_err(store_error)?;
+        match status {
+            BlobStatus::Complete { size } => count_members(root, size).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Whether this store holds `id` in full.
@@ -1265,6 +1289,48 @@ pub trait Granting {
 
 /// How much of a closure's root is read per store call: 1024 members.
 const ROOT_WINDOW: u64 = 32 * 1024;
+
+/// How many members one request of a closure fetch asks for.
+///
+/// iroh-blobs plans a request by building a map entry per member it names, and
+/// encodes one run per missing member, so asking for a closure in windows
+/// bounds both the plan's memory and the request's size (4096 members is about
+/// 12 KB, against a 1 MiB cap) whatever the closure's length.
+const FETCH_WINDOW: u64 = 4096;
+
+/// The member count of a root of `size` bytes, or why it is not a closure.
+fn count_members(root: BlobId, size: u64) -> Result<u64> {
+    if !size.is_multiple_of(32) {
+        return Err(Error::BlobUnverified {
+            id: root,
+            fault: BlobFault::NotASequence { len: size },
+        });
+    }
+    let members = size / 32;
+    if members > MAX_CLOSURE_MEMBERS as u64 {
+        return Err(Error::BlobUnverified {
+            id: root,
+            fault: BlobFault::TooManyMembers {
+                members,
+                limit: MAX_CLOSURE_MEMBERS as u64,
+            },
+        });
+    }
+    Ok(members)
+}
+
+/// The request for members `start..end` of the closure at `root`, and nothing
+/// else: no bytes of the root, and nothing past `end`.
+///
+/// Built from its wire form (a run from offset `start + 1` that selects
+/// everything, then a run that selects nothing) rather than with the request
+/// builder, which expands a vector of every offset below the last one it is given.
+fn window_request(root: BlobId, start: u64, end: u64) -> Result<GetRequest> {
+    let runs = vec![(start + 1, vec![0u64]), (end - start, Vec::<u64>::new())];
+    let wire = postcard::to_stdvec(&runs).map_err(store_error)?;
+    let ranges = postcard::from_bytes(&wire).map_err(store_error)?;
+    Ok(GetRequest::new(root.hash(), ranges))
+}
 
 /// A store failure, as keylink reports every one.
 fn store_error(error: impl std::fmt::Display) -> Error {
@@ -1601,9 +1667,10 @@ impl BlobHandle {
     /// is not a whole number of addresses.
     pub async fn missing(&self, store: &Blobs) -> Result<Missing> {
         if let Content::Closure(_) = self.content {
-            if !store.has(self.id()).await? {
+            // Dials only when the store lacks the root.
+            if store.members(self.id()).await?.is_none() {
                 let connection = self.dial().await?;
-                self.fetch_root(&connection, store).await?;
+                self.ensure_root(&connection, store).await?;
             }
         }
         store.missing(self.content).await
@@ -1807,15 +1874,18 @@ impl BlobHandle {
     /// cut in half, the second fetch read 37232 of 70000 bytes, so the two
     /// whole 16 KiB blocks the store had already validated were kept.
     ///
-    /// # A closure is fetched in two phases, on one dial
+    /// # A closure is fetched in phases, on one dial
     ///
     /// First the root alone, which costs no request when the store already holds
-    /// it. Then the members, and only the members the store lacks: iroh-blobs
+    /// it, and which is checked for whole addresses and for
+    /// [`MAX_CLOSURE_MEMBERS`] before it is downloaded. Then the members, and
+    /// only the members the store lacks, 4096 of them per request: iroh-blobs
     /// computes what is missing from the local copy of the root and asks for
-    /// exactly that. Fetching the sequence in one request would send the whole
-    /// closure when the root is absent, because the fetcher cannot know which
-    /// members it holds until it holds the list. The holder's grant is its
-    /// claim that it has the closure.
+    /// exactly that, and a window keeps both its plan and its request small
+    /// however long the closure is. Fetching the sequence in one request would
+    /// send the whole closure when the root is absent, because the fetcher
+    /// cannot know which members it holds until it holds the list. The holder's
+    /// grant is its claim that it has the closure.
     ///
     /// # It does not inherit the reader's size guarantee, on purpose
     ///
@@ -1833,15 +1903,28 @@ impl BlobHandle {
     /// The same set as [`copy_to`](Self::copy_to).
     pub async fn fetch_into(&self, store: &Blobs) -> Result<u64> {
         let connection = self.dial().await?;
-        let mut bytes = self.fetch_root(&connection, store).await?;
-        if let Content::Closure(_) = self.content {
-            bytes += self
-                .fetch_with(
-                    &connection,
-                    store,
-                    HashAndFormat::hash_seq(self.id().hash()),
-                )
-                .await?;
+        let (mut bytes, members) = match self.content {
+            Content::Blob(_) => (self.fetch_root(&connection, store).await?, 0),
+            Content::Closure(_) => self.ensure_root(&connection, store).await?,
+        };
+        // The members, a window of them per request. The root is complete in
+        // the store by now, so each window plans from its own slice of the list.
+        let remote = store.store().remote();
+        let mut start = 0;
+        while start < members {
+            let end = (start + FETCH_WINDOW).min(members);
+            let local = remote
+                .local_for_request(window_request(self.id(), start, end)?)
+                .await
+                .map_err(store_error)?;
+            if !local.is_complete() {
+                let stats = remote
+                    .execute_get(connection.clone(), local.missing())
+                    .await
+                    .map_err(|error| self.classify(error, &connection))?;
+                bytes += stats.payload_bytes_read;
+            }
+            start = end;
         }
         Ok(bytes)
     }
@@ -1850,6 +1933,32 @@ impl BlobHandle {
     async fn fetch_root(&self, connection: &Connection, store: &Blobs) -> Result<u64> {
         self.fetch_with(connection, store, HashAndFormat::raw(self.id().hash()))
             .await
+    }
+
+    /// Make sure `store` holds this closure's root, and say how many members it
+    /// lists and how many payload bytes it cost to get it.
+    ///
+    /// The root is checked against [`MAX_CLOSURE_MEMBERS`] and for whole
+    /// addresses **before it is downloaded**, from the size the holder proves
+    /// with the last chunk, because the holder chooses how long it is. A root
+    /// the store already holds is checked the same way, so a closure whose list
+    /// is not a sequence fails here and not as a fetch that succeeds.
+    async fn ensure_root(&self, connection: &Connection, store: &Blobs) -> Result<(u64, u64)> {
+        if let Some(members) = store.members(self.id()).await? {
+            return Ok((0, members));
+        }
+        let (size, _) = get_verified_size(connection, &self.id().hash())
+            .await
+            .map_err(|error| self.classify(error, connection))?;
+        count_members(self.id(), size)?;
+        let bytes = self.fetch_root(connection, store).await?;
+        let members = store.members(self.id()).await?.ok_or_else(|| {
+            Error::Io(std::io::Error::other(format!(
+                "closure root {} did not land in the store",
+                self.id()
+            )))
+        })?;
+        Ok((bytes, members))
     }
 
     async fn fetch_with(

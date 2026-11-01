@@ -176,6 +176,19 @@ pub enum BlobFault {
         /// The length of the root.
         len: u64,
     },
+
+    /// A closure's root lists more members than this crate will plan for.
+    ///
+    /// The member list is the holder's to make as long as it likes, and the
+    /// fetcher's memory pays for planning around it, so the root is refused
+    /// before it is downloaded. See [`MAX_CLOSURE_MEMBERS`](crate::MAX_CLOSURE_MEMBERS).
+    #[error("a closure lists {members} members, past the limit of {limit}")]
+    TooManyMembers {
+        /// The members the root lists.
+        members: u64,
+        /// The most a closure may list.
+        limit: u64,
+    },
 }
 
 impl Error {
