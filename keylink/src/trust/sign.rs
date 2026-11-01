@@ -48,7 +48,7 @@ pub(super) fn decode_canonical<T: Serialize + DeserializeOwned>(
 }
 
 /// An application-chosen signed-message purpose and operation name.
-/// Names contain 1..=64 bytes of `[a-z0-9._/-]`, without an edge slash.
+/// Names contain 1..=64 bytes of `[A-Za-z0-9._/-]`, without an edge slash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Purpose(&'static str);
 impl Purpose {
@@ -60,7 +60,7 @@ impl Purpose {
             || name.ends_with('/')
             || !name
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._/-".contains(&b))
+                .all(|b| b.is_ascii_alphabetic() || b.is_ascii_digit() || b"._/-".contains(&b))
         {
             return Err(SignedError::BadPurpose);
         }

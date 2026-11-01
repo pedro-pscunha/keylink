@@ -98,3 +98,28 @@ fn a_forwarder_cannot_substitute_another_authority_chain() {
         );
     }
 }
+
+#[test]
+fn generated_operation_names_are_case_sensitive_purposes() {
+    let key = SecretKey::from_bytes(&[6; 32]);
+    let purpose = Purpose::new("Inventory/GetItem").unwrap();
+    let signed = Signed::sign(&key, &purpose, &1u64, Chain::default()).unwrap();
+    let roots = Roots::only([key.public()]).unwrap();
+    assert_eq!(
+        signed
+            .open(&purpose, &roots, Timestamp::from_unix_secs(1))
+            .unwrap()
+            .value,
+        1
+    );
+    assert_eq!(
+        signed
+            .open(
+                &Purpose::new("inventory/getitem").unwrap(),
+                &roots,
+                Timestamp::from_unix_secs(1)
+            )
+            .unwrap_err(),
+        SignedError::BadSignature
+    );
+}
