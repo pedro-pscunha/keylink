@@ -2188,6 +2188,8 @@ ANCHORS = [
      "            if book.used.saturating_add(cost) > book.budget {"),
     ("HK53", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if entry.committed.is_none() && entry.pending == 0 {"),
+    ("HK57", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    if table.capacity() > 2 * table.len() {"),
     ("HK56", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if selects_past(&msg.request.ranges, MAX_CLOSURE_MEMBERS as u64) {"),
     ("HK55", "keylink/src/blobs.rs", "keylink/src/blobs.rs",

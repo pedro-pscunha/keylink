@@ -643,6 +643,7 @@ impl Grants {
         let Some(held) = book.by_peer.remove(&peer) else {
             return 0;
         };
+        trim(&mut book.by_peer);
         book.used -= PEER_COST + GRANT_COST * held.len();
         held.values()
             .filter(|entry| entry.committed.is_some())
@@ -668,15 +669,33 @@ impl Grants {
     fn remove(book: &mut Book, peer: EndpointId, root: &BlobId) -> Option<Entry> {
         let held = book.by_peer.get_mut(&peer)?;
         let entry = held.remove(root)?;
+        trim(held);
         book.used -= GRANT_COST;
         if held.is_empty() {
             // Not tidiness: `knows` reads this map, so a peer left behind with
             // an empty table would keep passing connection admission while
             // holding no grant at all.
             book.by_peer.remove(&peer);
+            trim(&mut book.by_peer);
             book.used -= PEER_COST;
         }
         Some(entry)
+    }
+}
+
+/// Give back the memory a table no longer needs.
+///
+/// A hash table keeps its allocation when entries leave, so refunding
+/// [`GRANT_COST`] on every revoke would let churn retain far more than the
+/// budget says: fill a peer's table, revoke all but one root, and the refund
+/// pays for filling another peer's table while the first keeps its buckets.
+/// Shrinking whenever the capacity passes twice the length keeps the retained
+/// buckets within the 16/7 per-slot charge the constants are derived from, at
+/// both levels (a peer's roots, and the peers). It is the same check at every
+/// call, and a no-op when the table is already as small as it can be.
+fn trim<K: Eq + std::hash::Hash, V>(table: &mut HashMap<K, V>) {
+    if table.capacity() > 2 * table.len() {
+        table.shrink_to_fit();
     }
 }
 
@@ -2466,6 +2485,67 @@ mod tests {
         assert!(
             grants.lock().inflight.is_empty(),
             "a finished call leaves nothing in the fence table"
+        );
+    }
+
+    /// What a hash table of `slot` bytes per entry retains for `capacity`: the
+    /// bucket count hashbrown derives from it, a control byte each, and one
+    /// group of padding.
+    fn retained(capacity: usize, slot: usize) -> usize {
+        let buckets = if capacity < 8 {
+            capacity + 1
+        } else {
+            capacity / 7 * 8
+        };
+        buckets * (slot + 1) + 16
+    }
+
+    /// Review finding 4. Revoking refunds [`GRANT_COST`], and a table that
+    /// keeps its allocation would make that refund pay for memory still held.
+    /// Fill each of many peers, revoke all but one root each, and compare what
+    /// the tables really retain with what the ledger says it has charged, at
+    /// both levels.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK57`) by replacing
+    /// `if table.capacity() > 2 * table.len() {`
+    /// with `    if false {`: retained is then several times `used`.
+    #[test]
+    fn churn_cannot_retain_more_than_the_budget_has_charged() {
+        let grants = Grants::new();
+        for seed in 1..=60u8 {
+            for nth in 0..400u32 {
+                let mut root = [0u8; 32];
+                root[..4].copy_from_slice(&nth.to_le_bytes());
+                grant(&grants, seed, BlobId(root));
+            }
+            for nth in 1..400u32 {
+                let mut root = [0u8; 32];
+                root[..4].copy_from_slice(&nth.to_le_bytes());
+                assert!(grants.revoke(admitted(seed).id(), BlobId(root)));
+            }
+        }
+        // And a whole generation of peers leaving, which empties the outer table.
+        for seed in 1..=50u8 {
+            grants.revoke_peer(admitted(seed).id());
+        }
+
+        let book = grants.lock();
+        let slot = size_of::<(BlobId, Entry)>();
+        let inner: usize = book
+            .by_peer
+            .values()
+            .map(|held| retained(held.capacity(), slot))
+            .sum();
+        let outer = retained(
+            book.by_peer.capacity(),
+            size_of::<(EndpointId, HashMap<BlobId, Entry>)>(),
+        );
+        assert_eq!(book.by_peer.len(), 10);
+        assert!(
+            inner + outer <= book.used,
+            "the tables retain {} bytes against {} charged",
+            inner + outer,
+            book.used
         );
     }
 
