@@ -198,11 +198,20 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  that resumes an interrupted transfer: whatever is already validated is
     //  never asked for again.
     let device_store = Blobs::memory();
+    //  It answers with a `Fetched`: the payload bytes read from the holder, and
+    //  the verified bytes the store already held and did not ask for.
     let first = kiln_image.fetch_into(&device_store).await?;
     let second = kiln_image.fetch_into(&device_store).await?;
-    println!("fetch_into transferred {first} bytes, then {second}");
-    assert!(first > 0, "the first fetch must move the payload");
-    assert_eq!(second, 0, "the second must move nothing");
+    println!(
+        "fetch_into read {} bytes, then {} (and kept {})",
+        first.read, second.read, second.kept
+    );
+    assert!(first.read > 0, "the first fetch must move the payload");
+    assert_eq!(second.read, 0, "the second must move nothing");
+    assert_eq!(
+        second.kept, first.read,
+        "and it kept what the first one read"
+    );
 
     //  `copy_to` has no store, so it has neither. It streams to a sink with a
     //  peak of one chunk, and it pays the whole length every time. That is the
@@ -210,7 +219,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  a device that will ask again after a power cut.
     let mut sink = Vec::new();
     let copied = kiln_image.copy_to(&mut sink).await?;
-    assert_eq!(copied, first, "copy_to always pays full price");
+    assert_eq!(copied, first.read, "copy_to always pays full price");
     assert_eq!(sink.len() as u64, copied);
 
     // ── 4. The upload. One `send`, one body, and a receipt that names what the

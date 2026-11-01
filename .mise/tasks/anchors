@@ -2235,9 +2235,27 @@ ANCHORS = [
     ("HK60", "keylink-http/tests/blobs.rs", "keylink-http/src/error.rs",
      "                | keylink::RemoteError::GrantsExhausted { .. }"),
     ("HK63", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
-     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+     "                .filter(|(_, member)| touched.insert(**member))"),
+    ("HK64", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "            Self::Part(held) => ChunkRanges::all().difference(&held.ranges),"),
+    ("HK65", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if !runs.is_empty() && used + size + REQUEST_RESERVE > budget {"),
+    ("HK68", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if at > from && bytes + cost > spec {"),
+    ("HK66", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    if u64::from_le_bytes(*size) != total {"),
+    ("HK67", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "                return Err(if damaged(&error) && (!short || self.alive().await) {"),
+    ("HK69", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            Self::Part(held) => ChunkRanges::all().difference(&held.ranges),"),
+    ("HK70", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            Holding::Part(bits) if bits.validated_size().is_some() => bits.size(),"),
+    ("HK71", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "                .filter(|(_, member)| touched.insert(**member))"),
+    ("HK72", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        None => by_kind(io),"),
     ("HK62", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
-     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+     "                let lacking = held.lacking();"),
     ("HK59", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if grants.knows(&peer) {"),
     ("HK57", "keylink/tests/grant_allocation.rs", "keylink/src/blobs.rs",
@@ -4068,7 +4086,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 392
+RECORD_BLOCKS = 401
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

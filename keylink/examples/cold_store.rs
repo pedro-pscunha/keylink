@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // ── 2. The reel, fetched into a store that is also on a disk.
     let (declared, handle) = reader.reel("reel-1".to_string()).await?;
     let store = Blobs::persistent(&reader_store, Retention::Forever).await?;
-    let moved = handle.fetch_into(&store).await?;
+    let moved = handle.fetch_into(&store).await?.read;
     println!("this run's first fetch moved {moved} bytes of a {declared}-byte reel");
     if moved == 0 {
         println!("  (zero, so a previous run committed the reel to this path)");
@@ -202,8 +202,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  checkable. This is the same mechanism that resumes an interrupted
     //  transfer, and on a disk it survives the process as well as the handle.
     let again = handle.fetch_into(&store).await?;
-    println!("the second fetch moved {again} bytes");
-    assert_eq!(again, 0, "content already held is never asked for again");
+    println!(
+        "the second fetch read {} bytes and kept {}",
+        again.read, again.kept
+    );
+    assert_eq!(
+        again.read, 0,
+        "content already held is never asked for again"
+    );
 
     // ── 4. A body read off a file, which is the other feature.
     //

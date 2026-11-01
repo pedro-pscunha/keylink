@@ -451,6 +451,44 @@ pub enum Error {
         end: u64,
     },
 
+    /// This store does not hold the blob in full, so there is nothing to read.
+    ///
+    /// Absent, or only part of it: `held` is how many verified bytes are here,
+    /// and is zero for a blob that is not. A local read never returns the part
+    /// that is.
+    #[error("this store holds {held} verified bytes of blob {id}, not all of it")]
+    BlobNotHeld {
+        /// The blob that was asked for.
+        id: crate::BlobId,
+        /// Verified bytes of it the store holds.
+        held: u64,
+    },
+
+    /// This store's copy of a blob does not verify against its address.
+    ///
+    /// The data, or the hashes stored beside it, changed after they were written:
+    /// a damaged disk, or a file edited by hand. `offset` is the start of the
+    /// window of the blob that failed, and every byte before it was verified and
+    /// delivered.
+    #[error("this store's copy of blob {id} does not verify, in the window at byte {offset}")]
+    BlobCorrupt {
+        /// The blob that was being read.
+        id: crate::BlobId,
+        /// Where the window that failed begins.
+        offset: u64,
+    },
+
+    /// A blob is longer than the caller said it would read into memory.
+    #[error("blob {id} is {len} bytes, over the {limit} that were to be read into memory")]
+    BlobTooLarge {
+        /// The blob that was asked for.
+        id: crate::BlobId,
+        /// Its size.
+        len: u64,
+        /// What the caller allowed.
+        limit: u64,
+    },
+
     /// Bad or missing configuration, reported at startup rather than on first use.
     #[error("config: {0}")]
     Config(#[from] ConfigError),

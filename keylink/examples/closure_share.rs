@@ -134,11 +134,18 @@ async fn fetch(client: &shelf::Client, preseed: u32) -> Result<(), Box<dyn StdEr
     let started = Instant::now();
     let moved = handle.fetch_into(&local).await?;
     println!(
-        "fetch_into: {moved} payload bytes ({:?})",
+        "fetch_into: read {} payload bytes, kept {} ({:?})",
+        moved.read,
+        moved.kept,
         started.elapsed()
     );
-    if moved != lacking * 1024 {
-        return Err(format!("expected {} payload bytes, moved {moved}", lacking * 1024).into());
+    if moved.read != lacking * 1024 {
+        return Err(format!(
+            "expected {} payload bytes, read {}",
+            lacking * 1024,
+            moved.read
+        )
+        .into());
     }
 
     // 3. Nothing is missing now, and asking again moves nothing.
@@ -147,8 +154,8 @@ async fn fetch(client: &shelf::Client, preseed: u32) -> Result<(), Box<dyn StdEr
         return Err(format!("expected nothing missing, got {after:?}").into());
     }
     let again = handle.fetch_into(&local).await?;
-    if again != 0 {
-        return Err(format!("a second fetch moved {again} bytes").into());
+    if again.read != 0 {
+        return Err(format!("a second fetch read {} bytes", again.read).into());
     }
     println!("missing: nothing; a second fetch_into moved 0 bytes");
 

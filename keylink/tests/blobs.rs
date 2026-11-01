@@ -754,13 +754,16 @@ async fn a_blob_fetched_twice_into_one_store_costs_one_transfer() {
         .fetch_into(&local)
         .await
         .expect("the first fetch transfers");
-    assert!(first > 0, "the first fetch moved bytes");
+    assert!(first.read > 0, "the first fetch moved bytes");
 
     let second = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), id)
         .fetch_into(&local)
         .await
         .expect("the second fetch is free");
-    assert_eq!(second, 0, "content already held costs no payload bytes");
+    assert_eq!(
+        second.read, 0,
+        "content already held costs no payload bytes"
+    );
 }
 
 // ───────────────────────────────────────────────── verified readers and ranges
@@ -993,7 +996,7 @@ async fn ask(from: iroh::Endpoint, holder: iroh::EndpointAddr, request: GetReque
         .expect("encodes a get request");
     send.write_all(&asked).await.expect("writes the request");
     send.finish().expect("finishes the request");
-    recv.read_to_end(16 * 1024 * 1024)
+    recv.read_to_end(256 * 1024 * 1024)
         .await
         .expect("reads the whole answer")
 }
@@ -1580,12 +1583,13 @@ async fn interrupted_fetch_into_resumes_from_store_progress() {
         .await
         .expect("the second fetch completes");
     assert!(
-        second > 0,
+        second.read > 0,
         "control: the first fetch did not quietly finish, so there was a suffix to ask for"
     );
     assert!(
-        second < content.len() as u64,
-        "resume asks only for what the store is missing, not {second} of {} bytes",
+        second.read < content.len() as u64,
+        "resume asks only for what the store is missing, not {} of {} bytes",
+        second.read,
         content.len()
     );
 }
@@ -1857,7 +1861,7 @@ async fn a_blob_method_result_can_be_fetched_into_a_store() {
         .fetch_into(&local)
         .await
         .expect("fetches into a store");
-    assert!(moved > 0, "the first fetch moved bytes");
+    assert!(moved.read > 0, "the first fetch moved bytes");
 }
 
 // ───────────────────────────────────────────────── configuration is checked
@@ -2599,7 +2603,7 @@ async fn a_closure_of_5000_members_is_fetched_with_one_grant() {
     let list = 5000 * 32;
     let proof = (list - 1) % 1024 + 1;
     assert_eq!(
-        moved,
+        moved.read,
         5000 * 1024 + list + proof,
         "every member's payload, the member list, and the last chunk of it the \
          size proof carried: all payload that crossed the wire"
@@ -2741,7 +2745,7 @@ async fn missing_names_exactly_the_members_the_store_lacks() {
 
     let moved = handle.fetch_into(&local).await.expect("fetches the rest");
     assert_eq!(
-        moved,
+        moved.read,
         1000 * 1024,
         "the root was already held, and so was the rest"
     );
@@ -2749,7 +2753,7 @@ async fn missing_names_exactly_the_members_the_store_lacks() {
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 }
 
 /// Revoking a closure takes effect at the next request.
@@ -3130,12 +3134,12 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
     let moved = handle.fetch_into(&local).await.expect("fetches 20,000");
     let list = 20_000 * 32;
     let proof = (list - 1) % 1024 + 1;
-    assert_eq!(moved, 20_000 * 1024 + list + proof);
+    assert_eq!(moved.read, 20_000 * 1024 + list + proof);
     assert_eq!(
         local.missing(handle.content()).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 
     // The size proof, the root, and five windows (4096 four times, then 3616).
     let asked: Vec<GetRequest> = holder
@@ -3175,10 +3179,10 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
 /// arrived whole.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK62`) by replacing
-/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
-/// with `lacking.push(true);` in `keylink/src/blobs.rs`: every window then asks
-/// for all of its members, and the retry moves every member again (20,480,000
-/// bytes) instead of the roughly half it lacked.
+/// `let lacking = held.lacking();`
+/// with `let lacking = ChunkRanges::all();` in `keylink/src/blobs.rs`: every
+/// window then asks for all of its members, and the retry moves every member
+/// again (20,480,000 bytes) instead of the roughly half it lacked.
 #[tokio::test]
 async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds() {
     let cluster = cluster().await;
@@ -3234,7 +3238,7 @@ async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds()
         .expect("the retry completes");
     let lacking_before = (20_000 - held_after_cut) as u64;
     assert_eq!(
-        second,
+        second.read,
         lacking_before * 1024,
         "exactly the members that were lacking: the root is held, the windows already \
          fetched are not asked for again, and the members of the third window that \
@@ -3299,7 +3303,7 @@ async fn a_closure_with_alternating_gaps_is_fetched(members: u32) {
 
     let moved = handle.fetch_into(&local).await.expect("fetches the rest");
     assert_eq!(
-        moved,
+        moved.read,
         u64::from(members / 2) * 4,
         "the odd members, 4 bytes each"
     );
@@ -3307,7 +3311,7 @@ async fn a_closure_with_alternating_gaps_is_fetched(members: u32) {
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 }
 
 /// Three whole windows and one member over (3 * 4096 + 1), with alternating
@@ -3355,9 +3359,9 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
 /// 10000.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK63`) by replacing
-/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
-/// with `lacking.push(!store.has(*member).await? && { asked.insert(*member); true });`
-/// in `keylink/src/blobs.rs`: the fetch then moves every listed place and fails
+/// `.filter(|(_, member)| touched.insert(**member))`
+/// with `.filter(|(_, member)| true || touched.insert(**member))` in
+/// `keylink/src/blobs.rs`: the fetch then asks for every listed place and fails
 /// with `each blob crossed once` (left: 10000, right: 6000).
 #[tokio::test]
 async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
@@ -3390,7 +3394,7 @@ async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
         .fetch_into(&local)
         .await
         .expect("fetches the members");
-    assert_eq!(moved, 1000 + 2000 + 3000, "each blob crossed once");
+    assert_eq!(moved.read, 1000 + 2000 + 3000, "each blob crossed once");
     assert_eq!(
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
@@ -3401,4 +3405,499 @@ async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
         vec![payload(1000), payload(2000), payload(3000)],
         "and every place it was listed is filled"
     );
+}
+
+// ═══════════════════════════════════════ resume goes down into a member
+
+/// Where in a member's answer `groups` whole 16 KiB chunk groups end.
+///
+/// A holder's answer for one blob is its 8-byte size, then the tree in pre-order:
+/// a 64-byte parent for each node above the groups, and each group's data where
+/// it falls. Cutting the answer here ends it exactly after the `groups`-th group
+/// has arrived whole, with every parent hash that verifies it.
+fn bytes_through_group(len: u64, groups: u64) -> usize {
+    use bao_tree::{iter::BaoChunk, BaoTree, ChunkRanges as Ranges};
+    let tree = BaoTree::new(len, iroh_blobs::store::IROH_BLOCK_SIZE);
+    let mut bytes = 8usize;
+    let mut seen = 0;
+    for chunk in tree.ranges_pre_order_chunks_iter_ref(&Ranges::all(), 0) {
+        match chunk {
+            BaoChunk::Parent { .. } => bytes += 64,
+            BaoChunk::Leaf { size, .. } => {
+                bytes += size;
+                seen += 1;
+                if seen == groups {
+                    return bytes;
+                }
+            }
+        }
+    }
+    panic!("a blob of {len} bytes has fewer than {groups} groups");
+}
+
+/// **Resume inside a member.** A member of 4 MiB and 100 bytes (257 chunk groups
+/// of 16 KiB, the last of 100 bytes) is fetched through a holder that cuts its
+/// answer exactly after `K = 100` whole groups. The fetch fails. The next
+/// `fetch_into`, from the same store, asks for that member from group 100 on and
+/// so reads exactly the bytes the store lacked:
+///
+/// ```text
+/// read = 4 194 404 - 100 * 16 384 = 2 556 004
+/// kept = 32 (the member list) + 100 * 16 384 = 1 638 432
+/// ```
+///
+/// The last group is short, and it is among the groups still to come, so it is
+/// part of `read` as its own 100 bytes and no adjustment is needed to `K` whole
+/// groups held. Nothing of the first 100 groups crosses the wire twice.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK64`) by replacing
+/// `Self::Part(held) => ChunkRanges::all().difference(&held.ranges),`
+/// with `Self::Part(_) => ChunkRanges::all(),` in `keylink/src/blobs.rs`, which is what the planner
+/// did before: it asks for a partly held member whole again, and `read` is the
+/// whole 4 194 404 bytes against the 2 556 004 that were lacking.
+#[tokio::test]
+async fn a_fetch_cut_inside_one_member_resumes_without_resending_a_verified_group() {
+    const GROUP: u64 = 16 * 1024;
+    const K: u64 = 100;
+    let len = 4 * 1024 * 1024 + 100;
+    let cluster = cluster().await;
+    let member = cluster.add_bytes(&payload(len)).await;
+    let seq = cluster
+        .blobs
+        .add_seq([member])
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+
+    let cut = bytes_through_group(len as u64, K);
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let data_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holder = forgery({
+        let data_requests = Arc::clone(&data_requests);
+        move |request: GetRequest| {
+            let (from, to) = (from.clone(), to.clone());
+            let data_requests = Arc::clone(&data_requests);
+            async move {
+                let answer = ask(from, to, request.clone()).await;
+                if request.ranges == preflight_ranges() {
+                    return answer;
+                }
+                // 1 is the member list, 2 is the member: cut that one.
+                let nth = data_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if nth == 2 {
+                    answer[..cut].to_vec()
+                } else {
+                    answer
+                }
+            }
+        }
+    })
+    .await;
+    let handle = holder.handle(seq);
+    let local = Blobs::memory();
+
+    handle
+        .fetch_into(&local)
+        .await
+        .expect_err("an answer that stops after 100 groups does not complete a fetch");
+
+    let second = handle
+        .fetch_into(&local)
+        .await
+        .expect("the retry completes");
+    println!("resume: read {} kept {}", second.read, second.kept);
+    assert_eq!(
+        second.kept,
+        32 + K * GROUP,
+        "the store kept the member list and exactly the {K} groups that arrived whole"
+    );
+    assert_eq!(
+        second.read,
+        len as u64 - K * GROUP,
+        "and only what it lacked crossed the wire: no verified group twice"
+    );
+    assert_eq!(
+        handle.missing(&local).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    let read = read_back(&local, &[member]).await;
+    assert_eq!(
+        read,
+        vec![payload(len)],
+        "and the member is whole and identical"
+    );
+}
+
+/// Read a held blob back through the local reader, hashing as it streams, and
+/// say the longest piece it handed out.
+async fn stream_and_hash(
+    blobs: &Blobs,
+    id: BlobId,
+) -> keylink::Result<(Vec<u8>, blake3::Hash, usize)> {
+    let mut reader = blobs.reader(id).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = Vec::with_capacity(reader.total_len() as usize);
+    let mut longest = 0;
+    while let Some(chunk) = reader.next_chunk().await? {
+        hasher.update(&chunk);
+        longest = longest.max(chunk.len());
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, hasher.finalize(), longest))
+}
+
+/// The local reader: a fetched closure is read back member by member, every
+/// byte equal to what was stored and the BLAKE3 of it equal to the address, and
+/// no piece is longer than a chunk group, so a blob of any size is read in a
+/// bounded amount of memory.
+#[tokio::test]
+async fn a_fetched_closure_is_read_back_locally_and_hashes_to_its_addresses() {
+    let stack = stack(300).await;
+    let (_, handle) = stack.client.snapshot().await.expect("the one call");
+    let local = Blobs::memory();
+    handle
+        .fetch_into(&local)
+        .await
+        .expect("fetches the closure");
+
+    for (nth, id) in stack.ids.iter().enumerate() {
+        let (bytes, hash, longest) = stream_and_hash(&local, *id).await.expect("held, so read");
+        assert_eq!(bytes, member(nth as u32), "member {nth} reads back intact");
+        assert_eq!(hash.as_bytes(), id.as_bytes(), "and hashes to its address");
+        assert!(
+            longest <= 16 * 1024,
+            "a piece of {longest} bytes is over a chunk group"
+        );
+    }
+    // The member list too, which is a held blob like any other.
+    let (list, hash, _) = stream_and_hash(&local, stack.seq.id()).await.expect("held");
+    assert_eq!(list.len(), 300 * 32);
+    assert_eq!(hash.as_bytes(), stack.seq.id().as_bytes());
+
+    // A large blob streams in pieces of a chunk group and not in one.
+    let big = payload(3 * 1024 * 1024 + 7);
+    let id = local.add_bytes(big.clone()).await.expect("stores");
+    let (bytes, hash, longest) = stream_and_hash(&local, id).await.expect("held");
+    assert_eq!(bytes, big);
+    assert_eq!(hash.as_bytes(), id.as_bytes());
+    assert_eq!(longest, 16 * 1024, "the pieces are the chunk groups");
+    // And the convenience, with its bound.
+    assert_eq!(
+        local
+            .read_to_bytes(stack.ids[0], 4096)
+            .await
+            .expect("small"),
+        member(0).as_slice()
+    );
+    assert!(matches!(
+        local.read_to_bytes(id, 1024).await,
+        Err(Error::BlobTooLarge { len, limit: 1024, .. }) if len == big.len() as u64
+    ));
+}
+
+/// A blob the store does not hold in full is refused with a typed error and no
+/// byte of it, whether it is absent or only partly here.
+#[tokio::test]
+async fn a_blob_the_store_does_not_hold_in_full_is_refused_by_the_local_reader() {
+    let absent = Blobs::memory();
+    let id = Blobs::memory()
+        .add_bytes(payload(40_000))
+        .await
+        .expect("stores");
+    assert!(matches!(
+        absent.reader(id).await,
+        Err(Error::BlobNotHeld { held: 0, .. })
+    ));
+    assert!(matches!(
+        absent.read_to_bytes(id, 1 << 20).await,
+        Err(Error::BlobNotHeld { held: 0, .. })
+    ));
+
+    // Partly here: three groups of a five-group blob arrived before the cut.
+    const GROUP: u64 = 16 * 1024;
+    let len = 4 * GROUP + 5;
+    let cluster = cluster().await;
+    let member = cluster.add_bytes(&payload(len as usize)).await;
+    cluster
+        .grant_content(&cluster.peer, &[Content::Blob(member)])
+        .await;
+    let cut = bytes_through_group(len, 3);
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let holder = forgery(move |request: GetRequest| {
+        let (from, to) = (from.clone(), to.clone());
+        async move {
+            let answer = ask(from, to, request.clone()).await;
+            if request.ranges == preflight_ranges() {
+                answer
+            } else {
+                answer[..cut].to_vec()
+            }
+        }
+    })
+    .await;
+    let local = Blobs::memory();
+    holder
+        .handle(member)
+        .fetch_into(&local)
+        .await
+        .expect_err("cut after three groups");
+    match local.reader(member).await {
+        Err(Error::BlobNotHeld { held, .. }) => assert_eq!(held, 3 * GROUP),
+        other => panic!("a partly held blob must be refused, got {other:?}"),
+    }
+    assert!(local.read_to_bytes(member, 1 << 20).await.is_err());
+}
+
+// ═══════════════════════════════════════ a blob listed in two windows is counted once
+
+/// `Fetched` counts each distinct blob once for the whole fetch, not once a
+/// window. `[A; 4097]` is two windows (4096 and 1) listing the same blob.
+///
+/// With `A` absent: the first window reads it, and the second must not count the
+/// bytes that were just read as `kept`. The exact counters:
+///
+/// ```text
+/// read = A (30 000) + the root's 131 104 bytes + its size probe's last chunk (32)
+/// kept = 0
+/// ```
+///
+/// With `A` already held: it is `kept` once, not twice, and only the root crosses.
+///
+/// ```text
+/// read = 131 104 + 32      kept = 30 000
+/// ```
+///
+/// Watched red with `scripts/break-once.sh` (row `HK71`) by replacing
+/// `.filter(|(_, member)| touched.insert(**member))`
+/// with `.filter(|(_, member)| true || touched.insert(**member))` in
+/// `keylink/src/blobs.rs`: the second window counts `A` again, `kept` is 30,000
+/// where it should be 0 (absent) and 60,000 where it should be 30,000 (held).
+#[tokio::test]
+async fn a_blob_listed_in_two_windows_is_counted_once_whether_absent_or_held() {
+    const LEN: usize = 30_000;
+    let cluster = cluster().await;
+    let a = cluster.add_bytes(&payload(LEN)).await;
+    let seq = cluster
+        .blobs
+        .add_seq(vec![a; 4097])
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+    let handle = BlobHandle::new(
+        &cluster.peer,
+        cluster.server.endpoint().addr(),
+        Content::Closure(seq.id()),
+    );
+    let root = 4097 * 32;
+    let probe = (root - 1) % 1024 + 1;
+    assert_eq!((root, probe), (131_104, 32));
+
+    let absent = Blobs::memory();
+    let fetched = handle.fetch_into(&absent).await.expect("fetches");
+    assert_eq!(fetched.read, (LEN + root + probe) as u64);
+    assert_eq!(fetched.kept, 0, "nothing was held before this call");
+
+    let held = Blobs::memory();
+    held.add_bytes(payload(LEN)).await.expect("stores");
+    let fetched = handle.fetch_into(&held).await.expect("fetches");
+    assert_eq!(fetched.read, (root + probe) as u64);
+    assert_eq!(fetched.kept, LEN as u64, "held once, listed 4097 times");
+}
+
+// ═══════════════════════════════════════ on a disk (needs `--features blobs-fs`)
+//
+// These run under the literal invocation
+// `cargo test -p keylink --features blobs-fs --test blobs on_disk_`, which is the
+// `blobs-fs` command in `mise.toml`'s `test` task: a default build has no file
+// store to put a partial blob in or to corrupt.
+
+#[cfg(feature = "blobs-fs")]
+mod on_disk {
+    use super::*;
+    use iroh_blobs::store::fs::FsStore;
+
+    /// A fresh directory, removed when it goes out of scope.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos();
+            Self(
+                std::env::temp_dir()
+                    .join(format!("keylink-{what}-{}-{unique}", std::process::id())),
+            )
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// The data file of the one big blob in a file store's directory.
+    fn data_file(root: &std::path::Path, len: u64) -> std::path::PathBuf {
+        fn walk(dir: &std::path::Path, len: u64, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("a readable directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    walk(&path, len, found);
+                } else if path.extension().is_some_and(|ext| ext == "data")
+                    && std::fs::metadata(&path).expect("metadata").len() == len
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(root, len, &mut found);
+        assert_eq!(
+            found.len(),
+            1,
+            "one data file of {len} bytes under {root:?}"
+        );
+        found.remove(0)
+    }
+
+    fn flip_a_byte(file: &std::path::Path, at: u64) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file)
+            .expect("opens the data file");
+        let mut byte = [0u8; 1];
+        handle.seek(SeekFrom::Start(at)).expect("seeks");
+        handle.read_exact(&mut byte).expect("reads");
+        byte[0] ^= 0xFF;
+        handle.seek(SeekFrom::Start(at)).expect("seeks");
+        handle.write_all(&byte).expect("writes");
+        handle.sync_all().expect("syncs");
+    }
+
+    /// **The local reader refuses bytes that do not verify.**
+    ///
+    /// A blob of 1 MiB is stored on a disk and one byte of its data file, at
+    /// 900,000 (in the fourth window of 256 KiB), is flipped.
+    ///
+    /// First, what iroh-blobs does with it: the file store's own `get_bytes`,
+    /// which is its export, validates what it reads down from the address it was
+    /// asked for, and refuses the damaged blob with `LeafHashMismatch(864)` (the
+    /// leaf at chunk 864, which holds byte 900,000). The reader's own decode is a
+    /// second, independent verification of the same bytes, not the only one.
+    ///
+    /// Then the local reader on the same damage: it delivers the three windows
+    /// before the damaged one (786,432 bytes, each equal to what was stored) and
+    /// then fails with `BlobCorrupt { offset: 786432 }`, and the damaged window's
+    /// bytes are never handed out. The decode that checks the path to the address
+    /// is covered on its own, with a flipped parent and a wrong size, by
+    /// `a_window_verifies_against_its_address_and_nothing_else_does`.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK67`) by replacing
+    /// `return Err(if damaged(&error) && (!short || self.alive().await) {`
+    /// with `return Err(if false {` in `keylink/src/blobs.rs`: the store's refusal then
+    /// arrives as `Error::Io` and the typed-error assertion fails. Watched: `expected
+    /// BlobCorrupt at the damaged window, got Io(Custom { kind: Other, error: "inner
+    /// error: Error::Io" })`.
+    #[tokio::test]
+    async fn on_disk_the_local_reader_refuses_a_blob_whose_data_changed() {
+        const LEN: usize = 1024 * 1024;
+        const AT: u64 = 900_000;
+        let content = payload(LEN);
+
+        // 1. iroh-blobs alone.
+        let theirs = Scratch::new("iroh-export");
+        let store = FsStore::load(&theirs.0).await.expect("opens a file store");
+        let tag = store.add_bytes(content.clone()).await.expect("stores");
+        store.sync_db().await.expect("commits");
+        flip_a_byte(&data_file(&theirs.0, LEN as u64), AT);
+        let exported = store
+            .get_bytes(tag.hash)
+            .await
+            .expect_err("the file store's export refuses data that no longer matches");
+        assert!(
+            format!("{exported:?}").contains("LeafHashMismatch(864)"),
+            "refused at the damaged leaf: {exported:?}"
+        );
+        store.shutdown().await.expect("shuts down");
+
+        // 2. keylink's reader on the same damage.
+        let ours = Scratch::new("keylink-reader");
+        let blobs = Blobs::persistent(&ours.0, keylink::Retention::Forever)
+            .await
+            .expect("opens a file store");
+        let id = blobs.add_bytes(content.clone()).await.expect("stores");
+        blobs.flush().await.expect("commits");
+        // Read it once undamaged: the control.
+        let (clean, hash, _) = stream_and_hash(&blobs, id).await.expect("verifies");
+        assert_eq!(clean, content);
+        assert_eq!(hash.as_bytes(), id.as_bytes());
+
+        flip_a_byte(&data_file(&ours.0, LEN as u64), AT);
+        let mut reader = blobs.reader(id).await.expect("held in full, so it opens");
+        let mut delivered = Vec::new();
+        let error = loop {
+            match reader.next_chunk().await {
+                Ok(Some(chunk)) => delivered.extend_from_slice(&chunk),
+                Ok(None) => panic!("the damaged blob read to its end"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                Error::BlobCorrupt {
+                    offset: 786_432,
+                    ..
+                }
+            ),
+            "expected BlobCorrupt at the damaged window, got {error:?}"
+        );
+        assert_eq!(delivered.len(), 786_432, "the three windows before it");
+        assert_eq!(delivered, content[..786_432], "each verified and equal");
+        assert!(blobs.read_to_bytes(id, 2 << 20).await.is_err());
+    }
+
+    /// **A store that cannot be read is not a blob that does not verify.** The
+    /// same 1 MiB blob, committed to a disk, has its data file removed under the
+    /// open store. The blob is still held as far as the database knows, so the
+    /// reader opens, and the first window fails because the file is gone: that is `Error::Io`, with the cause, and not `Error::BlobCorrupt`,
+    /// which says the bytes are wrong and that a retry will not help.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK72`) by replacing
+    /// `None => by_kind(io),`
+    /// with `None => true,` in `keylink/src/blobs.rs` (every export failure that
+    /// is not an `EncodeError` counted as damage): the assertion below fails with
+    /// `BlobCorrupt`. Watched: `an unreadable store is an I/O failure, got
+    /// BlobCorrupt { id: BlobId(74cb441f..), offset: 0 }`.
+    #[tokio::test]
+    async fn on_disk_a_store_that_cannot_be_read_is_an_io_error_and_not_corruption() {
+        const LEN: usize = 1024 * 1024;
+        let scratch = Scratch::new("unreadable");
+        let blobs = Blobs::persistent(&scratch.0, keylink::Retention::Forever)
+            .await
+            .expect("opens a file store");
+        let id = blobs.add_bytes(payload(LEN)).await.expect("stores");
+        blobs.flush().await.expect("commits");
+        std::fs::remove_file(data_file(&scratch.0, LEN as u64)).expect("removes the data file");
+
+        let mut reader = blobs.reader(id).await.expect("the database still holds it");
+        let error = reader
+            .next_chunk()
+            .await
+            .expect_err("the first window cannot be read");
+        assert!(
+            matches!(error, Error::Io(_)),
+            "an unreadable store is an I/O failure, got {error:?}"
+        );
+    }
 }
