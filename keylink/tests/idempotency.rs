@@ -167,6 +167,22 @@ fn key(text: &str) -> IdempotencyKey {
     IdempotencyKey::new(text).expect("a valid key")
 }
 
+/// Wait until the ledger holds a running claim under `name`.
+///
+/// What the tests that start a slow call and then send a second one under the same
+/// key need to know, asked of the ledger and not guessed from a sleep: a second
+/// call that reaches the server first takes the claim itself, and the test is then
+/// about something else. Bounded, so a claim that never lands is a red test.
+async fn until_running(client: &till::Client, name: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while client.key_state(key(name)).await.expect("asks") != keylink::KeyState::Running {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first call's claim reached the ledger within 30 s");
+}
+
 /// An oversized key, built the only way a peer can build one.
 ///
 /// `IdempotencyKey::new` refuses this, and `derive(Deserialize)` does not call
@@ -1796,8 +1812,8 @@ async fn a_second_caller_attaches_to_a_live_key() {
         let scoped = client.with_idempotency(key("k"));
         tokio::spawn(async move { scoped.slow(400).await })
     };
-    // Long enough that the claim is taken and the handler is inside its sleep.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The claim is taken, and the handler is entered or about to be.
+    until_running(&client, "k").await;
 
     let attached = client
         .with_idempotency(keylink::Idempotency::attaching_for(
@@ -1861,8 +1877,8 @@ async fn an_attacher_on_a_recordless_service_waits_and_is_told_it_ran() {
         let scoped = client.with_idempotency(key("k"));
         tokio::spawn(async move { scoped.slow(400).await })
     };
-    // Long enough that the claim is taken and the handler is inside its sleep.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The claim is taken, and the handler is entered or about to be.
+    until_running(&client, "k").await;
 
     let refused = client
         .with_idempotency(keylink::Idempotency::attaching_for(
@@ -1901,7 +1917,7 @@ async fn an_attach_that_outlives_its_budget_returns() {
         let scoped = client.with_idempotency(key("k"));
         tokio::spawn(async move { scoped.slow(3_000).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_running(&client, "k").await;
 
     let error = client
         .with_idempotency(keylink::Idempotency::attaching_for(
@@ -2354,7 +2370,7 @@ mod stored {
             // waits for the claim itself instead of for a duration that happens to
             // be long enough on this machine.
             let mut claimed = false;
-            for _ in 0..200 {
+            for _ in 0..3_000 {
                 if fixture
                     .client
                     .key_state(key("in-flight"))

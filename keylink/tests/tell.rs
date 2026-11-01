@@ -51,7 +51,9 @@ async fn a_tell_is_delivered_and_handled() {
     // observe it is to ask afterwards on a stream that DOES have a reply. This
     // is also the shape a caller has to use, and saying so here is the point.
     let mut seen = 0u64;
-    for _ in 0..50 {
+    // Thirty seconds of polling, which a pass leaves at the first read: the bound
+    // is for a handler that never runs, not for a machine that is slow.
+    for _ in 0..1_500 {
         seen = client.count().await.expect("counts");
         if seen > 0 {
             break;
@@ -101,7 +103,7 @@ async fn tells_on_one_client_arrive_in_the_order_they_were_sent() {
     }
 
     let mut seen = 0u64;
-    for _ in 0..100 {
+    for _ in 0..1_500 {
         seen = client.count().await.expect("counts");
         if seen == 20 {
             break;

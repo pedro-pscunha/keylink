@@ -1149,7 +1149,7 @@ async fn finish_runs_on_stop_and_not_on_abort() {
     aborted.abort();
     // The abort is cooperative, so wait for it to have landed rather than
     // asserting against a clock.
-    for _ in 0..100 {
+    for _ in 0..6_000 {
         if !aborted.is_running() {
             break;
         }

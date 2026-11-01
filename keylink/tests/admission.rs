@@ -967,7 +967,7 @@ async fn a_departed_peer_is_not_reported_as_revoked() {
     assert_eq!(policy.live(), 1);
 
     client.close().await.expect("closes");
-    for _ in 0..100 {
+    for _ in 0..600 {
         if policy.live() == 0 {
             break;
         }
