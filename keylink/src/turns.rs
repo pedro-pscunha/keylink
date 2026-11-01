@@ -856,7 +856,11 @@ impl<T> Deferred<T> {
     /// - **It is cancelled when the actor ends**, by `stop`, `abort`, a refusal, a
     ///   feed that ran out, or a restart. The caller is told [`Withheld::Gone`] or
     ///   [`Withheld::Restarting`], read from the actor's standing, which is settled
-    ///   before the work is cancelled. `stop` does not wait for it.
+    ///   before the work is cancelled. The actor's end waits for the cancelled work
+    ///   to be gone, so that reply dies reading its own incarnation's standing and
+    ///   never a later one's; a work future that blocks its thread inside a poll
+    ///   delays the end, and so the restart, by that long. `stop` does not wait for
+    ///   the work to finish, only for it to be cancelled.
     /// - **A panic in the work** tells the caller [`Withheld::Dropped`]. The actor
     ///   goes on serving.
     /// - **It is not durable.** A crash loses it. Reconcile what was pending when
@@ -2537,7 +2541,18 @@ where
     // caller, and the caller reads that verdict when its task is cancelled. The
     // work is cancelled before `finish`, which flushes the state and has no use
     // for it.
-    drop(away);
+    //
+    // **And waited for.** Cancelling a task asks for it and does not wait: the
+    // future, and the parked reply inside it, are destroyed only when the
+    // cancellation has run, and a task that is in the middle of a poll finishes
+    // the poll first. A supervisor starts the next incarnation and publishes
+    // `Running` for it as soon as this function returns, so a reply that died
+    // after that read `Running` and told its caller `Dropped` about a reply this
+    // incarnation's end had taken. `shutdown` returns when every task is gone,
+    // so every reply dies reading this incarnation's own verdict.
+    if let Some(mut set) = away {
+        set.shutdown().await;
+    }
 
     for observer in &mut hooks {
         // Shared reborrow first, and the `FnOnce`-forcing rebind inside, for the

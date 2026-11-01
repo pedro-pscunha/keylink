@@ -508,12 +508,13 @@ impl Back<Checked, Landed> for Repo {
 The work belongs to the actor. It starts only after the launching turn commits, so
 an observer that refuses that turn stops it from ever starting, and a durable
 actor's work starts only after the turn that chose it is on disk. It is cancelled
-when the actor ends, and the parked caller is told `Gone` or `Restarting`. The
-`back` turn is an ordinary turn: the panic guard, the observers and the commit all
-apply, and other turns ran while the work was away, so `back` re-checks what the
-launching turn assumed. The work itself holds no reference to the state. It is not
-durable: a crash loses it, and the actor reconciles what was pending on restart.
-`stop` does not wait for it. Calling `away` outside a turn, or with another state
+when the actor ends, and the actor's end waits for the cancelled work to be gone,
+so the parked caller is told `Gone` or `Restarting` by its own incarnation and
+never by the next one. The `back` turn is an ordinary turn: the panic guard, the
+observers and the commit all apply, and other turns ran while the work was away,
+so `back` re-checks what the launching turn assumed. The work itself holds no
+reference to the state. It is not durable: a crash loses it, and the actor
+reconciles what was pending on restart. `stop` does not wait for it to finish. Calling `away` outside a turn, or with another state
 type than the running turn's, drops the work and tells the caller `Dropped` on the
 first call.
 

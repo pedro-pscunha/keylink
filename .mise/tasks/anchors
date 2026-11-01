@@ -2369,13 +2369,15 @@ ANCHORS = [
      "    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
     # ── off-turn work (`Deferred::away`), the three breaks of `tests/away.rs`. All
     # cross-file, so the records' quotes add no occurrence to the target. The
-    # indentation is part of each literal and is what makes it unique: `OT2`'s bare
-    # `drop(away);` is also in a comment, and `OT3`'s bare line is the only match but
+    # indentation is part of each literal and is what makes it unique: `OT2` and `OT6`
+    # share the cancellation line, broken two ways, and `OT3`'s bare line is the only match but
     # for a guard arm a rewrite would add next to it.
     ("OT1", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "                        while let Poll::Ready(Some(done)) = set.poll_join_next(cx) {"),
     ("OT2", "keylink/tests/away.rs", "keylink/src/turns.rs",
-     "    drop(away);"),
+     "        set.shutdown().await;"),
+    ("OT6", "keylink/tests/away.rs", "keylink/src/turns.rs",
+     "        set.shutdown().await;"),
     ("OT3", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => crate::away::push::<A>(Box::pin(async move {"),
     ("OT5", "keylink/tests/away.rs", "keylink/src/away.rs",

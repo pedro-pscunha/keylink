@@ -10,6 +10,7 @@
 //! | the actor serves other messages while the work is away, and the work then comes back as a turn | `a_slow_off_turn_step_does_not_hold_the_actor` |
 //! | the actor ending cancels the work and tells the parked caller the truth | `stopping_while_work_is_away_answers_the_parked_caller` |
 //! | a launching turn that is refused never starts its work | `work_launched_by_a_refused_turn_never_starts` |
+//! | work cancelled by a restart answers its caller with that restart, never with the next incarnation | `work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_incarnation` |
 //! | a `back` that sends before it returns its future is still gated by its turn's commit | `a_back_that_sends_eagerly_is_still_gated_by_its_turns_commit` |
 //! | a `back` that launches before it returns its future launches nothing for a refused turn | `a_back_that_relaunches_eagerly_launches_nothing_for_a_refused_turn` |
 //! | a `back` that panics before it returns its future costs the message and not the actor | `a_back_that_panics_before_returning_a_future_costs_the_message_and_not_the_actor` |
@@ -46,6 +47,9 @@ keylink::service! {
 
     /// How many `back` turns have run, and the sum of what they carried.
     rpc Applied() -> u64;
+
+    /// Does nothing. A test's observer refuses it, which ends an incarnation.
+    rpc Retire() -> u64;
 }
 
 /// What the work does. One enum and not three services, so the three tests share a
@@ -61,6 +65,13 @@ enum Work {
     },
     /// Sets a flag the moment it runs.
     Flag(Arc<AtomicBool>),
+    /// Blocks the worker thread that polls it for a while, after saying it
+    /// started, and then waits for ever. Cancelling it has to wait for the poll to
+    /// return, which is the slow destruction a restart must not outrun.
+    Blocks {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        for_how_long: Duration,
+    },
 }
 
 /// An ordered record of what happened to the work, shared with the test.
@@ -113,6 +124,20 @@ impl Work {
                     n
                 })
             }
+            Self::Blocks {
+                started,
+                for_how_long,
+            } => {
+                let started = started.lock().unwrap().take();
+                let for_how_long = *for_how_long;
+                Box::pin(async move {
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    std::thread::sleep(for_how_long);
+                    std::future::pending::<u64>().await
+                })
+            }
         }
     }
 }
@@ -148,6 +173,10 @@ impl desk::Actor for Desk {
 
     async fn applied(&mut self, _cx: Caller<'_>) -> u64 {
         self.applied
+    }
+
+    async fn retire(&mut self, _cx: Caller<'_>) -> u64 {
+        0
     }
 }
 
@@ -240,9 +269,10 @@ async fn a_slow_off_turn_step_does_not_hold_the_actor() {
 /// about how soon.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `run_loop`'s
-/// `drop(away);` (indented four spaces) and the replacement `if let Some(mut set) =
-/// away { set.detach_all(); }`, which lets the work outlive its actor. The fallback
-/// fires and the log reads `left: ["released", "dropped"]`, `right: ["dropped"]`.
+/// `set.shutdown().await;` (indented eight spaces; registered as `OT2`) and the
+/// replacement `set.detach_all();`, which lets the work outlive its actor. The
+/// fallback fires and the log reads `left: ["released", "dropped"]`, `right:
+/// ["dropped"]`.
 #[tokio::test(start_paused = true)]
 async fn stopping_while_work_is_away_answers_the_parked_caller() {
     let log = Log::default();
@@ -347,6 +377,102 @@ async fn work_launched_by_a_refused_turn_never_starts() {
         .await
         .expect("the actor ends when an observer refuses");
     assert!(!ran.load(Ordering::SeqCst), "the work never started");
+}
+
+// ───────────────────────────────────────────────── work cancelled by a restart
+
+/// Refuses a turn named `Retire`, without declaring the refusal fatal, which ends
+/// the incarnation and lets its supervisor start another.
+struct RetiresTheIncarnation;
+
+impl Observer<Desk> for RetiresTheIncarnation {
+    fn name(&self) -> &'static str {
+        "retiring"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Desk, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let retire = turn.method == "Retire";
+        Box::pin(async move {
+            if retire {
+                Err(Stop::new("this incarnation is retired"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// A caller parked behind away work is told what became of **its** incarnation,
+/// even when the cancelled work is slow to die.
+///
+/// Cancelling a task asks for it and does not wait: the future, and the parked
+/// reply inside it, are destroyed only when the cancellation has run, and a task
+/// that is in the middle of a poll finishes the poll first. Here the work blocks
+/// its worker for 300 ms, so the reply outlives the incarnation by that long. The
+/// supervisor's backoff is ten milliseconds, and a restart publishes the standing
+/// `Running` for the new incarnation; a reply that died after that read `Running`
+/// and told its caller `Dropped`, *the actor is serving and this reply was thrown
+/// away*, about a reply the old incarnation's end had taken. The loop now waits
+/// for the cancelled work to be gone before the incarnation is over, so the reply
+/// dies while the standing is still `Restarting`.
+///
+/// Four workers, because on one the blocked poll would hold up the supervisor
+/// too and there would be no window to close.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `run_loop`'s
+/// `set.shutdown().await;` (indented eight spaces; registered as `OT6`) and the
+/// replacement `drop(set);`, which cancels without waiting. Watched:
+/// `the caller is told its own incarnation restarted: got Err(Turn(Dropped))`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_incarnation() {
+    let (started_tx, started) = oneshot::channel();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let desk = desk::restarting(
+        move || {
+            let started_tx = Arc::clone(&started_tx);
+            async move {
+                let observers: Vec<Box<dyn Observer<Desk>>> = vec![Box::new(RetiresTheIncarnation)];
+                let work = Work::Blocks {
+                    started: Mutex::new(started_tx.lock().unwrap().take()),
+                    for_how_long: Duration::from_millis(300),
+                };
+                Ok((Desk::new(work), observers, ()))
+            }
+        },
+        keylink::Intensity::new(
+            std::num::NonZeroU32::new(2).expect("a budget of at least one"),
+            Duration::from_millis(20),
+        )
+        .expect("a recovery span whose backoff is not zero"),
+    )
+    .actor();
+
+    let landing = {
+        let desk = desk.clone();
+        tokio::spawn(async move { desk.land(1).await })
+    };
+    started.await.expect("the work started");
+
+    // The work is now blocking a worker mid-poll. Ending the incarnation cancels it.
+    let refused = desk.retire().await;
+    assert!(
+        matches!(&refused, Err(Unanswered::Turn(Withheld::Refused { .. }))),
+        "the observer ended the incarnation: got {refused:?}"
+    );
+
+    let landed = n0_future::time::timeout(Duration::from_secs(30), landing)
+        .await
+        .expect("a parked caller must not outlive its incarnation as a hang")
+        .expect("the caller is not itself panicking");
+    assert!(
+        matches!(&landed, Err(Unanswered::Turn(Withheld::Restarting { .. }))),
+        "the caller is told its own incarnation restarted: got {landed:?}"
+    );
+    assert_eq!(
+        desk.applied().await.expect("the next incarnation serves"),
+        0,
+        "and the restart did happen"
+    );
 }
 
 // ───────────────────────────────────── a `back` that does work before it returns a future
