@@ -151,7 +151,8 @@ impl Trust {
     }
     /// Verify and retain one chain at the current time. Refused data is not stored.
     /// Identical certificate-id sequences are a no-op. At capacity, the chain
-    /// with the earliest expiry is evicted. Returns the first verification fault.
+    /// with the earliest expiry is evicted. Returns `NotRetained` if the offered
+    /// chain loses that comparison, or the first verification fault.
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
@@ -173,7 +174,11 @@ impl Trust {
                 .enumerate()
                 .min_by_key(|(_, c)| c.caveats().validity.not_after())
             {
+                let offered = index == chains.len() - 1;
                 chains.remove(index);
+                if offered {
+                    return Err(ChainError::NotRetained);
+                }
             }
         }
         Ok(())

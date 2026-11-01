@@ -502,3 +502,36 @@ async fn a_forbidden_principal_does_not_mask_an_authorized_candidate() {
         .unwrap();
     assert_eq!(client.read().await.unwrap(), 7);
 }
+
+#[tokio::test]
+async fn presentation_never_reports_held_for_an_evicted_offer() {
+    let (root, device, _, trust) = fixture();
+    for serial in 0..trust::MAX_CHAINS_PER_HOLDER as u64 {
+        let mut delegation = grant(device.public(), "repo/a", 0);
+        delegation.serial = serial;
+        trust
+            .insert(Chain::new(vec![
+                Certificate::issue(&root, delegation).unwrap()
+            ]))
+            .unwrap();
+    }
+    let mut shorter = grant(device.public(), "repo/b", 0);
+    shorter.caveats.validity = Validity::new(
+        Timestamp::from_unix_secs(0),
+        Timestamp::from_unix_secs(Timestamp::now().unix_secs() + 300),
+    )
+    .unwrap();
+    let offered = Chain::new(vec![Certificate::issue(&root, shorter).unwrap()]);
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let _running = Server::builder(&node)
+        .service(trust.presentation().build())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        trust::present(&peer, node.endpoint().addr(), &offered)
+            .await
+            .unwrap(),
+        Presented::Refused(ChainError::NotRetained)
+    );
+}

@@ -304,6 +304,9 @@ pub enum Widening {
     Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, postcard_schema::Schema,
 )]
 pub enum ChainError {
+    /// The offered chain lost the per-holder retention comparison.
+    #[error("the offered chain was not retained")]
+    NotRetained,
     /// No links.
     #[error("the chain has no links")]
     Empty,
