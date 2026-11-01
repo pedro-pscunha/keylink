@@ -247,8 +247,8 @@ async fn a_connection_admitted_during_a_revocation_is_still_closed() {
 }
 
 #[test]
-// Search `    pub(super) fn trust_roots(&mut self, roots: &Roots) {`.
-// Made red with scripts/break-once.sh replacing it with `    pub(super) fn trust_roots(&mut self, roots: &Roots) {
+// Search `    pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {`.
+// Made red with scripts/break-once.sh replacing it with `    pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {
 //         self.accepted.clear();`.
 // Watched: removing the revoker root resurrected the previously revoked chain.
 fn removing_a_root_never_resurrects_an_accepted_revocation() {
@@ -362,7 +362,7 @@ fn trust_store_budgets_bound_retained_chains() {
     );
 }
 #[test]
-// Search `                    >= super::MAX_PENDING_REVOCATIONS`.
+// Search `                >= super::MAX_PENDING_REVOCATIONS`.
 // Made red with scripts/break-once.sh replacing it with `                    > super::MAX_PENDING_REVOCATIONS`.
 // Watched: one additional pending revocation was accepted instead of a typed capacity error.
 fn trust_store_budgets_bound_pending_records_and_never_drop_tombstones() {
@@ -406,4 +406,157 @@ fn trust_store_budgets_bound_pending_records_and_never_drop_tombstones() {
         trust.insert(chain).unwrap_err(),
         ChainError::Revoked { at: 0 }
     );
+}
+
+#[test]
+fn revoked_leaf_churn_exhausts_its_revoker_without_retaining_the_leaves() {
+    let (root, delegate, holder) = keys();
+    let parent = Certificate::issue(&root, grant(delegate.public(), "repo", 1)).unwrap();
+    let trust = Trust::new(Roots::only([root.public()]).unwrap());
+    for serial in 0..=MAX_ACCEPTED_PER_REVOKER as u64 {
+        let mut delegation = grant(holder.public(), "repo/a", 0);
+        delegation.serial = serial;
+        let leaf = Certificate::issue(&delegate, delegation).unwrap();
+        trust
+            .apply(Change::Revoke(Revocation::issue(&delegate, leaf.id())))
+            .unwrap();
+        let error = trust
+            .insert(Chain::new(vec![parent.clone(), leaf]))
+            .unwrap_err();
+        if serial < MAX_ACCEPTED_PER_REVOKER as u64 {
+            assert_eq!(error, ChainError::Revoked { at: 1 });
+        } else {
+            assert_eq!(
+                error,
+                ChainError::RevokerExhausted {
+                    revoker: *delegate.public().as_bytes()
+                }
+            );
+        }
+    }
+    let store = trust.store();
+    assert_eq!(store.revoked.revision(), (MAX_ACCEPTED_PER_REVOKER, 1));
+    assert_eq!(store.revoked.accounted_keys(), 2);
+    assert!(store.chains.is_empty());
+    assert!(store.revoked.is_exhausted(&delegate.public()));
+    assert!(!store.revoked.is_exhausted(&root.public()));
+    drop(store);
+    let sibling = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(budget_key(9000).public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    assert!(trust.verify(&sibling, Timestamp::now()).is_ok());
+}
+
+#[test]
+fn fresh_revoker_keys_cannot_bypass_the_common_issuer_budget() {
+    let (root, delegate, holder) = keys();
+    let parent = Certificate::issue(&root, grant(delegate.public(), "repo", 2)).unwrap();
+    let trust = Trust::new(Roots::only([root.public()]).unwrap());
+    for index in 0..MAX_ACCEPTED_PER_REVOKER + 32 {
+        let revoker = budget_key(10000 + index);
+        let intermediate =
+            Certificate::issue(&delegate, grant(revoker.public(), "repo", 1)).unwrap();
+        let leaf = Certificate::issue(&revoker, grant(holder.public(), "repo/a", 0)).unwrap();
+        trust
+            .apply(Change::Revoke(Revocation::issue(&revoker, leaf.id())))
+            .unwrap();
+        let error = trust
+            .insert(Chain::new(vec![parent.clone(), intermediate, leaf]))
+            .unwrap_err();
+        if index < MAX_ACCEPTED_PER_REVOKER {
+            assert_eq!(error, ChainError::Revoked { at: 2 });
+        } else {
+            assert_eq!(
+                error,
+                ChainError::RevokerExhausted {
+                    revoker: *delegate.public().as_bytes()
+                }
+            );
+        }
+    }
+    let store = trust.store();
+    assert_eq!(store.revoked.revision(), (MAX_ACCEPTED_PER_REVOKER, 1));
+    assert_eq!(store.revoked.accounted_keys(), MAX_ACCEPTED_PER_REVOKER + 2);
+    assert!(
+        store
+            .revoked
+            .pending
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum::<usize>()
+            <= MAX_PENDING_REVOCATIONS
+    );
+    assert!(store.chains.is_empty());
+}
+
+#[test]
+fn direct_and_root_promoted_budgets_never_evict_accepted_tombstones() {
+    let (root, _, holder) = keys();
+    let revoker = budget_key(20000);
+    let roots = Roots::only([root.public(), revoker.public()]).unwrap();
+    let purpose = Purpose::new("claims/read").unwrap();
+    let signed = Signed::sign(&revoker, &purpose, &7u64, Chain::default()).unwrap();
+    for promote in [false, true] {
+        let trust = Trust::new(if promote {
+            Roots::only([root.public()]).unwrap()
+        } else {
+            roots.clone()
+        });
+        let mut certificates = Vec::new();
+        for serial in 0..=MAX_ACCEPTED_PER_REVOKER as u64 {
+            let mut delegation = grant(holder.public(), "repo/a", 0);
+            delegation.serial = serial;
+            let certificate = Certificate::issue(&root, delegation).unwrap();
+            let result = trust.apply(Change::Revoke(Revocation::issue(
+                &revoker,
+                certificate.id(),
+            )));
+            if !promote && serial == MAX_ACCEPTED_PER_REVOKER as u64 {
+                assert_eq!(
+                    result.unwrap_err(),
+                    ChangeError::RevokerExhausted {
+                        revoker: revoker.public(),
+                        max: MAX_ACCEPTED_PER_REVOKER
+                    }
+                );
+            } else {
+                result.unwrap();
+            }
+            certificates.push(certificate);
+        }
+        if promote {
+            assert_eq!(
+                trust.apply(Change::Roots(roots.clone())).unwrap_err(),
+                ChangeError::RevokerExhausted {
+                    revoker: revoker.public(),
+                    max: MAX_ACCEPTED_PER_REVOKER
+                }
+            );
+        }
+        assert_eq!(
+            trust.store().revoked.revision(),
+            (MAX_ACCEPTED_PER_REVOKER, 1)
+        );
+        assert!(!trust.admitting(revoker.public()));
+        assert!(trust.admitting(root.public()));
+        assert!(matches!(
+            trust.open(&signed, &purpose, Timestamp::now()),
+            Err(SignedError::Chain(ChainError::RevokerExhausted { .. }))
+        ));
+        trust
+            .apply(Change::Roots(Roots::only([root.public()]).unwrap()))
+            .unwrap();
+        if promote {
+            certificates.sort_by_key(Certificate::id);
+        }
+        let first = Chain::new(vec![certificates[0].clone()]);
+        assert_eq!(
+            trust.verify(&first, Timestamp::now()).unwrap_err(),
+            ChainError::Revoked { at: 0 }
+        );
+        let last = Chain::new(vec![certificates[MAX_ACCEPTED_PER_REVOKER].clone()]);
+        assert!(trust.verify(&last, Timestamp::now()).is_ok());
+    }
 }

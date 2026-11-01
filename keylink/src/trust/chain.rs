@@ -14,70 +14,147 @@ use super::{
 pub(super) struct Revoked {
     pub(super) pending: BTreeMap<CertId, BTreeSet<PublicKey>>,
     accepted: BTreeSet<CertId>,
+    usage: BTreeMap<PublicKey, usize>,
+    exhausted: BTreeSet<PublicKey>,
 }
 impl Revoked {
     pub(super) fn new() -> Self {
         Self::default()
     }
-    pub(super) fn accepted_len(&self) -> usize {
-        self.accepted.len()
+    pub(super) fn revision(&self) -> (usize, usize) {
+        (self.accepted.len(), self.exhausted.len())
+    }
+    #[cfg(test)]
+    pub(super) fn accounted_keys(&self) -> usize {
+        self.usage.len()
+    }
+    pub(super) fn is_exhausted(&self, key: &PublicKey) -> bool {
+        self.exhausted.contains(key)
+    }
+
+    // Charge the actual signer first, then its proven issuers from nearest to
+    // farthest. Charging the root path bounds fresh-revoker-key churn too.
+    // No new accounting key is retained until the entire charge fits.
+    fn accept(
+        &mut self,
+        id: CertId,
+        revoker: PublicKey,
+        path: &[PublicKey],
+    ) -> Result<(), PublicKey> {
+        if self.accepted.contains(&id) {
+            self.pending.remove(&id);
+            return Ok(());
+        }
+        let mut seen = BTreeSet::new();
+        let charged: Vec<_> = std::iter::once(revoker)
+            .chain(path.iter().rev().copied())
+            .filter(|key| seen.insert(*key))
+            .collect();
+        for key in &charged {
+            if self.exhausted.contains(key)
+                || self.usage.get(key).copied().unwrap_or(0) >= super::MAX_ACCEPTED_PER_REVOKER
+            {
+                self.exhausted.insert(*key);
+                return Err(*key);
+            }
+        }
+        for key in charged {
+            *self.usage.entry(key).or_default() += 1;
+        }
+        self.accepted.insert(id);
+        self.pending.remove(&id);
+        Ok(())
     }
     pub(super) fn add(
         &mut self,
         revocation: &super::Revocation,
-        authoritative: bool,
+        authority: Option<&[PublicKey]>,
     ) -> Result<(), super::ChangeError> {
         let id = revocation.certificate();
+        let revoker = revocation.revoker();
         if self.accepted.contains(&id) {
             return Ok(());
         }
-        if authoritative {
-            self.accepted.insert(id);
-            self.pending.remove(&id);
-        } else {
-            let duplicate = self
-                .pending
-                .get(&id)
-                .is_some_and(|keys| keys.contains(&revocation.revoker()));
-            if !duplicate
-                && self.pending.values().map(BTreeSet::len).sum::<usize>()
-                    >= super::MAX_PENDING_REVOCATIONS
-            {
-                return Err(super::ChangeError::PendingRevocationsFull {
-                    max: super::MAX_PENDING_REVOCATIONS,
-                });
-            }
-            self.pending
-                .entry(id)
-                .or_default()
-                .insert(revocation.revoker());
+        if self.exhausted.contains(&revoker) {
+            return Err(super::ChangeError::RevokerExhausted {
+                revoker,
+                max: super::MAX_ACCEPTED_PER_REVOKER,
+            });
+        }
+        if let Some(path) = authority {
+            return self.accept(id, revoker, path).map_err(|revoker| {
+                super::ChangeError::RevokerExhausted {
+                    revoker,
+                    max: super::MAX_ACCEPTED_PER_REVOKER,
+                }
+            });
+        }
+        let duplicate = self
+            .pending
+            .get(&id)
+            .is_some_and(|keys| keys.contains(&revoker));
+        if !duplicate
+            && self.pending.values().map(BTreeSet::len).sum::<usize>()
+                >= super::MAX_PENDING_REVOCATIONS
+        {
+            return Err(super::ChangeError::PendingRevocationsFull {
+                max: super::MAX_PENDING_REVOCATIONS,
+            });
+        }
+        self.pending.entry(id).or_default().insert(revoker);
+        Ok(())
+    }
+    pub(super) fn trust_roots(&mut self, roots: &Roots) -> Result<(), super::ChangeError> {
+        let promotions: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|(id, revokers)| {
+                revokers
+                    .iter()
+                    .find(|key| roots.contains(key) && !self.is_exhausted(key))
+                    .map(|key| (*id, *key))
+            })
+            .collect();
+        for (id, revoker) in promotions {
+            self.accept(id, revoker, &[]).map_err(|revoker| {
+                super::ChangeError::RevokerExhausted {
+                    revoker,
+                    max: super::MAX_ACCEPTED_PER_REVOKER,
+                }
+            })?;
         }
         Ok(())
     }
-    pub(super) fn trust_roots(&mut self, roots: &Roots) {
-        self.pending.retain(|id, revokers| {
-            if revokers.iter().any(|key| roots.contains(key)) {
-                self.accepted.insert(*id);
-                false
-            } else {
-                true
-            }
-        });
-    }
-    fn revokes(&mut self, id: CertId, roots: &Roots, upstream: &BTreeSet<PublicKey>) -> bool {
+    fn revokes(
+        &mut self,
+        id: CertId,
+        roots: &Roots,
+        upstream: &[PublicKey],
+    ) -> Result<bool, ChainError> {
         if self.accepted.contains(&id) {
-            return true;
+            return Ok(true);
         }
-        if self.pending.get(&id).is_some_and(|revokers| {
+        let revoker = self.pending.get(&id).and_then(|revokers| {
             revokers
                 .iter()
-                .any(|key| roots.contains(key) || upstream.contains(key))
-        }) {
-            self.accepted.insert(id);
-            self.pending.remove(&id);
-            return true;
-        }
-        false
+                .find(|key| {
+                    !self.is_exhausted(key) && (roots.contains(key) || upstream.contains(key))
+                })
+                .copied()
+        });
+        let Some(revoker) = revoker else {
+            return Ok(false);
+        };
+        let path = if roots.contains(&revoker) {
+            &[][..]
+        } else {
+            upstream
+        };
+        self.accept(id, revoker, path)
+            .map_err(|revoker| ChainError::RevokerExhausted {
+                revoker: *revoker.as_bytes(),
+            })?;
+        Ok(true)
     }
 }
 pub(super) const MAX_CHAIN_BYTES: usize = 1 + MAX_CHAIN_LINKS * (MAX_CERTIFICATE + 74);
@@ -289,17 +366,26 @@ pub(super) fn standing(
     if !roots.contains(&first.issuer()) {
         return Err(ChainError::UntrustedRoot);
     }
-    let mut upstream = BTreeSet::new();
+    for link in chain.links() {
+        for key in [link.issuer(), link.subject()] {
+            if revoked.is_exhausted(&key) {
+                return Err(ChainError::RevokerExhausted {
+                    revoker: *key.as_bytes(),
+                });
+            }
+        }
+    }
+    let mut upstream = Vec::new();
     for (i, link) in chain.links().iter().enumerate() {
         let at = i as u8;
-        upstream.insert(link.issuer());
+        upstream.push(link.issuer());
         if now < link.caveats().validity.not_before() {
             return Err(ChainError::NotYetValid { at });
         }
         if now >= link.caveats().validity.not_after() {
             return Err(ChainError::Expired { at });
         }
-        if revoked.revokes(link.id(), roots, &upstream) {
+        if revoked.revokes(link.id(), roots, &upstream)? {
             return Err(ChainError::Revoked { at });
         }
     }
@@ -324,6 +410,12 @@ pub enum Widening {
     Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, postcard_schema::Schema,
 )]
 pub enum ChainError {
+    /// A key on this chain exhausted its accepted-revocation budget.
+    #[error("a key on the chain exhausted its revocation budget")]
+    RevokerExhausted {
+        /// The exhausted public key, in its 32-byte wire form.
+        revoker: [u8; 32],
+    },
     /// The total retained-chain budget is full.
     #[error("the retained chain budget of {max} chains is full")]
     StoreFull {

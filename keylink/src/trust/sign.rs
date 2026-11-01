@@ -212,6 +212,12 @@ impl<T: Serialize + DeserializeOwned> Signed<T> {
             if !roots.contains(&self.signer) {
                 return Err(ChainError::UntrustedRoot.into());
             }
+            if revoked.is_exhausted(&self.signer) {
+                return Err(ChainError::RevokerExhausted {
+                    revoker: *self.signer.as_bytes(),
+                }
+                .into());
+            }
             Credential::root(self.signer)
         } else {
             let credential = structure(&self.chain)?;

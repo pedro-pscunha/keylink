@@ -12,7 +12,9 @@
 //! Each store is one node's view. Revocation reaches other nodes only as fast as
 //! the application's feeder delivers it. Idle expired connections close on
 //! [`Change::Expire`](crate::trust::Change::Expire); expiry is always enforced at admission and per call.
-//! Revocation records are permanent and currently never pruned. Host clocks are
+//! Accepted records are permanent and charged to their revoker and proven issuer
+//! path. Exhausting a key's budget refuses its subtree, never evicting a tombstone.
+//! Root changes do not reset existing accounting or exhaustion. Host clocks are
 //! trusted. Idempotency remains per device key, not per delegated principal.
 
 mod cert;
@@ -58,11 +60,25 @@ pub const MAX_CHAINS_PER_HOLDER: usize = 16;
 pub const MAX_RETAINED_CHAINS: usize = 1024;
 /// Total pending signed revocation records whose authority is not yet established.
 pub const MAX_PENDING_REVOCATIONS: usize = 1024;
+/// Maximum accepted revocations charged to one signer or proven upstream issuer.
+/// Exhaustion permanently refuses every chain containing that key. Charging
+/// issuer paths prevents a delegate from bypassing the cap with fresh revoker keys.
+pub const MAX_ACCEPTED_PER_REVOKER: usize = 128;
 
-/// Why a signed change could not be retained. Refusal leaves the prior view intact.
+/// Why a signed change could not be retained. Pending-cap refusal leaves the
+/// prior view intact. Accepted-budget exhaustion permanently fences its key's
+/// subtree and closes its connections even though `apply` returns an error.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ChangeError {
+    /// This key's accepted-revocation budget was exhausted; its subtree is refused.
+    #[error("revoker {revoker} exhausted its {max} accepted revocation budget")]
+    RevokerExhausted {
+        /// The permanently exhausted signer or upstream issuer.
+        revoker: PublicKey,
+        /// The accepted-record budget.
+        max: usize,
+    },
     /// The budget for not-yet-authoritative revocation records is full.
     #[error("the pending revocation budget of {max} records is full")]
     PendingRevocationsFull {
@@ -123,7 +139,7 @@ impl Store {
         permits: impl Fn(&Credential) -> bool,
     ) -> Vec<Arc<Credential>> {
         let mut candidates = Vec::new();
-        if self.roots.contains(&peer) {
+        if self.roots.contains(&peer) && !self.revoked.is_exhausted(&peer) {
             let credential = Credential::root(peer);
             if permits(&credential) {
                 candidates.push(Arc::new(credential));
@@ -196,7 +212,7 @@ impl Trust {
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
-        let before = store.revoked.accepted_len();
+        let before = store.revoked.revision();
         let result = (|| {
             store.standing(&chain, Timestamp::now())?;
             let held = store.chains.get(&credential.holder());
@@ -247,7 +263,7 @@ impl Trust {
             chains.sort_by(|a, b| retention_order(a, b));
             Ok(())
         })();
-        let promoted = store.revoked.accepted_len() != before;
+        let promoted = store.revoked.revision() != before;
         drop(store);
         if promoted {
             let _ = self.sweep();
@@ -260,9 +276,9 @@ impl Trust {
     pub fn verify(&self, chain: &Chain, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(chain)?;
         let mut store = self.store();
-        let before = store.revoked.accepted_len();
+        let before = store.revoked.revision();
         let result = store.standing(chain, now).map(|()| credential);
-        let promoted = store.revoked.accepted_len() != before;
+        let promoted = store.revoked.revision() != before;
         drop(store);
         if promoted {
             let _ = self.sweep();
@@ -285,12 +301,12 @@ impl Trust {
             let mut store = self.store();
             // Certificate signatures already verified independently of T. Resolve
             // pending authority in the shared view before copying it for serde.
-            let before = store.revoked.accepted_len();
+            let before = store.revoked.revision();
             let _ = store.standing(signed.chain(), now);
             (
                 store.roots.clone(),
                 store.revoked.clone(),
-                store.revoked.accepted_len() != before,
+                store.revoked.revision() != before,
             )
         };
         if promoted {
@@ -328,13 +344,14 @@ impl Trust {
     }
     fn current(&self, credential: &Credential, now: Timestamp) -> bool {
         let mut store = self.store();
-        let before = store.revoked.accepted_len();
+        let before = store.revoked.revision();
         let current = if credential.chain().links().is_empty() {
             store.roots.contains(&credential.holder())
+                && !store.revoked.is_exhausted(&credential.holder())
         } else {
             store.standing(credential.chain(), now).is_ok()
         };
-        let promoted = store.revoked.accepted_len() != before;
+        let promoted = store.revoked.revision() != before;
         drop(store);
         if promoted {
             let _ = self.sweep();
@@ -391,46 +408,49 @@ impl Revocable for Trust {
     type Change = Change;
     type Error = ChangeError;
     fn apply(&self, change: Change) -> Result<Vec<PublicKey>, ChangeError> {
-        {
+        let result = {
             let mut store = self.store();
-            match change {
-                Change::Revoke(revocation) => {
-                    let roots = store.roots.clone();
-                    let authoritative = roots.contains(&revocation.revoker())
-                        || store.chains.values().flatten().any(|credential| {
-                            let mut upstream = BTreeSet::new();
-                            credential.chain().links().iter().any(|link| {
-                                upstream.insert(link.issuer());
-                                link.id() == revocation.certificate()
-                                    && upstream.contains(&revocation.revoker())
+            (|| -> Result<(), ChangeError> {
+                match change {
+                    Change::Revoke(revocation) => {
+                        let authority = if store.roots.contains(&revocation.revoker()) {
+                            Some(Vec::new())
+                        } else {
+                            store.chains.values().flatten().find_map(|credential| {
+                                let mut path = Vec::new();
+                                for link in credential.chain().links() {
+                                    path.push(link.issuer());
+                                    if link.id() == revocation.certificate()
+                                        && path.contains(&revocation.revoker())
+                                    {
+                                        return Some(path);
+                                    }
+                                }
+                                None
                             })
+                        };
+                        store.revoked.add(&revocation, authority.as_deref())?;
+                    }
+                    Change::Roots(roots) => {
+                        store.roots = roots;
+                        let roots = store.roots.clone();
+                        store.revoked.trust_roots(&roots)?;
+                    }
+                    Change::Expire => {
+                        let now = Timestamp::now();
+                        store.chains.retain(|_, chains| {
+                            chains.retain(|c| c.caveats().validity.not_after() > now);
+                            !chains.is_empty()
                         });
-                    store.revoked.add(&revocation, authoritative)?;
-                    let chains: Vec<_> = store
-                        .chains
-                        .values()
-                        .flatten()
-                        .map(|c| c.chain().clone())
-                        .collect();
-                    for chain in chains {
-                        let _ = store.standing(&chain, Timestamp::now());
                     }
                 }
-                Change::Roots(roots) => {
-                    store.revoked.trust_roots(&roots);
-                    store.roots = roots;
-                }
-                Change::Expire => {
-                    let now = Timestamp::now();
-                    store.chains.retain(|_, chains| {
-                        chains.retain(|c| c.caveats().validity.not_after() > now);
-                        !chains.is_empty()
-                    });
-                }
-            }
-        }
-        // Mutate FIRST, then snapshot: reconnects must meet the new view.
-        Ok(self.sweep())
+                Ok(())
+            })()
+        };
+        // Errors can establish permanent exhaustion too. Always sweep AFTER
+        // mutating, including when the operation returns a typed budget refusal.
+        let closed = self.sweep();
+        result.map(|()| closed)
     }
 }
 

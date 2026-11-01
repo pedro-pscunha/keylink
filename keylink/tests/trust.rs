@@ -869,3 +869,87 @@ async fn a_recorded_reply_cannot_cross_principals_for_the_same_request() {
         ))
     ));
 }
+
+#[tokio::test]
+async fn revoker_exhaustion_closes_its_live_subtree_and_keeps_a_sibling_open() {
+    let root = SecretKey::from_bytes(&[1; 32]);
+    let delegate = SecretKey::from_bytes(&[2; 32]);
+    let holder = SecretKey::from_bytes(&[3; 32]);
+    let sibling = SecretKey::from_bytes(&[4; 32]);
+    for during_apply in [false, true] {
+        let trust = Trust::new(Roots::only([root.public()]).unwrap());
+        let parent = Certificate::issue(&root, grant(delegate.public(), "repo", 1)).unwrap();
+        let mut live_grant = grant(holder.public(), "repo/a", 0);
+        live_grant.serial = u64::MAX;
+        let live_leaf = Certificate::issue(&delegate, live_grant).unwrap();
+        trust
+            .insert(Chain::new(vec![parent.clone(), live_leaf.clone()]))
+            .unwrap();
+        trust
+            .insert(Chain::new(vec![Certificate::issue(
+                &root,
+                grant(sibling.public(), "repo/b", 0),
+            )
+            .unwrap()]))
+            .unwrap();
+        let node = Node::bind_local().await.unwrap();
+        let peer = Node::bind_local_with_secret(holder.clone()).await.unwrap();
+        let keeper = Node::bind_local_with_secret(sibling.clone()).await.unwrap();
+        let _running = Server::builder(&node)
+            .service(
+                ungated::service(Ungated, keylink::Allowlist::anyone())
+                    .admission(Arc::new(trust.clone()))
+                    .build(),
+            )
+            .spawn()
+            .unwrap();
+        let client = ungated::Client::connect(&peer, node.endpoint().addr())
+            .await
+            .unwrap();
+        let kept = ungated::Client::connect(&keeper, node.endpoint().addr())
+            .await
+            .unwrap();
+        assert_eq!(client.read().await.unwrap(), 7);
+        assert_eq!(kept.read().await.unwrap(), 7);
+        let watch = client.watch();
+        for serial in 0..trust::MAX_ACCEPTED_PER_REVOKER as u64 {
+            let mut delegation = grant(holder.public(), "repo/a", 0);
+            delegation.serial = serial;
+            let leaf = Certificate::issue(&delegate, delegation).unwrap();
+            trust
+                .apply(Change::Revoke(Revocation::issue(&delegate, leaf.id())))
+                .unwrap();
+            assert_eq!(
+                trust
+                    .verify(&Chain::new(vec![parent.clone(), leaf]), Timestamp::now())
+                    .unwrap_err(),
+                ChainError::Revoked { at: 1 }
+            );
+        }
+        assert_eq!(trust.live(), 2);
+        if during_apply {
+            assert!(matches!(
+                trust.apply(Change::Revoke(Revocation::issue(&delegate, live_leaf.id()))),
+                Err(trust::ChangeError::RevokerExhausted { .. })
+            ));
+        } else {
+            let mut delegation = grant(holder.public(), "repo/a", 0);
+            delegation.serial = trust::MAX_ACCEPTED_PER_REVOKER as u64;
+            let leaf = Certificate::issue(&delegate, delegation).unwrap();
+            trust
+                .apply(Change::Revoke(Revocation::issue(&delegate, leaf.id())))
+                .unwrap();
+            assert!(matches!(
+                trust.verify(&Chain::new(vec![parent, leaf]), Timestamp::now()),
+                Err(ChainError::RevokerExhausted { .. })
+            ));
+        }
+        assert_eq!(trust.live(), 1);
+        let _ = watch.await;
+        assert_eq!(
+            client.read().await.unwrap_err().refusal(),
+            Some(Refusal::Denied)
+        );
+        assert_eq!(kept.read().await.unwrap(), 7);
+    }
+}
