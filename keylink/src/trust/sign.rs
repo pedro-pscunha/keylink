@@ -182,7 +182,10 @@ impl<T: Serialize + DeserializeOwned> Signed<T> {
             value: PhantomData,
         })
     }
-    /// Strictly verify the signature, chain and operation caveat, then decode T.
+    /// Strictly verify the signature, chain standing and purpose's operation
+    /// caveat, then decode T. No resource is asserted or checked by this method.
+    /// Before using a resource-bearing claim, the application must check its
+    /// resource against the returned credential (for example with `permits`).
     /// Offline: this has no revocation knowledge. Use `Trust::open` for that.
     pub fn open(
         &self,

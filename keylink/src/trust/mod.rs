@@ -174,7 +174,9 @@ impl Trust {
         Ok(credential)
     }
     /// Open a forwarded value against this view's roots and revocations.
-    /// No application value is decoded before all signature and authority checks.
+    /// Checks signature, chain standing and the purpose's operation caveat before
+    /// decoding. Resource caveats are not checked: the application must authorize
+    /// the value's resource against the returned credential before using it.
     pub fn open<T: Serialize + DeserializeOwned>(
         &self,
         signed: &Signed<T>,
