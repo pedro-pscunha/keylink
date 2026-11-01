@@ -166,7 +166,9 @@
 //!
 //! What does release the actor is leaving the turn: [`Deferred::away`] runs the
 //! slow step outside it, and the actor serves other messages until the output comes
-//! back as a turn through [`Back`]. The step may itself be a `spawn_blocking`.
+//! back as a turn through [`Back`]. The step may itself await a `spawn_blocking`,
+//! which keeps running if the actor ends and the step is cancelled: only the step's
+//! own future is cancelled with the actor, as [`Deferred::away`] says.
 //!
 //! # A panic reaches the caller of an `ask`
 //!
@@ -853,14 +855,32 @@ impl<T> Deferred<T> {
     ///   answer. If the handler panics, the caller is told [`Withheld::Dropped`].
     ///   For a durable actor this means the work starts only after the turn that
     ///   decided to run it is on disk.
-    /// - **It is cancelled when the actor ends**, by `stop`, `abort`, a refusal, a
-    ///   feed that ran out, or a restart. The caller is told [`Withheld::Gone`] or
+    /// - **It is cancelled when the actor ends**, by `stop`, a refusal, a feed that
+    ///   ran out, a restart, or `abort`. The caller is told [`Withheld::Gone`] or
     ///   [`Withheld::Restarting`], read from the actor's standing, which is settled
-    ///   before the work is cancelled. The actor's end waits for the cancelled work
-    ///   to be gone, so that reply dies reading its own incarnation's standing and
+    ///   before the work is cancelled.
+    /// - **The orderly ends wait for the cancelled work to be gone**: `stop`, a
+    ///   refusal, a feed that ran out and a restart. The actor's end is published
+    ///   only then, so that reply dies reading its own incarnation's standing and
     ///   never a later one's; a work future that blocks its thread inside a poll
     ///   delays the end, and so the restart, by that long. `stop` does not wait for
     ///   the work to finish, only for it to be cancelled.
+    /// - **`abort` does not wait.** It destroys the actor now, and the work is
+    ///   cancelled as the actor goes, not before the end is published. What it
+    ///   keeps is the answer: the standing is settled [`Withheld::Gone`] first, so
+    ///   the parked caller reads `Gone` whenever the reply dies.
+    /// - **In a browser the wait is weaker.** On `wasm32-unknown-unknown`,
+    ///   `n0_future`'s `JoinSet::shutdown` asks for the cancellation and returns:
+    ///   the cancelled future is dropped on the executor's next poll, which can be
+    ///   after the actor's end is published, so a reply that dies after the next
+    ///   incarnation has started can be told [`Withheld::Dropped`]. The native
+    ///   guarantee above is unchanged.
+    /// - **Only the future passed to `away` belongs to the actor.** A task it
+    ///   spawns, a `spawn_blocking` closure it awaits and an operation it starts
+    ///   outside the process are not cancelled with it: dropping a `JoinHandle`
+    ///   detaches its task, and a blocking closure that has started runs to its
+    ///   end. Whatever the work starts needs its own cancellation, and its own
+    ///   wait, if the actor's end must not outrun it.
     /// - **A panic in the work** tells the caller [`Withheld::Dropped`]. The actor
     ///   goes on serving.
     /// - **It is not durable.** A crash loses it. Reconcile what was pending when
@@ -2423,7 +2443,8 @@ where
     // before `floor`, so it drops after it**: an unwind or an `abort` settles the
     // verdict first, and only then cancels the tasks, whose dying `Deferred`s read
     // that verdict. The orderly path settles it explicitly and shuts this down
-    // right after, below, and waits for the tasks to be gone. Every one of these
+    // right after, below, and waits for the tasks to be gone; an `abort` drops
+    // it, which cancels the tasks and does not wait for them. Every one of these
     // is a body local, so it drops before `state`.
     let mut away: Away<A> = None;
     // **Declared next, so it drops last of the locals that follow it — and every
@@ -2549,8 +2570,11 @@ where
     // the poll first. A supervisor starts the next incarnation and publishes
     // `Running` for it as soon as this function returns, so a reply that died
     // after that read `Running` and told its caller `Dropped` about a reply this
-    // incarnation's end had taken. `shutdown` returns when every task is gone,
-    // so every reply dies reading this incarnation's own verdict.
+    // incarnation's end had taken. Natively `shutdown` returns when every task is
+    // gone, so every reply dies reading this incarnation's own verdict. In a
+    // browser `n0_future`'s `shutdown` returns once the cancellation is requested
+    // and the future is dropped on the executor's next poll, so there the wait is
+    // weaker; `Deferred::away` says so.
     if let Some(mut set) = away {
         set.shutdown().await;
     }
@@ -4804,6 +4828,17 @@ impl<A, M> LocalActor<A, M> {
     /// The shape both of those replaced leaned on `!mail.is_closed()`, which is
     /// right for an unsupervised actor and false for a supervised one, whose
     /// receiver belongs to the supervisor's frame and outlives every incarnation.
+    ///
+    /// # Away work is cancelled, and not waited for
+    ///
+    /// Work sent off the turn with [`Deferred::away`] is cancelled as the aborted
+    /// task is destroyed, and **this is the one end that does not wait for it**:
+    /// `stop`, a refusal and a restart do. The work's reply dies reading `Gone`,
+    /// because the standing is settled first, so its parked caller is told the
+    /// actor is gone. But the actor's end can be published while a cancelled
+    /// future is still being destroyed, for instance one in the middle of a poll on
+    /// another worker. Use [`stop`](Self::stop) when that order matters.
+    /// `an_aborted_actor_tells_its_away_caller_it_is_gone` pins what is promised.
     pub fn abort(&self) {
         self.task.abort();
     }

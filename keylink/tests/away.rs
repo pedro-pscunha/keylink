@@ -11,6 +11,7 @@
 //! | the actor ending cancels the work and tells the parked caller the truth | `stopping_while_work_is_away_answers_the_parked_caller` |
 //! | a launching turn that is refused never starts its work | `work_launched_by_a_refused_turn_never_starts` |
 //! | work cancelled by a restart answers its caller with that restart, never with the next incarnation | `work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_incarnation` |
+//! | an aborted actor cancels the work and tells its caller the actor is gone; it does not wait for the work | `an_aborted_actor_tells_its_away_caller_it_is_gone` |
 //! | a `back` that sends before it returns its future is still gated by its turn's commit | `a_back_that_sends_eagerly_is_still_gated_by_its_turns_commit` |
 //! | a `back` that launches before it returns its future launches nothing for a refused turn | `a_back_that_relaunches_eagerly_launches_nothing_for_a_refused_turn` |
 //! | a `back` that panics before it returns its future costs the message and not the actor | `a_back_that_panics_before_returning_a_future_costs_the_message_and_not_the_actor` |
@@ -65,12 +66,14 @@ enum Work {
     },
     /// Sets a flag the moment it runs.
     Flag(Arc<AtomicBool>),
-    /// Blocks the worker thread that polls it for a while, after saying it
-    /// started, and then waits for ever. Cancelling it has to wait for the poll to
-    /// return, which is the slow destruction a restart must not outrun.
+    /// Blocks the worker thread that polls it, after saying it is inside the poll,
+    /// until the test releases it, and then waits for ever. Cancelling it has to
+    /// wait for the poll to return, which is the slow destruction a restart must
+    /// not outrun. It holds a sentinel, so the log says when its future died.
     Blocks {
-        started: Mutex<Option<oneshot::Sender<()>>>,
-        for_how_long: Duration,
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        log: Log,
     },
 }
 
@@ -125,16 +128,25 @@ impl Work {
                 })
             }
             Self::Blocks {
-                started,
-                for_how_long,
+                entered,
+                release,
+                log,
             } => {
-                let started = started.lock().unwrap().take();
-                let for_how_long = *for_how_long;
+                let entered = entered.lock().unwrap().take();
+                let release = release.lock().unwrap().take();
+                let sentinel = Sentinel {
+                    log: Arc::clone(log),
+                    signal: None,
+                };
                 Box::pin(async move {
-                    if let Some(started) = started {
-                        let _ = started.send(());
+                    let _held = sentinel;
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
                     }
-                    std::thread::sleep(for_how_long);
+                    if let Some(release) = release {
+                        // Blocks this worker inside the poll, on purpose.
+                        let _ = release.recv();
+                    }
                     std::future::pending::<u64>().await
                 })
             }
@@ -436,40 +448,84 @@ impl Observer<Desk> for RetiresTheIncarnation {
 }
 
 /// A caller parked behind away work is told what became of **its** incarnation,
-/// even when the cancelled work is slow to die.
+/// even when the cancelled work is slow to die, and the next incarnation is not
+/// built until that work is gone.
 ///
 /// Cancelling a task asks for it and does not wait: the future, and the parked
 /// reply inside it, are destroyed only when the cancellation has run, and a task
 /// that is in the middle of a poll finishes the poll first. Here the work blocks
-/// its worker for 300 ms, so the reply outlives the incarnation by that long. The
-/// supervisor's backoff is ten milliseconds, and a restart publishes the standing
+/// its worker inside the poll until the test releases it, so the reply outlives the
+/// incarnation by as long as the test likes. A restart publishes the standing
 /// `Running` for the new incarnation; a reply that died after that read `Running`
 /// and told its caller `Dropped`, *the actor is serving and this reply was thrown
-/// away*, about a reply the old incarnation's end had taken. The loop now waits
-/// for the cancelled work to be gone before the incarnation is over, so the reply
-/// dies while the standing is still `Restarting`.
+/// away*, about a reply the old incarnation's end had taken. The loop now waits for
+/// the cancelled work to be gone before the incarnation is over, so the reply dies
+/// while the standing is still `Restarting`.
+///
+/// Every step is a gate and none is a duration. The work says it is inside its poll
+/// and waits for a release. The factory of the next incarnation logs that it was
+/// called and waits for a gate before it returns, so the standing stays
+/// `Restarting` while the old caller's answer is read, and the read cannot lose a
+/// race with a new `Running`. The ordering is then read from the log: the work
+/// must be destroyed **before** the next incarnation is built.
+///
+/// **One window is a bound and not an assertion, and it can only hide a
+/// regression, never invent one.** Whether the end waits for the work cannot be
+/// seen without letting the supervisor try to go on: a correct end blocks until
+/// the release, so the test holds the work for `HOLD` and gives the supervisor
+/// that long to reach the next factory. A correct build never does, and pays
+/// `HOLD` for it. A build that does not wait reaches it within the supervisor's
+/// ten-millisecond backoff, and logs it before the release. If a loaded machine
+/// starves the supervisor for longer than `HOLD`, that regression goes unseen on
+/// that run; correct teardown is never reported as broken.
 ///
 /// Four workers, because on one the blocked poll would hold up the supervisor
 /// too and there would be no window to close.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `run_loop`'s
 /// `set.shutdown().await;` (indented eight spaces; registered as `OT6`) and the
-/// replacement `drop(set);`, which cancels without waiting. Watched:
-/// `the caller is told its own incarnation restarted: got Err(Turn(Dropped))`.
+/// replacement `drop(set);`, which cancels without waiting. Watched: `the work is
+/// destroyed before the next incarnation is built`, `left: ["next incarnation",
+/// "dropped"]`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_incarnation() {
-    let (started_tx, started) = oneshot::channel();
-    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    const HOLD: Duration = Duration::from_millis(250);
+
+    let log = Log::default();
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let (built_tx, built) = oneshot::channel();
+    let next_gate = Arc::new(Notify::new());
+
+    let first = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+    let built_tx = Arc::new(Mutex::new(Some(built_tx)));
     let desk = desk::restarting(
-        move || {
-            let started_tx = Arc::clone(&started_tx);
-            async move {
-                let observers: Vec<Box<dyn Observer<Desk>>> = vec![Box::new(RetiresTheIncarnation)];
-                let work = Work::Blocks {
-                    started: Mutex::new(started_tx.lock().unwrap().take()),
-                    for_how_long: Duration::from_millis(300),
-                };
-                Ok((Desk::new(work), observers, ()))
+        {
+            let (log, next_gate) = (Arc::clone(&log), Arc::clone(&next_gate));
+            move || {
+                let (log, next_gate) = (Arc::clone(&log), Arc::clone(&next_gate));
+                let first = first.lock().unwrap().take();
+                let built_tx = Arc::clone(&built_tx);
+                async move {
+                    let observers: Vec<Box<dyn Observer<Desk>>> =
+                        vec![Box::new(RetiresTheIncarnation)];
+                    let work = match first {
+                        Some((entered, release)) => Work::Blocks {
+                            entered: Mutex::new(Some(entered)),
+                            release: Mutex::new(Some(release)),
+                            log,
+                        },
+                        None => {
+                            log.lock().unwrap().push("next incarnation");
+                            if let Some(built) = built_tx.lock().unwrap().take() {
+                                let _ = built.send(());
+                            }
+                            next_gate.notified().await;
+                            Work::Flag(Arc::new(AtomicBool::new(false)))
+                        }
+                    };
+                    Ok((Desk::new(work), observers, ()))
+                }
             }
         },
         keylink::Intensity::new(
@@ -484,7 +540,7 @@ async fn work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_i
         let desk = desk.clone();
         tokio::spawn(async move { desk.land(1).await })
     };
-    started.await.expect("the work started");
+    entered.await.expect("the work is inside its poll");
 
     // The work is now blocking a worker mid-poll. Ending the incarnation cancels it.
     let refused = desk.retire().await;
@@ -493,6 +549,12 @@ async fn work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_i
         "the observer ended the incarnation: got {refused:?}"
     );
 
+    // Hold the work while the supervisor gets every chance to go on without it.
+    let _ = n0_future::time::timeout(HOLD, built).await;
+    release.send(()).expect("the work is still waiting for it");
+
+    // The old caller's answer is read while the next factory is still gated, so the
+    // standing cannot have moved on to `Running`.
     let landed = n0_future::time::timeout(Duration::from_secs(30), landing)
         .await
         .expect("a parked caller must not outlive its incarnation as a hang")
@@ -501,11 +563,69 @@ async fn work_cancelled_by_a_restart_answers_with_the_restart_and_not_the_next_i
         matches!(&landed, Err(Unanswered::Turn(Withheld::Restarting { .. }))),
         "the caller is told its own incarnation restarted: got {landed:?}"
     );
+
+    next_gate.notify_one();
     assert_eq!(
         desk.applied().await.expect("the next incarnation serves"),
         0,
         "and the restart did happen"
     );
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["dropped", "next incarnation"],
+        "the work is destroyed before the next incarnation is built"
+    );
+}
+
+// ──────────────────────────────────────────────── an aborted actor and its away work
+
+/// Aborting the actor cancels the work and tells the parked caller the actor is
+/// gone. That is all `abort` promises about away work, and the test pins no more.
+///
+/// `abort` destroys the actor now. Unlike `stop`, a refusal or a restart it does
+/// not wait for the cancelled work to be gone, so the actor's end can be
+/// published while a cancelled future is still being destroyed, and this test says
+/// nothing about that order. What survives is the answer: the loop's floor settles
+/// `Gone` as the aborted task is destroyed, before the state and everything parked
+/// in it, so the reply that dies with the away task reads `Gone` and not `Running`
+/// (which would tell a caller the actor is serving and dropped its answer).
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Floor`'s `Drop`,
+/// `self.fate.settle(Standing::Gone);` (indented twelve spaces; registered as
+/// `AB1`) and the replacement `self.fate.settle(Standing::Running);`. Watched: `the
+/// caller is told the actor is gone: got Err(Turn(Dropped))`.
+#[tokio::test(start_paused = true)]
+async fn an_aborted_actor_tells_its_away_caller_it_is_gone() {
+    let log = Log::default();
+    let (dropped, died) = oneshot::channel();
+    let desk = desk::actor(Desk::new(Work::Gate {
+        gate: Arc::new(Notify::new()),
+        log: Arc::clone(&log),
+        dropped: Mutex::new(Some(dropped)),
+    }));
+
+    let landing = {
+        let desk = desk.clone();
+        tokio::spawn(async move { desk.land(1).await })
+    };
+    launched(&desk, 1).await;
+
+    desk.abort();
+
+    let landed = n0_future::time::timeout(Duration::from_secs(30), landing)
+        .await
+        .expect("a parked caller must not outlive its aborted actor as a hang")
+        .expect("the caller is not itself panicking");
+    assert!(
+        matches!(landed, Err(Unanswered::Turn(Withheld::Gone))),
+        "the caller is told the actor is gone: got {landed:?}"
+    );
+
+    n0_future::time::timeout(Duration::from_secs(30), died)
+        .await
+        .expect("the work was never cancelled")
+        .expect("the sentinel signals once");
+    assert_eq!(*log.lock().unwrap(), ["dropped"]);
 }
 
 // ───────────────────────────────────── a `back` that does work before it returns a future

@@ -508,9 +508,16 @@ impl Back<Checked, Landed> for Repo {
 The work belongs to the actor. It starts only after the launching turn commits, so
 an observer that refuses that turn stops it from ever starting, and a durable
 actor's work starts only after the turn that chose it is on disk. It is cancelled
-when the actor ends, and the actor's end waits for the cancelled work to be gone,
-so the parked caller is told `Gone` or `Restarting` by its own incarnation and
-never by the next one. The `back` turn is an ordinary turn: the panic guard, the
+when the actor ends. `stop`, a refusal and a restart wait for the cancelled work
+to be gone, so the parked caller is told `Gone` or `Restarting` by its own
+incarnation and never by the next one. `abort` does not wait: it destroys the
+actor now, and the caller is still told `Gone`, but the actor's end can be
+published while the cancelled work is being destroyed. In a browser the wait is
+weaker for every end: the cancelled future is dropped on the executor's next
+poll, which can be after the end is published. Only the future passed to `away`
+belongs to the actor: a task it spawns, a `spawn_blocking` closure it awaits and
+anything it starts outside the process are not cancelled with it, and need their
+own cancellation. The `back` turn is an ordinary turn: the panic guard, the
 observers and the commit all apply, and other turns ran while the work was away,
 so `back` re-checks what the launching turn assumed. The work itself holds no
 reference to the state. It is not durable: a crash loses it, and the actor

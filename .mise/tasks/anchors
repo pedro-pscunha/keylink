@@ -2392,6 +2392,11 @@ ANCHORS = [
      "    Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))"),
     ("OT4", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "        let method = reply.method;"),
+    # `AB1` breaks `Floor`'s `Drop`, which `tests/defer.rs` also breaks without a row.
+    # The indentation is the literal's own: the other `settle(Standing::Gone)` in the
+    # file sits at sixteen spaces and in `supervise`, not behind `self.fate`.
+    ("AB1", "keylink/tests/away.rs", "keylink/src/turns.rs",
+     "            self.fate.settle(Standing::Gone);"),
     # ── the deadline (`ServiceBuilder::deadline`, `with_deadline`), the three breaks of
     # `tests/deadline.rs`. Cross-file, so the records' quotes add no occurrence to
     # `rpc.rs`; the indentation is the literal's own and `rustfmt` owns it, so
@@ -4139,7 +4144,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 426
+RECORD_BLOCKS = 427
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
