@@ -518,15 +518,16 @@ reconciles what was pending on restart. `stop` does not wait for it to finish. C
 type than the running turn's, drops the work and tells the caller `Dropped` on the
 first call.
 
-### A deadline ends the wait, never the work
+### A deadline ends the wait
 
 `ServiceBuilder::deadline(budget)` answers `RemoteError::DeadlinePassed` to any
 call with no answer after `budget`, and a caller can set a shorter one of its own
-with `with_deadline`, which travels in the request. Neither cancels anything. An
-unkeyed call's answer is discarded, and a concurrent `Handler`'s future is dropped
-where it stands. A running turn finishes. A keyed call is awaited to the end and
+with `with_deadline`, which travels in the request. What becomes of the work
+depends on the call. A running actor turn finishes, and its reply is discarded.
+A keyed call is awaited to the end for as long as its connection survives, and
 its key settles as what the call really returned, so a retry with the same key
-attaches to it or replays its answer and the work runs once.
+attaches to it or replays its answer and the work runs once. An unkeyed call to a
+concurrent `Handler` is cancelled: its future is dropped where it stands.
 
 ```rust
 let reserved = client

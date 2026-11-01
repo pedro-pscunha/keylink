@@ -23,7 +23,7 @@
 //!
 //! | bound | says | the key it carried |
 //! |---|---|---|
-//! | [`deadline`](keylink::ServiceBuilder::deadline) | the service stopped waiting, and the work was not cancelled | stays running and settles as what the call really returned, so a retry is handed that answer |
+//! | [`deadline`](keylink::ServiceBuilder::deadline) | the service stopped waiting; an unkeyed handler is dropped and a keyed call goes on | stays running and settles as what the call really returned, so a retry is handed that answer |
 //! | [`QueueTimeout`] | a message never started, and nothing ran | stays claimable, so the retry is a first attempt |
 //!
 //! **Act 2 measures the top row and act 3 the bottom one.** An unkeyed call on a

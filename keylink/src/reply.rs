@@ -331,15 +331,24 @@ pub enum RemoteError {
 
     /// The service stopped waiting for this call's answer after `millis`.
     ///
-    /// The work was not cancelled: if it started, it runs to the end, and a keyed
-    /// call's answer is recorded under its key, so retry with the same key and
-    /// the retry attaches to it or replays it. An unkeyed call's answer is
-    /// discarded. The budget is the shorter of the service's
+    /// **What became of the work depends on the call**, and this error does not
+    /// say which:
+    ///
+    /// - An **actor turn** that is running finishes. Its reply is discarded, or,
+    ///   for a keyed call, recorded under the key.
+    /// - A **keyed** call is awaited to the end for as long as its connection
+    ///   survives, and its key settles as what the call really returned. Retry
+    ///   with the same key and the retry attaches to it or replays it.
+    /// - An **unkeyed** call to a concurrent `Handler` is cancelled where it
+    ///   stands.
+    /// - A message still **queued** is shed and never starts.
+    ///
+    /// The budget is the shorter of the service's
     /// [`deadline`](crate::ServiceBuilder::deadline) and the caller's own.
     ///
     /// Appended last, like every variant before it: an insert would renumber the
     /// ones after it.
-    #[error("no answer within the {millis} ms deadline; the work was not cancelled")]
+    #[error("no answer within the {millis} ms deadline")]
     DeadlinePassed {
         /// The budget that passed.
         millis: u64,

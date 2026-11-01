@@ -57,9 +57,10 @@ pub trait WithDeadline: Sized {
     ///
     /// The caller stops waiting after `budget` and gets
     /// [`Error::DeadlinePassed`](crate::Error::DeadlinePassed), and the budget
-    /// travels in the request so the service stops waiting no later than that. The
-    /// work is not cancelled, so bound a keyed call and retry it with the same
-    /// key. See [`RpcClient::with_deadline`](crate::RpcClient::with_deadline).
+    /// travels in the request so the service stops waiting no later than that. A
+    /// deadline answers the caller and does not undo work already done, so bound a
+    /// keyed call and retry it with the same key. See
+    /// [`RpcClient::with_deadline`](crate::RpcClient::with_deadline).
     #[must_use = "discarding this value discards the deadline"]
     fn with_deadline(&self, budget: Duration) -> Self;
 }

@@ -1,4 +1,4 @@
-//! A deadline answers the caller and never cancels the work.
+//! A deadline answers the caller, and an actor turn or a keyed call goes on.
 //!
 //! `Timeout` was a layer, so on expiry it dropped the wait for the reply and left
 //! the turn running. A keyed call then settled `Interrupted` and every retry was
