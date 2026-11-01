@@ -343,3 +343,60 @@ async fn a_tell_outside_the_caveat_never_reaches_the_actor() {
     assert_eq!(writes.load(Ordering::SeqCst), 0);
     *TELL_DROPPED.lock().unwrap() = None;
 }
+
+keylink::service! { service Ungated; rpc Read() -> u64; }
+struct Ungated;
+impl ungated::Handler for Ungated {
+    async fn read(&self, _cx: &Context) -> u64 {
+        7
+    }
+}
+#[tokio::test]
+async fn revocation_closes_every_connection_across_two_alpns() {
+    let (root, device, chain, trust) = fixture();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    trust.insert(chain.clone()).unwrap();
+    // Admission alone must close both: no per-call Guard can hide a stale entry.
+    let _running = Server::builder(&node)
+        .service(
+            files::service(
+                Files(Arc::new(AtomicUsize::new(0))),
+                keylink::Allowlist::anyone(),
+            )
+            .admission(Arc::new(trust.clone()))
+            .build(),
+        )
+        .service(
+            ungated::service(Ungated, keylink::Allowlist::anyone())
+                .admission(Arc::new(trust.clone()))
+                .build(),
+        )
+        .spawn()
+        .unwrap();
+    let a = files::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let b = ungated::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    assert_eq!(a.read("repo/a".into()).await.unwrap(), 7);
+    assert_eq!(b.read().await.unwrap(), 7);
+    assert_eq!(trust.live(), 2);
+    let wa = a.watch();
+    let wb = b.watch();
+    assert_eq!(
+        trust.apply(Change::Revoke(Revocation::issue(
+            &root,
+            chain.links()[0].id()
+        ))),
+        vec![peer.id()]
+    );
+    let _ = tokio::join!(wa, wb);
+    assert_eq!(trust.live(), 0);
+    assert_eq!(
+        a.read("repo/a".into()).await.unwrap_err().refusal(),
+        Some(Refusal::Denied)
+    );
+    assert_eq!(b.read().await.unwrap_err().refusal(), Some(Refusal::Denied));
+}

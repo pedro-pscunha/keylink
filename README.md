@@ -1031,7 +1031,7 @@ Known gaps, in rough priority order:
 - **Trust is a local view.** Revocations reach other nodes only through the application's feeder. Records are permanent and the revocation set grows without pruning. Idle expired connections close only when the application applies `trust::Change::Expire`; expiry is checked on every call regardless. Already-dispatched calls finish after revocation. The host clock is trusted, with no skew allowance.
 - **Closing RPC connections does not retract blob grants.** Wiring the separate `Blobs::revoke_peer` capability into trust changes is still needed. A peer may otherwise retain access to previously granted hashes.
 - **Signed values are replayable.** The application supplies freshness in `T`. Its shape is not part of a service contract hash; drift is refused at `open`. Idempotency records remain per device key, not per delegated principal.
-- **Trust stores remember one connection per peer.** Multiple simultaneous connections from one key are not all retained. The open presentation protocol has byte, depth, and per-holder caps, but no rate limit. Browsers can verify chains and signed values, not serve guarded QUIC connections.
+- **Trust closes every tracked connection for a revoked peer.** Connections are tracked independently across service ALPNs. The open presentation protocol has byte, depth, and per-holder caps, but no rate limit. Browsers can verify chains and signed values, not serve guarded QUIC connections.
 
 - **No connection has ever run in a browser.** `mise run wasm-browser` loads the
   module into headless Chrome and runs every test in `keylink/tests/browser.rs`

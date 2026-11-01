@@ -62,9 +62,10 @@
 //!   revocation latency is the feeder's delivery latency.
 //! - **No history.** There is no audit trail of past decisions; that is a
 //!   different port with different operations.
-//! - **One connection per peer.** The registry is keyed by [`EndpointId`], so a
+//! - **DynamicAdmission remembers one connection per peer.** Its registry is keyed by [`EndpointId`], so a
 //!   peer holding several has its most recent remembered and closed. Two live
-//!   connections from one identity are not two peers.
+//!   connections from one identity are not two peers. `trust::Trust` instead
+//!   tracks and closes every connection, across all guarded ALPNs.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -156,6 +157,9 @@ pub struct LiveConnection {
 }
 
 impl LiveConnection {
+    pub(crate) fn id(&self) -> usize {
+        self.connection.stable_id()
+    }
     pub(crate) fn new(connection: Connection, peer: ProvenPeer) -> Self {
         Self { connection, peer }
     }

@@ -14,18 +14,18 @@
 mod cert;
 mod chain;
 mod guard;
+mod live;
 mod present;
 mod sign;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use iroh::PublicKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    Admission, Admittance, AdmittedPeer, LiveConnection, ProvenPeer, Revocable, Rpc,
-    ServiceBuilder, Subscribers,
+    Admission, Admittance, AdmittedPeer, LiveConnection, ProvenPeer, Revocable, Rpc, ServiceBuilder,
 };
 use chain::{standing, structure, Revoked};
 
@@ -118,7 +118,7 @@ impl Store {
 #[derive(Debug)]
 struct Inner {
     store: Mutex<Store>,
-    live: Subscribers<LiveConnection>,
+    live: live::Live,
 }
 
 /// A cheap-clone handle to the node's roots, chains, revocations, and live peers.
@@ -137,7 +137,7 @@ impl Trust {
                 chains: BTreeMap::new(),
                 revoked: Revoked::new(),
             }),
-            live: Subscribers::new(),
+            live: live::Live::default(),
         }))
     }
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -248,12 +248,12 @@ impl Admission for Trust {
         }
     }
     fn admitted(&self, peer: &AdmittedPeer, live: LiveConnection) {
-        self.0.live.insert(peer.id(), live.clone(), live.watch());
+        let registration = self.0.live.insert(live.clone());
         // Insert BEFORE the re-read: a concurrent change either sees this
         // connection in its snapshot or is visible to this check.
         if !self.admitting(peer.id()) {
             live.close();
-            self.0.live.remove(peer.id());
+            self.0.live.remove(registration);
         }
     }
 }
@@ -290,18 +290,19 @@ impl Revocable for Trust {
             }
         }
         // Mutate FIRST, then snapshot: reconnects must meet the new view.
-        let mut closed = Vec::new();
-        for (id, live) in self.0.live.snapshot() {
+        let mut closed = BTreeSet::new();
+        for (registration, live) in self.0.live.snapshot() {
+            let id = live.peer().id();
             if !self.admitting(id) {
                 live.close();
-                self.0.live.remove(id);
-                closed.push(id);
+                self.0.live.remove(registration);
+                closed.insert(id);
             }
         }
         // TODO: wire the separate Blobs::revoke_peer capability for every
         // affected holder, including inactive ones. `closed` names only live
         // connections; closing RPC alone does not retract prior blob grants.
-        closed
+        closed.into_iter().collect()
     }
 }
 
