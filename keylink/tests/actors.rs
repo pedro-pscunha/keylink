@@ -1344,10 +1344,7 @@ async fn abort_destroys_the_message_in_flight() {
             journal::spawn(Journal {
                 applied: applied.clone(),
                 entered: Some(entered_tx),
-                // Never given a permit: the turn is parked inside the handler
-                // until `abort` destroys it, so no duration decides whether
-                // the abort found the turn in flight.
-                release: Some(Arc::new(Semaphore::new(0))),
+                release: None,
                 inside: None,
                 nested: None,
                 forward: None,
@@ -1358,7 +1355,11 @@ async fn abort_destroys_the_message_in_flight() {
 
     let client_call = {
         let client = &fixture.client;
-        async move { client.at(id("doc")).apply(1, 0).await }
+        // A hold the abort is sequenced against by `entered`, not by a clock:
+        // the abort lands the moment the turn is inside, so the hold only has
+        // to outlast the gap between those two events, and it is the length of
+        // the red a broken `abort` takes to show.
+        async move { client.at(id("doc")).apply(1, 5_000).await }
     };
     let aborting = async {
         entered.recv().await.expect("the turn is inside the actor");
