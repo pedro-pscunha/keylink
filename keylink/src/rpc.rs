@@ -547,7 +547,8 @@ async fn replay<Req, Resp>(
     frame: Bytes,
     codec: &dyn Codec<Req, Resp>,
 ) -> Result<()> {
-    wire::write_frame(send, codec.reencode_response(frame)?).await?;
+    let (frame, _) = codec.reencode_response(frame)?;
+    wire::write_frame(send, frame).await?;
     send.finish()?;
     Ok(())
 }
@@ -895,8 +896,11 @@ where
     if let Some(permit) = permit {
         permit.commit();
     }
-    wire::write_frame(&mut send, codec.reencode_response(frame)?).await?;
-    body.write_to(&mut send).await?;
+    let (frame, carry_body) = codec.reencode_response(frame)?;
+    wire::write_frame(&mut send, frame).await?;
+    if carry_body {
+        body.write_to(&mut send).await?;
+    }
     send.finish()?;
     Ok(())
 }

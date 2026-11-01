@@ -269,7 +269,8 @@ pub(crate) trait Codec<Req, Resp>: Send + Sync + fmt::Debug {
         &self,
         bytes: &[u8],
     ) -> Result<std::result::Result<Envelope<WireRequest<Req>>, RemoteError>>;
-    fn reencode_response(&self, frame: Bytes) -> Result<Bytes>;
+    /// The encoded header and whether the handler's body can follow it.
+    fn reencode_response(&self, frame: Bytes) -> Result<(Bytes, bool)>;
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes>;
 }
@@ -348,22 +349,26 @@ where
                 detail: e.to_string(),
             }))
     }
-    fn reencode_response(&self, frame: Bytes) -> Result<Bytes> {
+    fn reencode_response(&self, frame: Bytes) -> Result<(Bytes, bool)> {
         if P::CURRENT {
-            return Ok(frame);
+            return Ok((frame, true));
         }
         let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
-        let (message, len) = match response_map(r.message, P::down_response) {
-            Ok(m) => (m, r.body_len),
+        let (message, len, carry_body) = match response_map(r.message, P::down_response) {
+            Ok(m) => (m, r.body_len, true),
             Err(e) => (
                 WireResponse::Call(Outcome::Err(RemoteError::Unsupported {
                     version: self.version.label,
                     detail: e.to_string(),
                 })),
                 Some(0),
+                false,
             ),
         };
-        Ok(wire::encode_header(len, r.idempotency.as_ref(), &message)?)
+        Ok((
+            wire::encode_header(len, r.idempotency.as_ref(), &message)?,
+            carry_body,
+        ))
     }
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes> {
@@ -538,6 +543,7 @@ pub(crate) async fn read_probe(connection: &Connection, service: &str) -> PeerWi
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     fn window(labels: &[u32]) -> Window {
         Window {
@@ -560,5 +566,51 @@ mod tests {
         let mut theirs = window(&[3]);
         theirs.versions[0].hash = 1;
         assert!(Mismatch::new(window(&[3]), PeerWindow::Speaks(theirs)).to_string().contains("both claim 3 with different shapes (ours 0000000000000000, theirs 0000000000000001)"));
+    }
+    struct RefuseReply;
+    impl Hop for RefuseReply {
+        type Request = u8;
+        type Response = u8;
+        type NewerRequest = u8;
+        type NewerResponse = u8;
+        fn upgrade_request(r: u8) -> std::result::Result<u8, Unsupported> {
+            Ok(r)
+        }
+        fn downgrade_request(r: u8) -> std::result::Result<u8, Unsupported> {
+            Ok(r)
+        }
+        fn upgrade_response(r: u8) -> std::result::Result<u8, Unsupported> {
+            Ok(r)
+        }
+        fn downgrade_response(_: u8) -> std::result::Result<u8, Unsupported> {
+            Err(Unsupported::new("Fetch", "no older reply"))
+        }
+    }
+    /// A downgrade refusal is a header without the handler's body.
+    ///
+    /// Watched red with `scripts/break-once.sh`: changed the body flag on the
+    /// unsupported-response branch to `true`. The isolated unit test failed at
+    /// "a conversion refusal must not stream the current body's bytes";
+    /// 0 passed, 1 failed. Restored. The edit is described because this record
+    /// lives in the file the harness changes.
+    #[test]
+    fn an_unrepresentable_reply_does_not_carry_its_current_body() {
+        let codec = At::<(RefuseReply, Here<u8, u8>)> {
+            version: Version::__new(2, 0),
+            marker: PhantomData,
+        };
+        let current = wire::encode_header(Some(17), None, &WireResponse::Call(Outcome::Ok(7_u8)))
+            .expect("encodes");
+        let (frame, carry_body) = codec.reencode_response(current).expect("refusal encodes");
+        assert!(
+            !carry_body,
+            "a conversion refusal must not stream the current body's bytes"
+        );
+        let reply: Envelope<WireResponse<u8>> = postcard::from_bytes(&frame[4..]).expect("decodes");
+        assert_eq!(reply.body_len, Some(0));
+        assert!(matches!(
+            reply.message,
+            WireResponse::Call(Outcome::Err(RemoteError::Unsupported { version: 2, .. }))
+        ));
     }
 }
