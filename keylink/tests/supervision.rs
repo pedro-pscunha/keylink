@@ -410,6 +410,21 @@ async fn store(name: &str) -> (Scratch, Files) {
     (scratch, files)
 }
 
+/// The recovery span of a test that spends a one-restart budget with two faults.
+///
+/// The second fault is the terminal one only if the incarnation the first fault
+/// built fails **before it has lived a whole span**: an incarnation that reaches
+/// `recovered_after` and then fails has recovered, and is granted a fresh
+/// restart. The test's own steps between the two faults (a park, a poll, a
+/// `boom` over a real connection) are what that incarnation lives through, so
+/// the span is the budget they must stay inside. It was 50 ms, which a loaded
+/// machine spends in one scheduling stall, and round 2 then read `Restarting`
+/// where it expected `Gone`.
+///
+/// Not larger, because the backoff is `recovered_after / max`: with a budget of
+/// one, every restart waits out this whole span in real time.
+const ONE_RESTART: Duration = Duration::from_secs(2);
+
 fn limit(max: u32, recovered_after: Duration) -> Intensity {
     Intensity::new(
         NonZeroU32::new(max).expect("a budget of at least one"),
@@ -1138,7 +1153,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
                 vec![Box::new(RefuseFaults { fatal: false })];
             Ok((Desk::default(), observers, ()))
         },
-        limit(1, Duration::from_millis(50)),
+        limit(1, ONE_RESTART),
     )
     .actor();
     let _server = Server::builder(&server_node)
@@ -1285,7 +1300,7 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
                 vec![Box::new(RefuseFaults { fatal: false })];
             Ok((Desk::default(), observers, ()))
         },
-        limit(1, Duration::from_millis(50)),
+        limit(1, ONE_RESTART),
     )
     .actor();
 
@@ -1508,7 +1523,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
                         vec![Box::new(RefuseFaults { fatal: false })];
                     Ok((Desk::default(), observers, ()))
                 },
-                limit(1, Duration::from_millis(50)),
+                limit(1, ONE_RESTART),
             )
             .mountable(),
         )
@@ -1675,8 +1690,20 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 
     let calling = tokio::spawn(async move { client.beats().await });
     // The send has to have landed before the unwind, or this proves nothing: a
-    // call refused at the mailbox is a different path, and already correct.
-    n0_future::time::sleep(Duration::from_millis(100)).await;
+    // call refused at the mailbox is a different path, and already correct. Asked
+    // of the mailbox, not slept for: the factory is held, so the call can only be
+    // sitting in it.
+    for _ in 0..30_000 {
+        if ticker.status().queued == 1 {
+            break;
+        }
+        n0_future::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        ticker.status().queued,
+        1,
+        "the peer's call must be in the mailbox before the factory unwinds"
+    );
     go.notify_one();
 
     let lost = n0_future::time::timeout(NO_PROGRESS, calling)
