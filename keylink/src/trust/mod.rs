@@ -184,11 +184,15 @@ impl Trust {
         self.0.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
     /// Verify and retain one chain at the current time. Refused data is not stored.
-    /// Identical certificate-id sequences are a no-op. At capacity, the chain
-    /// with the earliest expiry is evicted, breaking ties by ordered certificate
-    /// IDs. This total order makes retention independent of feed order. Returns
-    /// `NotRetained` if the offered
-    /// chain loses that comparison, or the first verification fault.
+    /// Identical certificate-id sequences are a no-op. At the per-holder cap,
+    /// the earliest expiry loses, breaking ties by ordered certificate IDs. This
+    /// retention order is feed-order independent for one holder, not globally.
+    /// At `MAX_RETAINED_CHAINS`, an insertion that would grow the total returns
+    /// `StoreFull`; there is no cross-holder eviction. First-accepted holders
+    /// occupy the global capacity, so rejected feeds can retain different subsets.
+    /// Returns `NotRetained` if the offer loses the per-holder comparison, or the
+    /// first verification fault. A proven pending revocation can close affected
+    /// connections even when this insertion is subsequently refused.
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
