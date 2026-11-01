@@ -1201,6 +1201,77 @@ impl Blobs {
         Ok(members.iter().map(|member| BlobId(*member)).collect())
     }
 
+    /// Read a blob this node holds, a window at a time, verifying every byte
+    /// against its address before it is handed out.
+    ///
+    /// The same [`BlobReader`] a holder's blob opens as, so a caller streams it
+    /// with [`next_chunk`](BlobReader::next_chunk) or
+    /// [`copy_to`](BlobReader::copy_to) and holds one window of it at most,
+    /// however large the blob is.
+    ///
+    /// **Whole or nothing at the door.** A blob the store does not hold in full,
+    /// absent or partly fetched, is refused with [`Error::BlobNotHeld`] before a
+    /// byte is read, and a held blob whose data or hashes have changed on disk
+    /// fails with [`Error::BlobCorrupt`] at the window where they differ, with
+    /// every earlier window already verified and delivered. The file store's
+    /// export already refuses data that no longer matches the hashes beside it;
+    /// this also checks those hashes, and the path from them, against the address
+    /// asked for, whatever store produced the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BlobNotHeld`], [`Error::BlobCorrupt`], and [`Error::Io`] when the
+    /// store fails.
+    pub async fn reader(&self, id: BlobId) -> Result<BlobReader> {
+        let status = self
+            .store()
+            .blobs()
+            .status(id.hash())
+            .await
+            .map_err(store_error)?;
+        let BlobStatus::Complete { size } = status else {
+            let held = self.held(id).await?.total_bytes();
+            return Err(Error::BlobNotHeld { id, held });
+        };
+        Ok(BlobReader {
+            connection: None,
+            total: size,
+            take: Selection::new(id, 0, size),
+            state: State::Local(Box::new(Local {
+                store: self.store().clone(),
+                id,
+                total: size,
+                next: 0,
+                pending: std::collections::VecDeque::new(),
+            })),
+        })
+    }
+
+    /// Read a blob this node holds into memory, verified.
+    ///
+    /// For small blobs: `limit` is the most bytes the caller will have held, and
+    /// a longer blob is refused with [`Error::BlobTooLarge`] before it is read.
+    /// Anything that might be large is read with [`reader`](Self::reader).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`reader`](Self::reader), and [`Error::BlobTooLarge`].
+    pub async fn read_to_bytes(&self, id: BlobId, limit: u64) -> Result<Bytes> {
+        let mut reader = self.reader(id).await?;
+        if reader.total_len() > limit {
+            return Err(Error::BlobTooLarge {
+                id,
+                len: reader.total_len(),
+                limit,
+            });
+        }
+        let mut out = Vec::with_capacity(reader.total_len() as usize);
+        while let Some(chunk) = reader.next_chunk().await? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(out))
+    }
+
     /// Which chunks of `id` this store holds, and how big the blob is if that
     /// has been proved.
     async fn held(&self, id: BlobId) -> Result<Bitfield> {
@@ -1466,7 +1537,7 @@ const FETCH_WINDOW: u64 = 4096;
 /// whole-member requests were. A window is split into as many requests as its
 /// ranges need, each at most this many bytes of encoded runs, and a run is never
 /// split: a request holds at least one member whatever the budget.
-const REQUEST_BUDGET: usize = 8 * 1024;
+const REQUEST_BUDGET: usize = 2 * 1024;
 
 /// The most bytes of ranges one member may contribute to a request before it is
 /// asked for whole instead: a store that has been written in thousands of
@@ -2127,7 +2198,7 @@ impl BlobHandle {
             });
         }
         Ok(BlobReader {
-            connection,
+            connection: Some(connection),
             total,
             take: Selection::new(self.id(), start, len),
             state: State::Reading(content),
@@ -2217,7 +2288,7 @@ impl BlobHandle {
     /// it, and which is checked for whole addresses before it is downloaded.
     /// Then the members, 4096 of them to a window: each window reads its slice of
     /// the root, asks the store what it holds of each member, and requests the
-    /// rest, in as many requests as its ranges need (at most 8 KiB of ranges
+    /// rest, in as many requests as its ranges need (at most 2 KiB of ranges
     /// each), so a window keeps both its plan and its requests small however long
     /// the closure is. A blob listed twice in a window is requested once.
     /// Fetching the sequence in one request would send the whole closure when
@@ -2520,10 +2591,103 @@ impl Selection {
 #[derive(Debug)]
 enum State {
     Reading(fsm::AtBlobContent),
+    /// A blob read off this node's own store: see [`Blobs::reader`].
+    Local(Box<Local>),
     Ended,
 }
 
+/// Verify one window of a blob that a store exported in the encoded form a
+/// holder would send, against the address `id` of a blob of `total` bytes, and
+/// return its leaves with the offset each starts at. `None` when anything fails:
+/// a size that is not `total`, a hash that does not match, a window that ends
+/// early.
+fn verify_window(
+    id: BlobId,
+    total: u64,
+    ranges: &ChunkRanges,
+    encoded: &[u8],
+) -> Option<Vec<(u64, Bytes)>> {
+    let (size, body) = encoded.split_first_chunk::<8>()?;
+    if u64::from_le_bytes(*size) != total {
+        return None;
+    }
+    let tree = bao_tree::BaoTree::new(total, iroh_blobs::store::IROH_BLOCK_SIZE);
+    let root = bao_tree::blake3::Hash::from_bytes(id.0);
+    let decoded =
+        bao_tree::io::sync::DecodeResponseIter::new(root, tree, std::io::Cursor::new(body), ranges);
+    let mut leaves = Vec::new();
+    for item in decoded {
+        match item.ok()? {
+            BaoContentItem::Leaf(leaf) => leaves.push((leaf.offset, leaf.data)),
+            BaoContentItem::Parent(_) => {}
+        }
+    }
+    Some(leaves)
+}
+
+/// How much of a local blob is read and verified at a time: 256 KiB, sixteen
+/// chunk groups. It is the most a local reader holds, whatever the blob's size.
+const LOCAL_WINDOW: u64 = 256 * 1024;
+
+/// A blob read off this node's own store, a window at a time.
+///
+/// Each window is exported in the same encoded form a holder would send over the
+/// wire (the size, the parent hashes down from the root, the data) and decoded
+/// with the decoder a fetch uses, against the address the caller asked for
+/// ([`verify_window`]). A leaf that does not hash to its parent, or a parent that
+/// does not hash to the root, fails the window, and the window's bytes are never
+/// handed out.
+///
+/// **Two checks, and they are not the same one.** The file store's export
+/// validates the data it encodes against the hashes stored beside it, and fails
+/// with `LeafHashMismatch` when a byte on disk has changed (measured by
+/// `on_disk_the_local_reader_refuses_a_blob_whose_data_changed`); that failure is
+/// reported here as [`Error::BlobCorrupt`] too. It checks the data against the
+/// stored hashes, not the stored hashes against the address, and it is a property
+/// of that store, not of the interface. The decode here checks the whole path up
+/// to the address the caller named, whatever store produced the bytes.
+#[derive(Debug)]
+struct Local {
+    store: Store,
+    id: BlobId,
+    total: u64,
+    /// Where the next window starts.
+    next: u64,
+    /// Verified leaves of the current window not yet handed out, with the
+    /// offset each starts at.
+    pending: std::collections::VecDeque<(u64, Bytes)>,
+}
+
+impl Local {
+    /// Read and verify the next window.
+    async fn fill(&mut self) -> Result<()> {
+        let start = self.next;
+        let end = (start + LOCAL_WINDOW).min(self.total);
+        let corrupt = || Error::BlobCorrupt {
+            id: self.id,
+            offset: start,
+        };
+        let ranges = ChunkRanges::bytes(start..end);
+        let encoded = self
+            .store
+            .blobs()
+            .export_bao(self.id.hash(), ranges.clone())
+            .bao_to_vec()
+            .await
+            .map_err(|_| corrupt())?;
+        let leaves = verify_window(self.id, self.total, &ranges, &encoded).ok_or_else(corrupt)?;
+        self.pending.extend(leaves);
+        self.next = end;
+        Ok(())
+    }
+}
+
 /// One verified read of a blob, or of one byte range of it.
+///
+/// Two ways to get one, with the same methods: from a holder
+/// ([`BlobHandle::open`]), and from this node's own store
+/// ([`Blobs::reader`]), which reads and verifies a window at a time and never
+/// hands out a byte of a blob it does not hold in full.
 ///
 /// # Dropping it cancels the transfer
 ///
@@ -2549,8 +2713,9 @@ enum State {
 /// selected byte arrived and was validated.
 pub struct BlobReader {
     /// Held so a refusal stays distinguishable from a network fault after the
-    /// handle is gone, and so the connection outlives the read.
-    connection: Connection,
+    /// handle is gone, and so the connection outlives the read. None for a read
+    /// of this node's own store, which has no connection.
+    connection: Option<Connection>,
     total: u64,
     take: Selection,
     state: State,
@@ -2609,13 +2774,38 @@ impl BlobReader {
             // it reporting a CLEAN END is `Selection::broke`, not this line.
             match std::mem::replace(&mut self.state, State::Ended) {
                 State::Ended => return self.take.finish().map(|()| None),
+                State::Local(mut local) => {
+                    if let Some((offset, data)) = local.pending.pop_front() {
+                        let slice = self.take.leaf(offset, data)?;
+                        self.state = State::Local(local);
+                        if let Some(bytes) = slice {
+                            return Ok(Some(bytes));
+                        }
+                    } else if local.next >= local.total {
+                        self.take.finish()?;
+                        return Ok(None);
+                    } else {
+                        match local.fill().await {
+                            Ok(()) => self.state = State::Local(local),
+                            Err(error) => {
+                                self.take.broke();
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 State::Reading(content) => match content.next().await {
                     fsm::BlobContentNext::More((next, item)) => {
                         let item = item.map_err(|error| {
                             // `Selection` remembers, so the terminal call above
                             // reports the failure instead of a clean end.
                             self.take.broke();
-                            classify(self.take.id, error.into(), &self.connection)
+                            match &self.connection {
+                                Some(connection) => {
+                                    classify(self.take.id, error.into(), connection)
+                                }
+                                None => Error::Io(std::io::Error::other(error.to_string())),
+                            }
                         })?;
                         // A hash-tree node, not payload. Verification is
                         // bao-tree's job and has already happened by the time an
@@ -3303,6 +3493,77 @@ mod tests {
         let requests = plan(blob(1), 0, &[scattered], REQUEST_BUDGET).expect("plans");
         assert_eq!(requests.len(), 1);
         assert_eq!(asked_at(&requests, 1), ChunkRanges::all());
+    }
+
+    /// Verification of a local window, on its own and against a store that is not
+    /// the file store: the encoded form a store exports for a window decodes and
+    /// verifies against the address, and a flipped data byte, a flipped parent
+    /// hash, a wrong size header, a window cut short, and an address that is not
+    /// the blob's each fail it.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK66`) by replacing
+    /// `if u64::from_le_bytes(*size) != total {`
+    /// with `if false {`: the wrong size header is then not refused.
+    #[tokio::test]
+    async fn a_window_verifies_against_its_address_and_nothing_else_does() {
+        let content: Vec<u8> = (0..70_000u32).map(|n| (n % 251) as u8).collect();
+        let store = MemStore::new();
+        let tag = store.add_bytes(content.clone()).await.expect("stores");
+        let id = BlobId::from_hash(tag.hash);
+        let total = content.len() as u64;
+        let ranges = ChunkRanges::bytes(16_384..49_152);
+        let encoded = store
+            .blobs()
+            .export_bao(tag.hash, ranges.clone())
+            .bao_to_vec()
+            .await
+            .expect("exports");
+
+        let leaves = verify_window(id, total, &ranges, &encoded).expect("verifies");
+        let data: Vec<u8> = leaves
+            .iter()
+            .flat_map(|(_, bytes)| bytes.to_vec())
+            .collect();
+        assert_eq!(leaves[0].0, 16_384, "the window starts at its group");
+        assert_eq!(data, content[16_384..49_152]);
+
+        // A flipped data byte: the last byte of the encoding is data.
+        let mut flipped = encoded.clone();
+        *flipped.last_mut().expect("bytes") ^= 0xFF;
+        assert!(
+            verify_window(id, total, &ranges, &flipped).is_none(),
+            "a data byte"
+        );
+
+        // A flipped parent hash: the first byte after the size is a parent's.
+        let mut flipped = encoded.clone();
+        flipped[8] ^= 0xFF;
+        assert!(
+            verify_window(id, total, &ranges, &flipped).is_none(),
+            "a parent hash"
+        );
+
+        // A size header that is not the blob's.
+        let mut flipped = encoded.clone();
+        flipped[0] ^= 0x01;
+        assert!(
+            verify_window(id, total, &ranges, &flipped).is_none(),
+            "the size"
+        );
+
+        // A window cut short.
+        let cut = &encoded[..encoded.len() - 1];
+        assert!(
+            verify_window(id, total, &ranges, cut).is_none(),
+            "cut short"
+        );
+        assert!(verify_window(id, total, &ranges, &[]).is_none(), "empty");
+
+        // Some other blob's address.
+        assert!(
+            verify_window(blob(9), total, &ranges, &encoded).is_none(),
+            "another address"
+        );
     }
 
     /// Review finding 8. An accept that has checked the ledger but not yet

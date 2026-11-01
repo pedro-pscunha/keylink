@@ -163,8 +163,25 @@ tree with sub-sequences is flattened into one sequence that lists every blob.
 read, and never hashes a peer supplied.
 
 `handle.fetch_into(&store)` fetches a closure on one dial: the root, then only
-the members the store lacks, 4096 members per request. `Blobs::missing` (and
-`handle.missing(&store)`) answer what that is, from the fetcher's own store.
+what the store lacks of the members, 4096 members to a window. It answers with a
+`Fetched { read, kept }`: the payload bytes read from the holder, and the verified
+bytes the store already held and did not ask for. Resume goes down into a member:
+the store's bitfield says which 16 KiB chunk groups it holds, and only the others
+are requested, so after a cut no verified group is sent twice. A 4 MiB member cut
+after exactly 100 groups resumed reading 2,556,004 of its 4,194,404 bytes and
+keeping 1,638,400. A window's requests carry at most 2 KiB of ranges each, so a
+window of many partly held members is several requests. `Blobs::missing` (and
+`handle.missing(&store)`) answer what is lacking, from the fetcher's own store.
+
+`Blobs::reader(id)` reads a blob the node holds, as the same `BlobReader` a
+holder's blob opens as: pieces of at most a chunk group, in a bounded amount of
+memory, each window verified against the address before any of it is handed out.
+A blob the store does not hold in full, absent or part way, is refused with
+`Error::BlobNotHeld` before a byte is read, and one whose stored data or hashes
+no longer verify fails with `Error::BlobCorrupt` at the window where they differ.
+(The file store's own export already refuses data that no longer matches the
+hashes beside it; the reader also checks those hashes against the address.)
+`Blobs::read_to_bytes(id, limit)` is the same for a small blob into memory.
 
 A closure has no limit on how many members it lists. Planning memory and
 request size are bounded, the work is not linear: iroh-blobs 0.104 walks offsets

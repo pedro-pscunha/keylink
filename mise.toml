@@ -298,6 +298,11 @@ description = "Every test once, with native integration suites sharing one proce
 run = [
     "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test grant_allocation --test keyed_topic_allocation --test mailbox_latency --test reliable --no-fail-fast",
     "cargo test --workspace --exclude keylink --test '*' --no-fail-fast",
+    # The tests that need a file store (`blobs-fs` is off by default): a partial
+    # blob seeded on a disk, and a data file damaged on one. They are in
+    # `tests/blobs.rs` under `mod on_disk`, compiled out of the commands above,
+    # and this one turns the feature on and runs exactly them.
+    "cargo test -p keylink --features blobs-fs --test blobs on_disk_ --no-fail-fast",
     "cargo test --workspace --doc --no-fail-fast",
 ]
 

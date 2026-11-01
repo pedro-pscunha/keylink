@@ -996,7 +996,7 @@ async fn ask(from: iroh::Endpoint, holder: iroh::EndpointAddr, request: GetReque
         .expect("encodes a get request");
     send.write_all(&asked).await.expect("writes the request");
     send.finish().expect("finishes the request");
-    recv.read_to_end(16 * 1024 * 1024)
+    recv.read_to_end(256 * 1024 * 1024)
         .await
         .expect("reads the whole answer")
 }
@@ -3529,4 +3529,439 @@ async fn a_fetch_cut_inside_one_member_resumes_without_resending_a_verified_grou
         vec![payload(len)],
         "and the member is whole and identical"
     );
+}
+
+/// Read a held blob back through the local reader, hashing as it streams, and
+/// say the longest piece it handed out.
+async fn stream_and_hash(
+    blobs: &Blobs,
+    id: BlobId,
+) -> keylink::Result<(Vec<u8>, blake3::Hash, usize)> {
+    let mut reader = blobs.reader(id).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = Vec::with_capacity(reader.total_len() as usize);
+    let mut longest = 0;
+    while let Some(chunk) = reader.next_chunk().await? {
+        hasher.update(&chunk);
+        longest = longest.max(chunk.len());
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, hasher.finalize(), longest))
+}
+
+/// The local reader: a fetched closure is read back member by member, every
+/// byte equal to what was stored and the BLAKE3 of it equal to the address, and
+/// no piece is longer than a chunk group, so a blob of any size is read in a
+/// bounded amount of memory.
+#[tokio::test]
+async fn a_fetched_closure_is_read_back_locally_and_hashes_to_its_addresses() {
+    let stack = stack(300).await;
+    let (_, handle) = stack.client.snapshot().await.expect("the one call");
+    let local = Blobs::memory();
+    handle
+        .fetch_into(&local)
+        .await
+        .expect("fetches the closure");
+
+    for (nth, id) in stack.ids.iter().enumerate() {
+        let (bytes, hash, longest) = stream_and_hash(&local, *id).await.expect("held, so read");
+        assert_eq!(bytes, member(nth as u32), "member {nth} reads back intact");
+        assert_eq!(hash.as_bytes(), id.as_bytes(), "and hashes to its address");
+        assert!(
+            longest <= 16 * 1024,
+            "a piece of {longest} bytes is over a chunk group"
+        );
+    }
+    // The member list too, which is a held blob like any other.
+    let (list, hash, _) = stream_and_hash(&local, stack.seq.id()).await.expect("held");
+    assert_eq!(list.len(), 300 * 32);
+    assert_eq!(hash.as_bytes(), stack.seq.id().as_bytes());
+
+    // A large blob streams in pieces of a chunk group and not in one.
+    let big = payload(3 * 1024 * 1024 + 7);
+    let id = local.add_bytes(big.clone()).await.expect("stores");
+    let (bytes, hash, longest) = stream_and_hash(&local, id).await.expect("held");
+    assert_eq!(bytes, big);
+    assert_eq!(hash.as_bytes(), id.as_bytes());
+    assert_eq!(longest, 16 * 1024, "the pieces are the chunk groups");
+    // And the convenience, with its bound.
+    assert_eq!(
+        local
+            .read_to_bytes(stack.ids[0], 4096)
+            .await
+            .expect("small"),
+        member(0).as_slice()
+    );
+    assert!(matches!(
+        local.read_to_bytes(id, 1024).await,
+        Err(Error::BlobTooLarge { len, limit: 1024, .. }) if len == big.len() as u64
+    ));
+}
+
+/// A blob the store does not hold in full is refused with a typed error and no
+/// byte of it, whether it is absent or only partly here.
+#[tokio::test]
+async fn a_blob_the_store_does_not_hold_in_full_is_refused_by_the_local_reader() {
+    let absent = Blobs::memory();
+    let id = Blobs::memory()
+        .add_bytes(payload(40_000))
+        .await
+        .expect("stores");
+    assert!(matches!(
+        absent.reader(id).await,
+        Err(Error::BlobNotHeld { held: 0, .. })
+    ));
+    assert!(matches!(
+        absent.read_to_bytes(id, 1 << 20).await,
+        Err(Error::BlobNotHeld { held: 0, .. })
+    ));
+
+    // Partly here: three groups of a five-group blob arrived before the cut.
+    const GROUP: u64 = 16 * 1024;
+    let len = 4 * GROUP + 5;
+    let cluster = cluster().await;
+    let member = cluster.add_bytes(&payload(len as usize)).await;
+    cluster
+        .grant_content(&cluster.peer, &[Content::Blob(member)])
+        .await;
+    let cut = bytes_through_group(len, 3);
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let holder = forgery(move |request: GetRequest| {
+        let (from, to) = (from.clone(), to.clone());
+        async move {
+            let answer = ask(from, to, request.clone()).await;
+            if request.ranges == preflight_ranges() {
+                answer
+            } else {
+                answer[..cut].to_vec()
+            }
+        }
+    })
+    .await;
+    let local = Blobs::memory();
+    holder
+        .handle(member)
+        .fetch_into(&local)
+        .await
+        .expect_err("cut after three groups");
+    match local.reader(member).await {
+        Err(Error::BlobNotHeld { held, .. }) => assert_eq!(held, 3 * GROUP),
+        other => panic!("a partly held blob must be refused, got {other:?}"),
+    }
+    assert!(local.read_to_bytes(member, 1 << 20).await.is_err());
+}
+
+// ═══════════════════════════════════════ on a disk (needs `--features blobs-fs`)
+//
+// These run with `mise run test`'s second command, which turns the feature on:
+// a default build has no file store to put a partial blob in or to corrupt.
+
+#[cfg(feature = "blobs-fs")]
+mod on_disk {
+    use super::*;
+    use iroh_blobs::store::fs::FsStore;
+
+    /// A fresh directory, removed when it goes out of scope.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos();
+            Self(
+                std::env::temp_dir()
+                    .join(format!("keylink-{what}-{}-{unique}", std::process::id())),
+            )
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// The data file of the one big blob in a file store's directory.
+    fn data_file(root: &std::path::Path, len: u64) -> std::path::PathBuf {
+        fn walk(dir: &std::path::Path, len: u64, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("a readable directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    walk(&path, len, found);
+                } else if path.extension().is_some_and(|ext| ext == "data")
+                    && std::fs::metadata(&path).expect("metadata").len() == len
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(root, len, &mut found);
+        assert_eq!(
+            found.len(),
+            1,
+            "one data file of {len} bytes under {root:?}"
+        );
+        found.remove(0)
+    }
+
+    fn flip_a_byte(file: &std::path::Path, at: u64) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file)
+            .expect("opens the data file");
+        let mut byte = [0u8; 1];
+        handle.seek(SeekFrom::Start(at)).expect("seeks");
+        handle.read_exact(&mut byte).expect("reads");
+        byte[0] ^= 0xFF;
+        handle.seek(SeekFrom::Start(at)).expect("seeks");
+        handle.write_all(&byte).expect("writes");
+        handle.sync_all().expect("syncs");
+    }
+
+    /// **The local reader refuses bytes that do not verify.**
+    ///
+    /// A blob of 1 MiB is stored on a disk and one byte of its data file, at
+    /// 900,000 (in the fourth window of 256 KiB), is flipped.
+    ///
+    /// First, what iroh-blobs does with it, stated plainly because it is easy to
+    /// assume the other thing: the file store's own `get_bytes`, which is its
+    /// export, **does** check the data it reads against the hashes stored beside
+    /// it, and refuses the damaged blob with `LeafHashMismatch(864)` (the leaf at
+    /// chunk 864, which holds byte 900,000). That check is the store's, against
+    /// its own outboard; it does not reach the address, and it is not an
+    /// interface a caller of keylink is promised.
+    ///
+    /// Then the local reader on the same damage: it delivers the three windows
+    /// before the damaged one (786,432 bytes, each equal to what was stored) and
+    /// then fails with `BlobCorrupt { offset: 786432 }`, and the damaged window's
+    /// bytes are never handed out. The decode that checks the path to the address
+    /// is covered on its own, with a flipped parent and a wrong size, by
+    /// `a_window_verifies_against_its_address_and_nothing_else_does`.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK67`) by replacing
+    /// `.map_err(|_| corrupt())?;`
+    /// with `.map_err(store_error)?;` in `keylink/src/blobs.rs`: the store's
+    /// refusal then arrives as `Error::Io` and the typed-error assertion fails.
+    #[tokio::test]
+    async fn on_disk_the_local_reader_refuses_a_blob_whose_data_changed() {
+        const LEN: usize = 1024 * 1024;
+        const AT: u64 = 900_000;
+        let content = payload(LEN);
+
+        // 1. iroh-blobs alone.
+        let theirs = Scratch::new("iroh-export");
+        let store = FsStore::load(&theirs.0).await.expect("opens a file store");
+        let tag = store.add_bytes(content.clone()).await.expect("stores");
+        store.sync_db().await.expect("commits");
+        flip_a_byte(&data_file(&theirs.0, LEN as u64), AT);
+        let exported = store
+            .get_bytes(tag.hash)
+            .await
+            .expect_err("the file store's export refuses data that no longer matches");
+        assert!(
+            format!("{exported:?}").contains("LeafHashMismatch(864)"),
+            "refused at the damaged leaf: {exported:?}"
+        );
+        store.shutdown().await.expect("shuts down");
+
+        // 2. keylink's reader on the same damage.
+        let ours = Scratch::new("keylink-reader");
+        let blobs = Blobs::persistent(&ours.0, keylink::Retention::Forever)
+            .await
+            .expect("opens a file store");
+        let id = blobs.add_bytes(content.clone()).await.expect("stores");
+        blobs.flush().await.expect("commits");
+        // Read it once undamaged: the control.
+        let (clean, hash, _) = stream_and_hash(&blobs, id).await.expect("verifies");
+        assert_eq!(clean, content);
+        assert_eq!(hash.as_bytes(), id.as_bytes());
+
+        flip_a_byte(&data_file(&ours.0, LEN as u64), AT);
+        let mut reader = blobs.reader(id).await.expect("held in full, so it opens");
+        let mut delivered = Vec::new();
+        let error = loop {
+            match reader.next_chunk().await {
+                Ok(Some(chunk)) => delivered.extend_from_slice(&chunk),
+                Ok(None) => panic!("the damaged blob read to its end"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                Error::BlobCorrupt {
+                    offset: 786_432,
+                    ..
+                }
+            ),
+            "expected BlobCorrupt at the damaged window, got {error:?}"
+        );
+        assert_eq!(delivered.len(), 786_432, "the three windows before it");
+        assert_eq!(delivered, content[..786_432], "each verified and equal");
+        assert!(blobs.read_to_bytes(id, 2 << 20).await.is_err());
+    }
+
+    /// **A window of many partly held members is split into requests, each
+    /// within the byte budget, and the fetch still ends at `Missing::Nothing`.**
+    ///
+    /// 800 members of 16,385 bytes (a group of 16,384 and a group of one byte)
+    /// are listed by a closure. A file store is seeded, with iroh-blobs' own
+    /// import, so that a third of them have only their first group, a third only
+    /// their second, and a third nothing, and the member list itself is whole.
+    /// What each member lacks differs from its neighbour's, so each is a run of
+    /// its own in the request, and 800 of them outgrow the 2 KiB a request may
+    /// carry: the holder is asked more than once, and no request is over it.
+    ///
+    /// `read` is exactly the bytes the store lacked and `kept` exactly the bytes
+    /// it held:
+    ///
+    /// ```text
+    /// read = 267 * 1 + 267 * 16 384 + 266 * 16 385 = 8 733 205
+    /// kept = 800 * 32 (the list) + 267 * 16 384 + 267 * 1 = 4 400 395
+    /// ```
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK65`, the same line the
+    /// planner's unit test is watched on): with the budget check off, one
+    /// request carries every run and the assertion that none is over 2 KiB fails.
+    #[tokio::test]
+    async fn on_disk_a_window_of_many_partly_held_members_is_split_and_completes() {
+        use iroh_blobs::store::mem::MemStore;
+        use iroh_blobs::BlobFormat;
+
+        const MEMBERS: u64 = 800;
+        const LEN: usize = 16 * 1024 + 1;
+        let member_bytes = |nth: u64| {
+            let mut bytes = payload(LEN);
+            bytes[..8].copy_from_slice(&nth.to_le_bytes());
+            bytes
+        };
+
+        let cluster = cluster().await;
+        let mut ids = Vec::new();
+        for nth in 0..MEMBERS {
+            ids.push(cluster.add_bytes(&member_bytes(nth)).await);
+        }
+        let seq = cluster
+            .blobs
+            .add_seq(ids.clone())
+            .await
+            .expect("stores the list");
+        cluster
+            .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+            .await;
+
+        // Seed the fetcher's disk: the whole list, and a piece of each member.
+        let seeded = Scratch::new("partial-members");
+        let source = MemStore::new();
+        let disk = FsStore::load(&seeded.0).await.expect("opens a file store");
+        let list: Vec<u8> = ids.iter().flat_map(|id| *id.as_bytes()).collect();
+        let list_tag = source
+            .blobs()
+            .add_bytes_with_opts((list, BlobFormat::HashSeq))
+            .await
+            .expect("stores the list");
+        assert_eq!(list_tag.hash, hash_of(seq.id()));
+        let whole = source
+            .blobs()
+            .export_bao(list_tag.hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await
+            .expect("exports");
+        disk.blobs()
+            .import_bao_bytes(list_tag.hash, ChunkRanges::all(), whole)
+            .await
+            .expect("imports the list");
+        let (mut read, mut kept) = (0u64, MEMBERS * 32);
+        for nth in 0..MEMBERS {
+            let tag = source
+                .add_bytes(member_bytes(nth))
+                .await
+                .expect("stores a member");
+            let held = match nth % 3 {
+                0 => ChunkRanges::chunks(0..16),
+                1 => ChunkRanges::chunks(16..17),
+                _ => ChunkRanges::empty(),
+            };
+            let (had, lacked) = match nth % 3 {
+                0 => (16 * 1024, 1),
+                1 => (1, 16 * 1024),
+                _ => (0, LEN as u64),
+            };
+            kept += had;
+            read += lacked;
+            if !held.is_empty() {
+                let piece = source
+                    .blobs()
+                    .export_bao(tag.hash, held.clone())
+                    .bao_to_vec()
+                    .await
+                    .expect("exports a piece");
+                disk.blobs()
+                    .import_bao_bytes(tag.hash, held, piece)
+                    .await
+                    .expect("imports a piece");
+            }
+        }
+        disk.shutdown().await.expect("shuts down");
+
+        let local = Blobs::persistent(&seeded.0, keylink::Retention::Forever)
+            .await
+            .expect("reopens the seeded store");
+        let from = cluster.peer.endpoint().clone();
+        let to = cluster.server.endpoint().addr();
+        let holder = forgery(move |request: GetRequest| {
+            let (from, to) = (from.clone(), to.clone());
+            async move { ask(from, to, request).await }
+        })
+        .await;
+        let handle = holder.handle(seq);
+
+        let fetched = handle
+            .fetch_into(&local)
+            .await
+            .expect("completes the members");
+        println!(
+            "many partial members: read {} kept {}",
+            fetched.read, fetched.kept
+        );
+        assert_eq!(fetched.read, read, "exactly the bytes the store lacked");
+        assert_eq!(fetched.kept, kept, "and exactly the bytes it held");
+        assert_eq!(
+            handle.missing(&local).await.expect("answers"),
+            keylink::Missing::Nothing
+        );
+
+        let asked: Vec<GetRequest> = holder
+            .asked()
+            .into_iter()
+            .filter(|request| request.ranges != preflight_ranges())
+            .collect();
+        assert!(
+            asked.len() >= 2,
+            "the window was split: {} request",
+            asked.len()
+        );
+        for request in &asked {
+            let bytes = postcard::to_stdvec(&request.ranges).expect("encodes").len();
+            assert!(
+                bytes <= 2 * 1024,
+                "a request of {bytes} bytes is over the budget"
+            );
+        }
+
+        // And what landed is the content.
+        for nth in [0u64, 1, 2, 399, 799] {
+            let (bytes, hash, _) = stream_and_hash(&local, ids[nth as usize])
+                .await
+                .expect("held");
+            assert_eq!(bytes, member_bytes(nth));
+            assert_eq!(hash.as_bytes(), ids[nth as usize].as_bytes());
+        }
+    }
 }
