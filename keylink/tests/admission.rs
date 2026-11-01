@@ -1011,3 +1011,56 @@ async fn an_allowlist_is_itself_an_admission() {
         "the fixed list must still fail closed"
     );
 }
+
+#[tokio::test]
+// Search `        for (registration, live) in self.live.snapshot() {`.
+// Made red with scripts/break-once.sh replacing it with
+// `        for (registration, live) in self.live.snapshot().into_iter().take(1) {`.
+// Watched: one connection remained live rather than zero, before either watch
+// was awaited. The complete implementation closes both sessions of the peer.
+async fn removing_a_peer_closes_both_of_its_simultaneous_connections() {
+    let node = local_node().await;
+    let secret = keylink::SecretKey::from_bytes(&[31; 32]);
+    // Separate endpoints with the same proven identity guarantee two sessions,
+    // independent of any client-side connection reuse.
+    let first_node = keylink::Node::bind_local_with_secret(secret.clone())
+        .await
+        .unwrap();
+    let second_node = keylink::Node::bind_local_with_secret(secret).await.unwrap();
+    let peer = first_node.id();
+    assert_eq!(peer, second_node.id());
+    let policy = Arc::new(DynamicAdmission::new(Allowlist::only([peer])));
+    let _running = Server::builder(&node)
+        .service(
+            gate::service(Gate, Allowlist::anyone())
+                .admission(policy.clone())
+                .build(),
+        )
+        .spawn()
+        .unwrap();
+    let first = gate::Client::connect(&first_node, node.endpoint().addr())
+        .await
+        .unwrap();
+    let second = gate::Client::connect(&second_node, node.endpoint().addr())
+        .await
+        .unwrap();
+    assert_eq!(first.knock().await.unwrap(), 1);
+    assert_eq!(second.knock().await.unwrap(), 1);
+    assert_eq!(policy.live(), 2);
+    let one = first.watch();
+    let two = second.watch();
+    assert_eq!(
+        policy.apply(Allowlist::only([node.id()])).unwrap(),
+        vec![peer]
+    );
+    assert_eq!(policy.live(), 0);
+    let _ = tokio::join!(one, two);
+    assert_eq!(
+        first.knock().await.unwrap_err().refusal(),
+        Some(keylink::Refusal::Denied)
+    );
+    assert_eq!(
+        second.knock().await.unwrap_err().refusal(),
+        Some(keylink::Refusal::Denied)
+    );
+}

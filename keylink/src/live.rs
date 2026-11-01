@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 type Connections = BTreeMap<PublicKey, BTreeMap<usize, (u64, LiveConnection)>>;
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Registration {
+pub(crate) struct Registration {
     peer: PublicKey,
     connection: usize,
     generation: u64,
@@ -18,9 +18,9 @@ struct Inner {
     next: AtomicU64,
 }
 #[derive(Debug, Default)]
-pub(super) struct Live(Arc<Inner>);
+pub(crate) struct Live(Arc<Inner>);
 impl Live {
-    pub(super) fn insert(&self, live: LiveConnection) -> Registration {
+    pub(crate) fn insert(&self, live: LiveConnection) -> Registration {
         let registration = Registration {
             peer: live.peer().id(),
             connection: live.id(),
@@ -43,10 +43,10 @@ impl Live {
         });
         registration
     }
-    pub(super) fn remove(&self, registration: Registration) {
+    pub(crate) fn remove(&self, registration: Registration) {
         remove(&self.0, registration);
     }
-    pub(super) fn snapshot(&self) -> Vec<(Registration, LiveConnection)> {
+    pub(crate) fn snapshot(&self) -> Vec<(Registration, LiveConnection)> {
         self.0
             .connections
             .lock()
@@ -68,7 +68,7 @@ impl Live {
             })
             .collect()
     }
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0
             .connections
             .lock()

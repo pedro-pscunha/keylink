@@ -537,6 +537,8 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ("DA1", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     "        for (registration, live) in self.live.snapshot() {"),
     ("CA1", "keylink/tests/trust.rs", "keylink/src/call.rs",
      "        hasher.update(&binding);"),
     ('RR1', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '            hash.update(credential.principal().as_bytes());'),

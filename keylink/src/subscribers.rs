@@ -111,11 +111,11 @@ impl<C> Subscribers<C> {
     /// connection one's task wakes and removes connection two's entry, because
     /// both are filed under the same [`EndpointId`].
     ///
-    /// The result is a peer that believes it is subscribed, a registry that has
-    /// forgotten it, and — in the admission adapter that instantiates this at
-    /// `LiveConnection` — a live connection no `apply` can see or close. That is
-    /// an authorization bypass reached through a bookkeeping race, so the
-    /// generation is not an optimisation.
+    /// The result is a peer that believes it is subscribed and a registry that
+    /// has forgotten it. The generation is therefore part of correctness.
+    /// Admission does not use this one-handle-per-peer registry: both built-in
+    /// revocable policies share a private per-connection registry so removing a
+    /// peer closes every session, not only its latest one.
     pub fn insert(&self, peer: EndpointId, client: C, departure: Watch)
     where
         C: Send + 'static,

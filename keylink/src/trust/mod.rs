@@ -20,10 +20,10 @@
 mod cert;
 mod chain;
 mod guard;
-mod live;
 mod present;
 mod sign;
 
+use crate::live;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

@@ -657,7 +657,7 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    store would be held and never written — and its exclusive claim on the log
    file would refuse the next service that meant to use it.
 
-   So **effectively-once is a property of one process's lifetime, not of a key** — for as long as the only thing that knows about the key is the ledger. `cx.call()` changes that: its `CallId` binds the peer and key to the same received-message and principal/holder commitment as the ledger. `Applied<T>` is a bounded set of those bound calls, so an old answer cannot cross requests or principals after the ledger forgets its slot. Retries must preserve message bytes and authority; another contract encoding is another bound call. Put one in your own state, and the dedupe is three lines:
+   So **effectively-once is a property of one process's lifetime, not of a key** — for as long as the only thing that knows about the key is the ledger. `cx.call()` changes that: its `CallId` binds the peer and key to the same received-message and principal/holder commitment as the ledger. `Applied<T>` is a bounded set of those bound calls, so an old answer cannot cross requests or principals after the ledger forgets its slot. Retries must preserve message bytes and authority; another contract encoding is another bound call. CallId v2 does not migrate old IDs; a reset of pre-v2 applied-ID state is required. Put one in your own state, and the dedupe is three lines:
 
    ```rust,ignore
    let call = cx.peer().and_then(Context::call);

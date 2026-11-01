@@ -62,17 +62,17 @@
 //!   revocation latency is the feeder's delivery latency.
 //! - **No history.** There is no audit trail of past decisions; that is a
 //!   different port with different operations.
-//! - **DynamicAdmission remembers one connection per peer.** Its registry is keyed by [`EndpointId`], so a
-//!   peer holding several has its most recent remembered and closed. Two live
-//!   connections from one identity are not two peers. `trust::Trust` instead
-//!   tracks and closes every connection, across all guarded ALPNs.
+//! - **Both built-in revocable adapters track every connection.** Each removed
+//!   peer's sessions are closed across ALPNs. The returned peer IDs are unique;
+//!   `live()` counts connections, not unique identities.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
 
-use crate::{AdmittedPeer, Allowlist, ProvenPeer, Subscribers, Watch};
+use crate::{AdmittedPeer, Allowlist, ProvenPeer, Watch};
 
 /// The close code for a peer a policy refused.
 pub(crate) const REFUSED: u32 = 1;
@@ -233,10 +233,9 @@ pub trait Revocable: Admission {
 #[derive(Debug)]
 pub struct DynamicAdmission {
     allow: Mutex<Allowlist>,
-    /// Wave C's registry, instantiated at the one other thing worth keying by
-    /// peer. One type, two uses: fan out to the peers that dialled in, and
-    /// close the ones a new policy no longer admits.
-    live: Subscribers<LiveConnection>,
+    /// Every connection is tracked separately, including simultaneous sessions
+    /// from one identity and connections on different service ALPNs.
+    live: crate::live::Live,
 }
 
 impl DynamicAdmission {
@@ -245,7 +244,7 @@ impl DynamicAdmission {
     pub fn new(initial: Allowlist) -> Self {
         Self {
             allow: Mutex::new(initial),
-            live: Subscribers::new(),
+            live: crate::live::Live::default(),
         }
     }
 
@@ -274,9 +273,8 @@ impl Admission for DynamicAdmission {
         }
     }
 
-    fn admitted(&self, peer: &AdmittedPeer, live: LiveConnection) {
-        let watch = live.watch();
-        self.live.insert(peer.id(), live.clone(), watch);
+    fn admitted(&self, _peer: &AdmittedPeer, live: LiveConnection) {
+        let registration = self.live.insert(live.clone());
 
         // Re-read the policy AFTER the insert, and the order is the whole fix.
         //
@@ -292,7 +290,7 @@ impl Admission for DynamicAdmission {
         // and closes it, and one that takes it BEFORE is visible to this read.
         if self.policy().admit(live.peer()).is_none() {
             live.close();
-            self.live.remove(peer.id());
+            self.live.remove(registration);
         }
     }
 }
@@ -308,15 +306,16 @@ impl Revocable for DynamicAdmission {
         *self.policy() = next;
 
         let policy = self.policy().clone();
-        let mut closed = Vec::new();
-        for (id, live) in self.live.snapshot() {
+        let mut closed = BTreeSet::new();
+        for (registration, live) in self.live.snapshot() {
+            let id = live.peer().id();
             if policy.admit(live.peer()).is_none() {
                 live.close();
-                self.live.remove(id);
-                closed.push(id);
+                self.live.remove(registration);
+                closed.insert(id);
             }
         }
-        Ok(closed)
+        Ok(closed.into_iter().collect())
     }
 }
 
