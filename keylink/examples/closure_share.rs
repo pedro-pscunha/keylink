@@ -116,12 +116,16 @@ async fn fetch(client: &shelf::Client, preseed: u32) -> Result<(), Box<dyn StdEr
     // 1. Have/want, answered from the fetcher's own store.
     let started = Instant::now();
     match handle.missing(&local).await? {
-        Missing::Members(members) if members.len() as u64 == lacking => {
+        Missing::Members(members) if members.len() as u64 == lacking && lacking > 0 => {
             println!(
                 "missing: {} of {count} ({:?})",
                 members.len(),
                 started.elapsed()
             );
+        }
+        // Everything is already held, or there is nothing to hold.
+        Missing::Nothing if lacking == 0 => {
+            println!("missing: nothing of {count} ({:?})", started.elapsed());
         }
         other => return Err(format!("expected {lacking} members missing, got {other:?}").into()),
     }
@@ -184,6 +188,15 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             let _server = serve(&holder, 200).await?;
             let client = shelf::Client::connect(&caller, holder.endpoint().addr()).await?;
             fetch(&client, 150).await?;
+            // The same holder again, for a fetcher that holds all of it: nothing
+            // is missing and nothing moves, which is not an error.
+            fetch(&client, 200).await?;
+
+            // And a closure that lists nothing.
+            let empty = Node::bind_local().await?;
+            let _empty = serve(&empty, 0).await?;
+            let client = shelf::Client::connect(&caller, empty.endpoint().addr()).await?;
+            fetch(&client, 0).await?;
         }
         Some("serve") => {
             let members = flag(&args, "--members", 5000)?;

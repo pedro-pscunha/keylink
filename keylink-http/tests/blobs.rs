@@ -124,9 +124,20 @@ fn challenge() -> Challenge {
 }
 
 async fn start_with(limits: StreamingLimits) -> Running {
+    start_with_grant_budget(limits, None).await
+}
+
+/// The same, over a store whose grant ledger holds `budget` bytes.
+async fn start_with_grant_budget(
+    limits: StreamingLimits,
+    budget: Option<std::num::NonZeroUsize>,
+) -> Running {
     let server_node = local_node().await;
     let client_node = local_node().await;
     let blobs = Blobs::memory();
+    if let Some(budget) = budget {
+        blobs.set_grant_budget(budget);
+    }
     let content = payload(SPANNING);
 
     let mut known = std::collections::HashMap::new();
@@ -624,6 +635,36 @@ async fn blob_lookup_returns_exact_value_location_and_no_fetch() {
         SPANNING.to_string(),
         "the declared value, and nothing else"
     );
+}
+
+/// Review finding 9. A full grant ledger is a capacity condition, and the
+/// gateway reports it as one (`503 upstream_unavailable`, as for the other
+/// capacity refusals) and not as a broken upstream (`502`).
+///
+/// The budget holds exactly one grant for the gateway's one peer. The first
+/// lookup takes it; the second is a different blob and does not fit.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK60`) by replacing
+/// `| keylink::RemoteError::GrantsExhausted { .. }`
+/// with nothing, in `keylink-http/src/error.rs`: the refusal then falls to the
+/// catch-all and the second lookup is a `502`.
+#[tokio::test]
+async fn a_full_grant_ledger_is_a_503_and_not_a_502() {
+    let one_grant =
+        std::num::NonZeroUsize::new(keylink::PEER_COST + keylink::GRANT_COST).expect("non-zero");
+    let running = start_with_grant_budget(limits(), Some(one_grant)).await;
+
+    let first = running.lookup("datasheet").await;
+    assert_eq!(
+        first.status(),
+        http::StatusCode::CREATED,
+        "control: it fits"
+    );
+
+    let second = running.lookup("tiny").await;
+    assert_eq!(second.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = second.text().await.expect("a body");
+    assert!(body.contains("upstream_unavailable"), "{body}");
 }
 
 /// A range header on a lookup names nothing, and is ignored rather than

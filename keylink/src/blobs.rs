@@ -783,6 +783,32 @@ impl Connections {
         self.lock().insert(connection_id, Live { peer, handle });
     }
 
+    /// Register a connection of `peer` if the ledger still knows it, and hang
+    /// it up if not. Returns whether it was kept.
+    ///
+    /// **Registers first and asks second**, which is the whole point. The other
+    /// order checks that the peer holds a grant and then registers, and a
+    /// `revoke_peer` that lands between the two has already swept the
+    /// connections it could see, so this one would be accepted by a node that
+    /// promised to refuse the peer. Registering first means a revoke either sees
+    /// the connection in its sweep, or removed the grants before the question
+    /// below is asked.
+    fn admit_known(
+        &self,
+        grants: &Grants,
+        connection_id: u64,
+        peer: ProvenPeer,
+        handle: Arc<dyn Hangup>,
+    ) -> bool {
+        self.admit(connection_id, peer, Arc::clone(&handle));
+        if grants.knows(&peer) {
+            return true;
+        }
+        self.forget(connection_id, peer);
+        handle.hang_up();
+        false
+    }
+
     /// Drop an entry only while it still names the peer that took it.
     ///
     /// `stable_id` is a slab index, and quinn reuses one once its connection is
@@ -1367,13 +1393,6 @@ impl ProtocolHandler for BlobsAdmission {
         // blobs path where the connection itself is in hand. Everything
         // downstream sees a `connection_id` and has to look the peer up.
         let peer = ProvenPeer::on(&connection);
-        if !self.grants.knows(&peer) {
-            // The same code and reason iroh-blobs uses for a refusal, so a
-            // denied peer reads `Error::BlobRefused` whether it was turned away
-            // at the connection or at the request.
-            connection.close(ERR_PERMISSION, b"permission");
-            return Ok(());
-        }
 
         // COUPLING, and it is load bearing. `handle_connection` derives its
         // `connection_id` as `connection.stable_id() as u64`
@@ -1386,8 +1405,19 @@ impl ProtocolHandler for BlobsAdmission {
         // a granted fetch SUCCEEDS, so a broken derivation turns a test red
         // instead of turning the feature off.
         let connection_id = connection.stable_id() as u64;
-        self.live
-            .admit(connection_id, peer, Arc::new(connection.clone()));
+        //
+        // Refused here when the peer holds no grant, with the same code and
+        // reason iroh-blobs uses for a refusal, so a denied peer reads
+        // `Error::BlobRefused` whether it was turned away at the connection or
+        // at the request.
+        if !self.live.admit_known(
+            &self.grants,
+            connection_id,
+            peer,
+            Arc::new(connection.clone()),
+        ) {
+            return Ok(());
+        }
         let _admitted = Admitted {
             live: &self.live,
             connection_id,
@@ -2743,6 +2773,38 @@ mod tests {
                 >= (size_of::<(EndpointId, HashMap<BlobId, Entry>)>() + 1) * 16 / 7
                     + 4 * size_of::<(BlobId, Entry)>()
         );
+    }
+
+    /// Review finding 8. An accept that has checked the ledger but not yet
+    /// registered its connection is invisible to `revoke_peer`'s sweep, so the
+    /// check has to come after the registration.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK59`) by replacing
+    /// `if grants.knows(&peer) {`
+    /// with `if true {`: the connection of a peer that was revoked before it
+    /// registered is then kept.
+    #[test]
+    fn a_connection_registered_after_a_peer_revoke_is_hung_up() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grant(&grants, 1, blob(1));
+
+        // The control: a known peer is kept, and left alone.
+        let kept = Arc::new(Hung::default());
+        assert!(live.admit_known(&grants, 1, peer(1), kept.clone()));
+        assert_eq!(live.peer(1), Some(peer(1)));
+        assert_eq!(hangups(&kept), 0);
+
+        // The revoke and its sweep both run while a second accept is between
+        // "the peer is known" and "the connection is registered".
+        grants.revoke_peer(admitted(1).id());
+        live.close_peer(admitted(1).id());
+        assert_eq!(hangups(&kept), 1, "the sweep closed the one it could see");
+
+        let late = Arc::new(Hung::default());
+        assert!(!live.admit_known(&grants, 2, peer(1), late.clone()));
+        assert_eq!(hangups(&late), 1, "the late connection is hung up too");
+        assert_eq!(live.peer(2), None, "and not left registered");
     }
 
     #[test]

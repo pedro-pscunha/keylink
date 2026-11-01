@@ -147,7 +147,8 @@ A body that ends early is an error, never a short file.
 
 A `blob` method returns a `Grant`; iroh-blobs moves the bytes, with verified
 resume and deduplication. keylink owns the mount, because the mount iroh-blobs'
-own documentation teaches serves every hash to every peer and accepts writes.
+own documentation teaches serves every hash to every peer (and, up to iroh-blobs
+0.103.0, accepted writes too).
 Returning a grant to a peer records it for that exact `(peer, root)` pair,
 and a blobs request is admitted only against a grant — so every entry was
 created by an RPC that already passed its service's allowlist and layers.
