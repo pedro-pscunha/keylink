@@ -634,7 +634,7 @@ async fn handle_recv<A: Access>(
     let (parts, body) = request.into_parts();
     let admitted = match surface.admit(&parts, method).await {
         Ok(admitted) => admitted,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Admitted { .. } = admitted;
     // A one-shot download has no reply to replay and no range to serve. Both
@@ -709,13 +709,18 @@ impl<A: Access> Surface<'_, A> {
     /// Takes the request PARTS rather than the request. `axum::body::Body` is
     /// `Send` and not `Sync`, so a `&Request<Body>` held across the `Access` await
     /// would make every handler future non-`Send` and no route would install.
+    ///
+    /// The refusal is boxed because a `Response<Body>` is at least 128 bytes,
+    /// and every caller pays an `Err` that size on its success path otherwise.
     async fn admit(
         &self,
         parts: &http::request::Parts,
         method: &'static str,
-    ) -> Result<Admitted, Response<Body>> {
+    ) -> Result<Admitted, Box<Response<Body>>> {
         let Some(principal) = parts.extensions.get::<Principal>().cloned() else {
-            return Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())));
+            return Err(Box::new(
+                GatewayError::Unauthenticated.response(Some(self.challenge.header())),
+            ));
         };
         match self
             .access
@@ -730,14 +735,14 @@ impl<A: Access> Surface<'_, A> {
             .await
         {
             Ok(()) => Ok(Admitted { principal }),
-            Err(AccessError::Unauthenticated) => {
-                Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())))
-            }
+            Err(AccessError::Unauthenticated) => Err(Box::new(
+                GatewayError::Unauthenticated.response(Some(self.challenge.header())),
+            )),
             // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
-            // { method, principal })` lets a denied caller reach the ticket
+            // { principal })` lets a denied caller reach the ticket
             // lookup, after which a resource it holds and one that never existed
             // stop answering alike.
-            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),
+            Err(AccessError::Forbidden) => Err(Box::new(GatewayError::Forbidden.response(None))),
         }
     }
 }
@@ -757,7 +762,7 @@ async fn handle_send<A: Access>(
     let (parts, body) = request.into_parts();
     let admitted = match surface.admit(&parts, method).await {
         Ok(admitted) => admitted,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Admitted { .. } = admitted;
     if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
@@ -819,7 +824,7 @@ async fn handle_blob_lookup<A: Access>(
     let (parts, body) = request.into_parts();
     let admitted = match surface.admit(&parts, method).await {
         Ok(admitted) => admitted,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Admitted { principal } = admitted;
     // `Range` and `If-Range` are IGNORED here, not refused. RFC 9110 §14.2:
@@ -909,7 +914,7 @@ async fn handle_blob_bytes<A: Access>(
     let (parts, body) = request.into_parts();
     let admitted = match surface.admit(&parts, method).await {
         Ok(admitted) => admitted,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Admitted { principal } = admitted;
 
@@ -1046,7 +1051,7 @@ async fn handle_rpc<A: Access>(
     let (parts, body) = request.into_parts();
     let admitted = match surface.admit(&parts, method).await {
         Ok(admitted) => admitted,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Admitted { principal } = admitted;
     if !is_media(&parts.headers, route.request_media()) {

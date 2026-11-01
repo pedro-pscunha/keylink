@@ -3104,7 +3104,14 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
 /// receive nor between turns.
 #[tokio::test]
 async fn busy_stays_true_across_an_await_inside_a_turn() {
-    let mut fixture = start_gated().await;
+    // Not `start_gated`: `touch` waits behind `hold` for as long as `watching`
+    // takes, and under a load average of about 110 that passed the fixture's
+    // 200 ms queue budget, so the queued call answered `TimedOut`. This test is
+    // about `busy`, not about the budget, so its budget is one load cannot spend.
+    let mut fixture = gated_behind(
+        QueueTimeout::try_after(Duration::from_secs(600)).expect("valid queue timeout budget"),
+    )
+    .await;
     let client = &fixture.client;
     let release = &fixture.release;
     let system = &fixture.system;

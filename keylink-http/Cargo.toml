@@ -34,7 +34,7 @@ iroh = { workspace = true, features = ["test-utils"] }
 # and nothing in `keylink::Blobs` revokes one: shutting the holder down yields
 # `Error::Transport`, which is a different answer from the refusal those rows
 # are about. Pinned to keylink's own version so the two cannot disagree.
-iroh-blobs = { version = "0.103.0", default-features = false }
+iroh-blobs = { version = "0.104.0", default-features = false }
 postcard = { workspace = true }
 postcard-schema = { workspace = true }
 bytes = { workspace = true }

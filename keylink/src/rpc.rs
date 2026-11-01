@@ -793,11 +793,13 @@ fn classify_connect(err: iroh::endpoint::ConnectError, alpn: &[u8]) -> Error {
     // is carried inside quinn's transport frame, several private layers down,
     // and the string is the only stable surface iroh exposes for it today.
     //
-    // The markers are what iroh 1.0.3 actually prints, verified against a live
+    // The markers are what iroh 1.0.3 printed, verified against a live
     // mismatch rather than taken from the TLS constant names:
     //   "aborted by peer: the cryptographic handshake failed:
     //    error 120: peer doesn't support any known protocol"
-    // 120 is the TLS `no_application_protocol` alert. Narrow on purpose —
+    // 120 is the TLS `no_application_protocol` alert. iroh 1.4.1 still prints
+    // them: `tests/protocol.rs` and `tests/actors.rs` dial a real mismatch and
+    // match `Error::SchemaMismatch`. Narrow on purpose —
     // anything unrecognised stays a transport error.
     let rendered = format!("{err:?} {err}").to_ascii_lowercase();
     if rendered.contains("support any known protocol") || rendered.contains("error 120") {

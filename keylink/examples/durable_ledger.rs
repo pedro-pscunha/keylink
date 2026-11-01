@@ -71,8 +71,10 @@ impl Durable for Ledger {
         }
         Ok(Self {
             entries: bytes
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect(),
         })
     }

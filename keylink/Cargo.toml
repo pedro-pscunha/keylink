@@ -3,7 +3,7 @@ name = "keylink"
 version = "0.1.0"
 edition = "2021"
 # Verified, not inherited: `cargo +1.91 check --workspace --all-targets
-# --all-features` passes. iroh 1.0.3 and iroh-blobs 0.103.0 both declare 1.91,
+# --all-features` passes. iroh 1.4.1 and iroh-blobs 0.104.0 both declare 1.91,
 # so this is the floor the dependency graph already imposes, and adding blobs
 # does not raise it. `mise run msrv` keeps the number honest.
 rust-version = "1.91"
@@ -56,7 +56,7 @@ toml = { workspace = true }
 # its idempotency key so a handler can dedupe a retry without being handed the
 # ledger's peer-scoping rule to re-implement.
 #
-# It adds an edge and not a crate. blake3 1.8.5 is already resolved here three
+# It adds an edge and not a crate. blake3 is already resolved here three
 # times over — `bao-tree`, `iroh` and `iroh-relay` all name it — so this changes
 # what keylink is allowed to call, not what it compiles. Check with
 # `cargo tree -i blake3`.
@@ -74,7 +74,7 @@ blake3 = { version = "1", default-features = false }
 # iroh-blobs' own `iroh` dependency is `1.0.0, default-features = false`, so it
 # adds no iroh features to this graph and cannot quietly re-enable a browser
 # blocker.
-iroh-blobs = { version = "0.103.0", default-features = false }
+iroh-blobs = { version = "0.104.0", default-features = false }
 # Named for exactly one type: `BaoContentItem`, which sits in the public
 # signature of `iroh_blobs::get::request::GetBlobItem` and which iroh-blobs does
 # not re-export. `BlobHandle::copy_to` has to match on it to stream leaves
@@ -85,7 +85,7 @@ iroh-blobs = { version = "0.103.0", default-features = false }
 # Version-coupled to iroh-blobs on purpose. If the two ever disagree, cargo
 # resolves two copies and the type stops matching, which is a loud build failure
 # rather than a silent one.
-bao-tree = { version = "0.16", default-features = false }
+bao-tree = { version = "0.17", default-features = false }
 # `sync` is DECLARED, not inherited. It was arriving by feature unification from
 # iroh, and `time` arrived from netwatch alone — one supplier for a feature
 # `actor.rs` cannot compile without. A build that is green because somebody
@@ -144,7 +144,7 @@ keylink-persist = { path = "../keylink-persist", version = "0.1.0", optional = t
 # mistake. Scoped this way, `--features blocking` on wasm fails in keylink's own
 # `compile_error!` instead, which says what to do about it.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-iroh = { version = "1.0.3", default-features = false, features = [
+iroh = { version = "1.4.1", default-features = false, features = [
     "tls-ring",
     "metrics",
     "portmapper",

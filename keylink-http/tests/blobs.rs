@@ -462,11 +462,20 @@ impl Holder {
     /// Claim one stall, if any are left.
     fn take_stall(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.holding
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                held.checked_sub(1)
-            })
-            .is_ok()
+        // `fetch_update` is deprecated in favour of `try_update`, which is newer
+        // than the 1.91 floor `mise run msrv` compiles on. This is the loop both
+        // of them run.
+        let mut held = self.holding.load(Ordering::SeqCst);
+        while let Some(next) = held.checked_sub(1) {
+            match self
+                .holding
+                .compare_exchange_weak(held, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => held = now,
+            }
+        }
+        false
     }
 
     async fn wait(&self) {
@@ -903,9 +912,10 @@ async fn blob_ticket_absence_is_identical_across_guess_principal_method_and_evic
 /// order is written, so the first version of this row proved nothing.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK20`) by replacing
-/// `Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),`
-/// in `keylink-http/src/gateway.rs` with
-/// `Err(AccessError::Forbidden) => Ok(Admitted { method, principal }),`, after
+/// `Err(AccessError::Forbidden) => Err(Box::new(GatewayError::Forbidden.response(None))),`
+/// in `keylink-http/src/gateway.rs` (re-quoted when the refusal was boxed; the
+/// break ran against the unboxed spelling of the same arm) with
+/// `Err(AccessError::Forbidden) => Ok(Admitted { principal }),`, after
 /// which the denied caller reaches the ticket lookup and the resource it holds
 /// answers `200` while the invented one still answers `404`.
 #[tokio::test]

@@ -82,8 +82,10 @@ fn entries_from_bytes(bytes: &[u8]) -> Result<Vec<u64>, RestoreError> {
         )));
     }
     Ok(bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
