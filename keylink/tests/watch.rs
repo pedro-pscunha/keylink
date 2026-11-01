@@ -57,7 +57,7 @@ async fn start() -> Fixture {
     let client = Client::connect(
         &client_node,
         server_node.endpoint().addr(),
-        sentinel::alpn(),
+        sentinel::lineage(),
     )
     .await
     .expect("the client dials the server");

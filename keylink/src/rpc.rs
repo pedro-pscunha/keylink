@@ -59,6 +59,7 @@ use crate::error::ConfigError;
 use crate::blobs::{Fence, Permit};
 use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
+use crate::version::{read_probe, Codec, Lineage, PeerWindow, Probe, Version};
 use crate::wire::FrameReader;
 use crate::{
     wire, Admission, AdmittedPeer, Allowlist, BlobHandle, Blobs, Body, BodyReader, CallId, Content,
@@ -248,6 +249,7 @@ async fn preflight<Req: 'static>(
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
 pub(crate) struct RpcService<Req, Resp> {
+    codec: Arc<dyn Codec<Req, Resp>>,
     next: Next<Req, Resp>,
     /// The policy this service admits against. An `Arc<dyn ..>` rather than a
     /// generic parameter: the decision is made once per connection and does no
@@ -268,6 +270,7 @@ pub(crate) struct RpcService<Req, Resp> {
 impl<Req, Resp> Clone for RpcService<Req, Resp> {
     fn clone(&self) -> Self {
         Self {
+            codec: self.codec.clone(),
             next: self.next.clone(),
             admission: self.admission.clone(),
             required_admission: self.required_admission.clone(),
@@ -318,10 +321,15 @@ impl Keys {
     /// [`Keyable::None`] there is no ledger to hold it. A doc line on
     /// [`ServiceBuilder::limits`] says so, because both methods appear in the
     /// crate's own examples in one chain.
-    fn new(keyable: Keyable, records: Records, limits: Limits) -> Self {
+    fn new(
+        keyable: Keyable,
+        records: Records,
+        limits: Limits,
+        contract: crate::version::RecordCodec,
+    ) -> Self {
         let ledger = keyable
             .needs_a_ledger()
-            .then(|| Ledger::new(limits, records));
+            .then(|| Ledger::new(limits, records, contract));
         Self { keyable, ledger }
     }
 
@@ -532,24 +540,34 @@ async fn claim_key(
     resolve(ledger.claim_durably(peer, key, fingerprint).await)
 }
 
-/// Write a recorded reply again, byte for byte.
-async fn replay(send: &mut SendStream, frame: Bytes) -> Result<()> {
-    wire::write_frame(send, frame).await?;
+/// Write a current recorded reply in this connection's negotiated shape.
+/// Current connections reuse the bytes; older connections run the downgrade.
+async fn replay<Req, Resp>(
+    send: &mut SendStream,
+    frame: Bytes,
+    codec: &dyn Codec<Req, Resp>,
+) -> Result<()> {
+    wire::write_frame(send, codec.reencode_response(frame)?).await?;
     send.finish()?;
     Ok(())
 }
 
 /// Refuse a call that was never entered. Carries no body, like every refusal.
-async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) -> Result<()> {
-    wire::write_header(
+async fn refuse<Req, Resp: Serialize>(
+    send: &mut SendStream,
+    refusal: RemoteError,
+    codec: &dyn Codec<Req, Resp>,
+) -> Result<()> {
+    replay(
         send,
-        Some(0),
-        None,
-        &WireResponse::<Resp>::Call(Outcome::Err(refusal)),
+        wire::encode_header(
+            Some(0),
+            None,
+            &WireResponse::<Resp>::Call(Outcome::Err(refusal)),
+        )?,
+        codec,
     )
-    .await?;
-    send.finish()?;
-    Ok(())
+    .await
 }
 
 /// Answer a question about this peer's ledger.
@@ -588,19 +606,23 @@ async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) ->
 /// caller never sent.
 ///
 /// [`NotKeyable`]: IdempotencyRefusal::NotKeyable
-async fn answer_key_state<Resp: Serialize>(
+async fn answer_key_state<Req, Resp: Serialize>(
     send: &mut SendStream,
     ledger: Option<&Ledger>,
     peer: EndpointId,
     key: &IdempotencyKey,
+    codec: &dyn Codec<Req, Resp>,
 ) -> Result<()> {
     let state = match ledger {
         Some(ledger) if key.validate().is_ok() => ledger.key_state(peer, key),
         Some(_) | None => KeyState::Fresh,
     };
-    wire::write_header(send, Some(0), None, &WireResponse::<Resp>::KeyState(state)).await?;
-    send.finish()?;
-    Ok(())
+    replay(
+        send,
+        wire::encode_header(Some(0), None, &WireResponse::<Resp>::KeyState(state))?,
+        codec,
+    )
+    .await
 }
 
 /// Drop the handles of calls that have already finished.
@@ -641,6 +663,7 @@ fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
 /// nobody to tell, which is exactly what `tell` promises and why a call that
 /// needs an answer must be an `rpc`.
 async fn serve_one_tell<Req, Resp>(
+    codec: Arc<dyn Codec<Req, Resp>>,
     next: Next<Req, Resp>,
     required: Arc<[Arc<dyn Preflight<Req>>]>,
     blobs: Option<Blobs>,
@@ -652,7 +675,10 @@ where
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
-    let Some(request) = frames.read_header::<WireRequest<Req>>().await? else {
+    let Some(frame) = frames.read_frame().await? else {
+        return Ok(());
+    };
+    let Ok(request) = codec.decode_request(&frame)? else {
         return Ok(());
     };
     // A ledger query on a unidirectional stream has nowhere to send its answer,
@@ -685,30 +711,41 @@ where
 
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
+    codec: Arc<dyn Codec<Req, Resp>>,
     next: Next<Req, Resp>,
     required: Arc<[Arc<dyn Preflight<Req>>]>,
     keys: Keys,
     grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
-    mut send: SendStream,
-    recv: RecvStream,
+    streams: (SendStream, RecvStream),
 ) -> Result<()>
 where
     Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
+    let (mut send, recv) = streams;
     let peer = admitted.id();
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some((request, received_fingerprint)) = frames.read_request::<WireRequest<Req>>().await?
-    else {
+    let Some(frame) = frames.read_frame().await? else {
         return Ok(());
+    };
+    let request = match codec.decode_request(&frame)? {
+        Ok(request) => request,
+        Err(refusal) => return refuse(&mut send, refusal, codec.as_ref()).await,
     };
 
     let message = match request.message {
         WireRequest::KeyState(key) => {
-            return answer_key_state::<Resp>(&mut send, keys.ledger.as_deref(), peer, &key).await;
+            return answer_key_state(
+                &mut send,
+                keys.ledger.as_deref(),
+                peer,
+                &key,
+                codec.as_ref(),
+            )
+            .await;
         }
         WireRequest::Call(message) => message,
     };
@@ -718,7 +755,7 @@ where
     // allowed to answer a method this policy denies.
     let credential = match preflight(&required, peer, &message).await {
         Ok(credential) => credential,
-        Err(error) => return refuse::<Resp>(&mut send, error).await,
+        Err(error) => return refuse(&mut send, error, codec.as_ref()).await,
     };
 
     // One commitment drives both replay stores: the transport ledger and the
@@ -772,8 +809,8 @@ where
         // connection ended, the server shut down — still settles honestly, even
         // though `Drop` is then the only code left running.
         Claimed::Run(guard) => Some(guard.watching(progress.clone())),
-        Claimed::Replay(frame) => return replay(&mut send, frame).await,
-        Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
+        Claimed::Replay(frame) => return replay(&mut send, frame, codec.as_ref()).await,
+        Claimed::Refuse(refusal) => return refuse(&mut send, refusal, codec.as_ref()).await,
     };
 
     // The fence in `grants` was taken when this stream was accepted, before the
@@ -837,7 +874,7 @@ where
         match progress.reached() {
             Reached::Completed => {
                 if let Err(refusal) = guard.record(&frame, body.declared_len() != Some(0)).await {
-                    return refuse::<Resp>(&mut send, refusal).await;
+                    return refuse(&mut send, refusal, codec.as_ref()).await;
                 }
             }
             // A layer said no WITHOUT calling through. Nothing ran and nothing
@@ -858,7 +895,7 @@ where
     if let Some(permit) = permit {
         permit.commit();
     }
-    wire::write_frame(&mut send, frame).await?;
+    wire::write_frame(&mut send, codec.reencode_response(frame)?).await?;
     body.write_to(&mut send).await?;
     send.finish()?;
     Ok(())
@@ -893,7 +930,10 @@ fn grant_or_refuse<Resp: Granting>(
 /// what the derived-ALPN drift gate looks like from the dialling side. Leaving
 /// it as a generic transport error sends whoever reads the log to inspect the
 /// network, when the actual fix is to rebuild one of the two peers.
-fn classify_connect(err: iroh::endpoint::ConnectError, alpn: &[u8]) -> Error {
+fn classify_connect<Req, Resp>(
+    err: iroh::endpoint::ConnectError,
+    lineage: &Lineage<Req, Resp>,
+) -> Error {
     // Matched on the rendered cause rather than the error enum: the alert code
     // is carried inside quinn's transport frame, several private layers down,
     // and the string is the only stable surface iroh exposes for it today.
@@ -908,9 +948,7 @@ fn classify_connect(err: iroh::endpoint::ConnectError, alpn: &[u8]) -> Error {
     // anything unrecognised stays a transport error.
     let rendered = format!("{err:?} {err}").to_ascii_lowercase();
     if rendered.contains("support any known protocol") || rendered.contains("error 120") {
-        return Error::SchemaMismatch {
-            ours: String::from_utf8_lossy(alpn).into_owned(),
-        };
+        return lineage.mismatch(PeerWindow::Unknown);
     }
     Error::Transport(err.into())
 }
@@ -978,17 +1016,18 @@ where
                         }
                     };
                     calls.spawn(serve_one(
+                        self.codec.clone(),
                         self.next.clone(),
                         self.required.clone(),
                         self.keys.clone(),
                         grants,
                         admitted,
-                        send,
-                        recv,
+                        (send, recv),
                     ));
                 }
                 Ok(Stream::Uni(recv)) => {
                     calls.spawn(serve_one_tell(
+                        self.codec.clone(),
                         self.next.clone(),
                         self.required.clone(),
                         self.blobs.clone(),
@@ -1105,15 +1144,25 @@ mod tests {
     #[test]
     fn keyed_none_builds_no_ledger() {
         assert!(
-            Keys::new(Keyable::None, Records::Memory, Limits::default())
-                .ledger
-                .is_none(),
+            Keys::new(
+                Keyable::None,
+                Records::Memory,
+                Limits::default(),
+                crate::version::RecordCodec::testing()
+            )
+            .ledger
+            .is_none(),
             "`Keyable::None` must not allocate a ledger nothing can ever write to"
         );
         assert!(
-            Keys::new(Keyable::Any, Records::Memory, Limits::default())
-                .ledger
-                .is_some(),
+            Keys::new(
+                Keyable::Any,
+                Records::Memory,
+                Limits::default(),
+                crate::version::RecordCodec::testing()
+            )
+            .ledger
+            .is_some(),
             "and every other policy must have one, or no key works at all"
         );
     }
@@ -1141,6 +1190,7 @@ mod tests {
             Keyable::Only(&["Reserve"]),
             Records::Memory,
             Limits::default(),
+            crate::version::RecordCodec::testing(),
         );
         assert!(
             keys.ledger_for("Reserve").is_some(),
@@ -1165,7 +1215,11 @@ mod tests {
     /// two apart, and one read it as the constant.
     #[tokio::test(start_paused = true)]
     async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
-        let ledger = Ledger::new(Limits::default(), Records::Memory);
+        let ledger = Ledger::new(
+            Limits::default(),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        );
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -1216,7 +1270,11 @@ mod tests {
     /// concurrency bound usually gets wrong.
     #[tokio::test(start_paused = true)]
     async fn a_parked_attacher_keeps_its_place_for_the_whole_wait() {
-        let ledger = Ledger::new(Limits::default(), Records::Memory);
+        let ledger = Ledger::new(
+            Limits::default(),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        );
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -1265,7 +1323,11 @@ mod tests {
     /// claim, so an expired budget is the only honest outcome, and returning a
     /// duration for a `Run` or a `Replay` would let one of those read as a wait.
     async fn held_for(limits: Limits, asked: Duration) -> Duration {
-        let ledger = Ledger::new(limits, Records::Memory);
+        let ledger = Ledger::new(
+            limits,
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        );
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -1477,7 +1539,11 @@ mod tests {
         attaching: Attaching,
         asked: Option<Duration>,
     ) -> IdempotencyRefusal {
-        let ledger = Ledger::new(Limits::default().attach(attaching), Records::Memory);
+        let ledger = Ledger::new(
+            Limits::default().attach(attaching),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        );
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -1621,8 +1687,8 @@ mod tests {
 ///
 /// Returned by the generated `service()`, so a caller adds behaviour without
 /// the macro knowing anything about it.
-pub struct ServiceBuilder<Req, Resp> {
-    alpn: &'static [u8],
+pub struct ServiceBuilder<Req: 'static, Resp: 'static> {
+    lineage: &'static Lineage<Req, Resp>,
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
     required: Vec<Arc<dyn Preflight<Req>>>,
@@ -1652,9 +1718,13 @@ where
 {
     /// Called by generated code. `dispatch` is the call into the user's handler.
     #[doc(hidden)]
-    pub fn new(alpn: &'static [u8], allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self {
+    pub fn new(
+        lineage: &'static Lineage<Req, Resp>,
+        allow: Allowlist,
+        dispatch: Dispatch<Req, Resp>,
+    ) -> Self {
         Self {
-            alpn,
+            lineage,
             admission: Arc::new(allow),
             required_admission: Vec::new(),
             required: Vec::new(),
@@ -1993,17 +2063,42 @@ where
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);
         }
-        Service {
-            alpn: self.alpn,
-            handler: Box::new(RpcService {
-                next: chain,
+        let keys = Keys::new(
+            self.keyable,
+            self.records,
+            self.limits,
+            self.lineage.records(),
+        );
+        let required: Arc<[_]> = self.required.into();
+        let mounts = self
+            .lineage
+            .entries
+            .iter()
+            .map(|entry| Mount {
+                alpn: entry.alpn.as_slice(),
+                handler: Box::new(RpcService {
+                    codec: entry.codec.clone(),
+                    next: chain.clone(),
+                    admission: self.admission.clone(),
+                    required_admission: self.required_admission.clone(),
+                    required: required.clone(),
+                    blobs: self.blobs.clone(),
+                    keys: keys.clone(),
+                    _p: PhantomData,
+                }),
+            })
+            .collect();
+        let probe = Some(Mount {
+            alpn: self.lineage.probe.as_slice(),
+            handler: Box::new(Probe {
+                window: self.lineage.window().clone(),
                 admission: self.admission,
-                required_admission: self.required_admission,
-                required: self.required.into(),
-                blobs: self.blobs.clone(),
-                keys: Keys::new(self.keyable, self.records, self.limits),
-                _p: PhantomData,
+                required: self.required_admission,
             }),
+        });
+        Service {
+            mounts,
+            probe,
             blobs: self.blobs,
             declares_blobs: self.declares_blobs,
             configuration,
@@ -2014,7 +2109,7 @@ where
 impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServiceBuilder")
-            .field("alpn", &String::from_utf8_lossy(self.alpn))
+            .field("alpn", &String::from_utf8_lossy(self.lineage.alpn()))
             .field("layers", &self.layers.len())
             .finish()
     }
@@ -2041,9 +2136,15 @@ const RESERVED_ALPNS: &[&[u8]] = &[iroh_blobs::ALPN];
 /// The request and response types are erased here, which is what lets services
 /// with completely unrelated schemas sit in one collection — and therefore on
 /// one endpoint.
-pub struct Service {
+struct Mount {
     alpn: &'static [u8],
     handler: Box<dyn DynProtocolHandler>,
+}
+
+/// One service and all of its contract-version mounts, ready for a server.
+pub struct Service {
+    mounts: Vec<Mount>,
+    probe: Option<Mount>,
     /// The store this service serves content from, if any. `spawn` collects
     /// these to decide what to mount on `iroh_blobs::ALPN`.
     blobs: Option<Blobs>,
@@ -2053,9 +2154,9 @@ pub struct Service {
 }
 
 impl Service {
-    /// The ALPN this service answers on — `<crate>/<Service>/<schema hash>`.
+    /// The current ALPN — `<crate>/<Service>/<label>/<schema hash>`.
     pub fn alpn(&self) -> &'static [u8] {
-        self.alpn
+        self.mounts[0].alpn
     }
 
     /// Register a protocol keylink did not generate, on the same node.
@@ -2087,8 +2188,11 @@ impl Service {
     /// an unauthorized protocol onto an otherwise allowlisted node.
     pub fn foreign(alpn: &'static [u8], handler: impl ProtocolHandler) -> Self {
         Self {
-            alpn,
-            handler: Box::new(handler),
+            mounts: vec![Mount {
+                alpn,
+                handler: Box::new(handler),
+            }],
+            probe: None,
             blobs: None,
             declares_blobs: false,
             configuration: None,
@@ -2099,7 +2203,7 @@ impl Service {
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Service")
-            .field("alpn", &String::from_utf8_lossy(self.alpn))
+            .field("alpn", &String::from_utf8_lossy(self.alpn()))
             .finish()
     }
 }
@@ -2171,28 +2275,31 @@ impl ServerBuilder<'_> {
     /// last-one-wins race: the second would silently shadow the first.
     pub fn spawn(self) -> Result<Server> {
         let mut seen: BTreeSet<&'static [u8]> = BTreeSet::new();
+        let mut probes = Vec::new();
         let mut store: Option<Blobs> = None;
         let mut builder = Router::builder(self.node.endpoint().clone());
         for service in self.services {
             if let Some(error) = service.configuration {
                 return Err(Error::Config(error));
             }
-            if RESERVED_ALPNS.contains(&service.alpn) {
-                return Err(Error::Config(ConfigError::ReservedAlpn(
-                    String::from_utf8_lossy(service.alpn).into_owned(),
-                )));
-            }
-            if !seen.insert(service.alpn) {
-                return Err(Error::Config(ConfigError::DuplicateAlpn(
-                    String::from_utf8_lossy(service.alpn).into_owned(),
-                )));
+            for mount in service.mounts.iter().chain(service.probe.iter()) {
+                if RESERVED_ALPNS.contains(&mount.alpn) {
+                    return Err(Error::Config(ConfigError::ReservedAlpn(
+                        String::from_utf8_lossy(mount.alpn).into_owned(),
+                    )));
+                }
+                if !seen.insert(mount.alpn) {
+                    return Err(Error::Config(ConfigError::DuplicateAlpn(
+                        String::from_utf8_lossy(mount.alpn).into_owned(),
+                    )));
+                }
             }
             // A service that serves content and was handed no store would
             // answer every `blob` call with an address nothing can fetch. That
             // is a configuration mistake, and keylink raises those at startup.
             if service.declares_blobs && service.blobs.is_none() {
                 return Err(Error::Config(ConfigError::MissingBlobStore {
-                    service: String::from_utf8_lossy(service.alpn).into_owned(),
+                    service: String::from_utf8_lossy(service.alpn()).into_owned(),
                 }));
             }
             if let Some(theirs) = &service.blobs {
@@ -2207,7 +2314,14 @@ impl ServerBuilder<'_> {
                     None => store = Some(theirs.clone()),
                 }
             }
-            builder = builder.accept(service.alpn, service.handler);
+            for mount in service.mounts {
+                builder = builder.accept(mount.alpn, mount.handler);
+            }
+            probes.extend(service.probe);
+        }
+        // The server's preference decides negotiation. Every version precedes every probe.
+        for probe in probes {
+            builder = builder.accept(probe.alpn, probe.handler);
         }
         // keylink mounts blobs itself, with the ledger attached. This is the
         // reason `iroh_blobs::ALPN` is reserved: there is exactly one way for
@@ -2227,6 +2341,8 @@ impl ServerBuilder<'_> {
 /// any number of concurrent callers at full connection speed.
 #[derive(Debug)]
 pub struct RpcClient<Req, Resp> {
+    codec: Arc<dyn Codec<Req, Resp>>,
+    version: Version,
     conn: Connection,
     /// Kept so a `blob` reply can open the second connection. A `Connection`
     /// does not expose the endpoint it came from, and blobs speaks its own
@@ -2246,6 +2362,8 @@ pub struct RpcClient<Req, Resp> {
 impl<Req, Resp> Clone for RpcClient<Req, Resp> {
     fn clone(&self) -> Self {
         Self {
+            codec: self.codec.clone(),
+            version: self.version,
             conn: self.conn.clone(),
             endpoint: self.endpoint.clone(),
             idempotency: self.idempotency.clone(),
@@ -2255,6 +2373,11 @@ impl<Req, Resp> Clone for RpcClient<Req, Resp> {
 }
 
 impl<Req, Resp> RpcClient<Req, Resp> {
+    /// The contract version negotiated by this connection.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
     /// The live connection, for crate code that observes it rather than uses it.
     ///
     /// An accessor rather than a `pub(crate)` field on purpose: a field can be
@@ -2336,6 +2459,8 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     ) -> IdempotentClient<Req, Resp> {
         IdempotentClient {
             inner: Self {
+                codec: self.codec.clone(),
+                version: self.version,
                 conn: self.conn.clone(),
                 endpoint: self.endpoint.clone(),
                 idempotency: Some(idempotency.into()),
@@ -2377,6 +2502,11 @@ impl<Req, Resp> Clone for IdempotentClient<Req, Resp> {
 }
 
 impl<Req, Resp> IdempotentClient<Req, Resp> {
+    /// The contract version negotiated by this connection.
+    pub fn version(&self) -> Version {
+        self.inner.version()
+    }
+
     /// The live connection, for crate code that observes it. See
     /// [`RpcClient::connection`].
     pub(crate) fn connection(&self) -> &Connection {
@@ -2448,14 +2578,41 @@ where
     pub async fn connect(
         node: &Node,
         peer: impl Into<EndpointAddr>,
-        alpn: &'static [u8],
+        lineage: &'static Lineage<Req, Resp>,
     ) -> Result<Self> {
-        let conn = node
+        let first = lineage.alpn();
+        let additional = lineage
+            .entries
+            .iter()
+            .skip(1)
+            .map(|entry| entry.alpn.clone())
+            .chain(std::iter::once(lineage.probe.clone()))
+            .collect();
+        let connecting = node
             .endpoint()
-            .connect(peer, alpn)
+            .connect_with_opts(
+                peer,
+                first,
+                iroh::endpoint::ConnectOptions::new().with_additional_alpns(additional),
+            )
             .await
-            .map_err(|err| classify_connect(err, alpn))?;
+            .map_err(|err| classify_connect(err.into(), lineage))?;
+        let conn = connecting
+            .await
+            .map_err(|err| classify_connect(err.into(), lineage))?;
+        if conn.alpn() == lineage.probe {
+            let theirs = read_probe(&conn, lineage.window().service()).await;
+            conn.close(0u32.into(), b"probed");
+            return Err(lineage.mismatch(theirs));
+        }
+        let entry = lineage
+            .entries
+            .iter()
+            .find(|entry| entry.alpn == conn.alpn())
+            .ok_or_else(|| lineage.mismatch(PeerWindow::Unknown))?;
         Ok(Self {
+            codec: entry.codec.clone(),
+            version: entry.version,
             conn,
             endpoint: node.endpoint().clone(),
             idempotency: None,
@@ -2470,24 +2627,21 @@ where
     /// [`Error::Closed`] when the peer finishes the stream without answering,
     /// plus any transport or codec failure.
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
-        let (mut send, recv) = self.conn.open_bi().await?;
-
-        wire::write_header(
-            &mut send,
+        let frame = self.codec.encode_request(
             body.declared_len(),
             self.idempotency.as_ref(),
-            &WireRequest::Call(request),
-        )
-        .await?;
+            WireRequest::Call(request),
+        )?;
+        let (mut send, recv) = self.conn.open_bi().await?;
+        wire::write_frame(&mut send, frame).await?;
         body.write_to(&mut send).await?;
         // The request is complete. Finishing tells the peer so without a
         // sentinel frame, and lets it start work before we read a byte.
         send.finish()?;
 
         let mut frames = FrameReader::new(recv);
-        let Some(response) = frames.read_header::<WireResponse<Resp>>().await? else {
-            return Err(Error::Closed);
-        };
+        let frame = frames.read_frame().await?.ok_or(Error::Closed)?;
+        let response = self.codec.decode_response(&frame)?;
         match response.message {
             WireResponse::Call(Outcome::Ok(value)) => {
                 Ok((value, BodyReader::new(frames, response.control.body_len)))
@@ -2523,13 +2677,15 @@ where
     /// plus any transport or codec failure.
     pub async fn key_state(&self, key: IdempotencyKey) -> Result<KeyState> {
         let (mut send, recv) = self.conn.open_bi().await?;
-        wire::write_header(&mut send, Some(0), None, &WireRequest::<Req>::KeyState(key)).await?;
+        let frame = self
+            .codec
+            .encode_request(Some(0), None, WireRequest::KeyState(key))?;
+        wire::write_frame(&mut send, frame).await?;
         send.finish()?;
 
         let mut frames = FrameReader::new(recv);
-        let Some(response) = frames.read_header::<WireResponse<Resp>>().await? else {
-            return Err(Error::Closed);
-        };
+        let frame = frames.read_frame().await?.ok_or(Error::Closed)?;
+        let response = self.codec.decode_response(&frame)?;
         match response.message {
             WireResponse::KeyState(state) => Ok(state),
             other => Err(Error::UnexpectedResponse {
@@ -2576,13 +2732,26 @@ where
         &self,
         request: Req,
     ) -> std::result::Result<crate::Transmitted, crate::TellError> {
+        let frame = self
+            .codec
+            .encode_request(Some(0), None, WireRequest::Call(request))
+            .map_err(|error| match error {
+                Error::Unsupported { version, source } => {
+                    crate::TellError::Unsupported { version, source }
+                }
+                Error::Codec(error) => crate::TellError::Codec(error),
+                Error::FrameTooLarge { len, cap } => crate::TellError::FrameTooLarge { len, cap },
+                _ => unreachable!(
+                    "encoding a request only returns conversion, codec or header-size errors"
+                ),
+            })?;
         let mut send = self.conn.open_uni().await?;
         // `None` for the key, and it is now the only value this line could
         // write: `self.idempotency` is `Some` on no client that has a `tell`.
         // `Some(0)` body length, because a `tell` carries no payload and an
         // open-ended stream would make the receiver wait for an end that says
         // nothing.
-        wire::write_tell(&mut send, &WireRequest::Call(request)).await?;
+        send.write_chunk(frame).await?;
         send.finish()?;
         Ok(crate::Transmitted::new())
     }

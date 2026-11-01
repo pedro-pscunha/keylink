@@ -12,12 +12,17 @@
 //! its size is declared in the envelope, and its flow control is QUIC's. That
 //! is why a 4 GiB file costs zero framing bytes and a bounded amount of memory.
 //!
-//! Nothing outside this module and [`crate::body`] touches bytes.
+//! The negotiated ALPN is `<crate>/<Service>/<label>/<shape hash>` (with
+//! `/keyed` before the label for addressed services). Framing stays here;
+//! contract codecs convert only header payloads, and [`crate::body`] streams
+//! application bytes unchanged.
 
 use bytes::{Buf, Bytes, BytesMut};
 use iroh::endpoint::{RecvStream, SendStream};
 use postcard_schema::Schema;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(test)]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
@@ -129,6 +134,7 @@ pub(crate) enum HeaderError {
 /// The length prefix is reserved at the front of the same buffer postcard
 /// serialises into, so the frame is one allocation and one write with no
 /// concatenation and no vectored fixup.
+#[cfg(test)]
 pub(crate) async fn write_header<T: Serialize>(
     stream: &mut SendStream,
     body_len: Option<u64>,
@@ -138,22 +144,11 @@ pub(crate) async fn write_header<T: Serialize>(
     write_frame(stream, encode_header(body_len, idempotency, message)?).await
 }
 
-/// Write the one request frame a `tell` carries, preserving its narrower error set.
-pub(crate) async fn write_tell<T: Serialize>(
-    stream: &mut SendStream,
-    message: &T,
-) -> std::result::Result<(), crate::TellError> {
-    let frame = encode_header(Some(0), None, message)?;
-    stream.write_chunk(frame).await?;
-    Ok(())
-}
-
 /// Hand an already-encoded frame to the transport.
 ///
-/// Split from [`write_header`] so a frame can be kept as well as sent. The
-/// idempotency ledger stores exactly these bytes, which is what makes a replayed
-/// reply byte-identical to the one the handler produced rather than a
-/// re-encoding of a value that has since been decoded and rebuilt.
+/// Split from `encode_header` so a current frame can be kept as well as sent.
+/// The ledger keeps current bytes; a current connection reuses them unchanged,
+/// while an older connection converts them to its negotiated shape.
 pub(crate) async fn write_frame(stream: &mut SendStream, frame: Bytes) -> Result<()> {
     stream.write_chunk(frame).await?;
     Ok(())
@@ -222,6 +217,7 @@ impl FrameReader {
     /// `Ok(None)` means the peer finished the stream cleanly *before* the frame
     /// started — a normal end of conversation. A frame that starts and does not
     /// finish is [`Error::FrameTruncated`]. The two are never confused.
+    #[cfg(test)]
     pub(crate) async fn read_header<T: DeserializeOwned>(&mut self) -> Result<Option<Envelope<T>>> {
         self.read_frame()
             .await?
@@ -243,7 +239,7 @@ impl FrameReader {
         Ok(Some((Envelope { control, message }, fingerprint)))
     }
 
-    async fn read_frame(&mut self) -> Result<Option<Bytes>> {
+    pub(crate) async fn read_frame(&mut self) -> Result<Option<Bytes>> {
         if !self.stage_at_least(PREFIX).await? {
             return if self.staged.is_empty() {
                 Ok(None)

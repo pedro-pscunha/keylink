@@ -334,18 +334,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     let refused = renamed_field::kiln::Client::connect(&floor, kiln.endpoint().addr()).await;
     match refused {
-        Err(Error::SchemaMismatch { ours }) => {
+        Err(Error::SchemaMismatch(mismatch)) => {
             println!("  one field renamed:  refused at the handshake");
-            println!("                      we offered {ours}");
-            //  The refusal names the same string act 3 computed. That is what
-            //  ties the table at the top of this file to a running handshake:
-            //  the hash a reader can print is the hash the dial actually used.
-            assert_eq!(
-                ours,
-                text(renamed_field::kiln::alpn()),
-                "the refusal must name the contract we measured"
-            );
-            assert_ne!(ours, text(named_reading::kiln::alpn()));
+            println!("                      we offered {}", mismatch.ours());
+            println!("                      peer: {:?}", mismatch.theirs());
+            assert_eq!(mismatch.ours(), renamed_field::kiln::window());
+            assert_ne!(mismatch.ours(), named_reading::kiln::window());
         }
         Err(Error::Transport(cause @ Transport::Connect(_))) => {
             return Err(format!("the mismatch was not narrowed, and stayed {cause}").into())
@@ -354,6 +348,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         Ok(_) => return Err("a client with a different contract must not connect".into()),
     }
 
-    println!("\nno version number was consulted at any point.");
+    println!("\nthe labels name versions; the shape hash decides whether they match.");
     Ok(())
 }

@@ -30,9 +30,10 @@
 //! - **Large payloads.** [`Body`] and [`BodyReader`] stream files and blobs
 //!   beside a request, with QUIC flow control as backpressure and peak memory
 //!   of one chunk.
-//! - **Schema safety.** The ALPN is derived from a hash of your types, so a peer
-//!   built against a different definition is refused at the handshake instead of
-//!   silently misparsing. See [`derive_alpn`].
+//! - **Schema safety.** A contract window names frozen versions and their shape
+//!   hashes. One handshake picks a common version; explicit conversions keep the
+//!   handler on current types. No common shape is a mismatch, never a silent
+//!   misparse. See [`Version`] and [`service!`].
 //! - **Authorization.** iroh proves *who* a peer is; [`Allowlist`] decides
 //!   whether they are welcome, and fails closed.
 //! - **Departure.** A peer going away is something you can await, rather than
@@ -246,8 +247,14 @@ mod subscribers;
 mod surfaces;
 #[cfg(test)]
 mod testing;
+mod version;
 mod watch;
 mod wire;
+#[doc(hidden)]
+pub use node::__schema_hash;
+#[doc(hidden)]
+pub use version::{Here, Hop, Keyed, Lineage, Toward};
+pub use version::{Mismatch, PeerWindow, Unsupported, Version, Window};
 
 pub use actor::{
     deliver_keyed, mount, mount_with_backpressure, serving_keyed, ActorStatus, Addressed, Eviction,

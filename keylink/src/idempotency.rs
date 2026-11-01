@@ -2063,6 +2063,8 @@ pub(crate) enum Claim {
 /// commitment is retained by durable records.
 #[derive(Debug)]
 pub(crate) struct Ledger {
+    #[cfg(feature = "persist")]
+    contract_hash: u64,
     inner: Mutex<Inner>,
     limits: Limits,
     /// Where the replies recorded here go. Held by the ledger rather than
@@ -2078,14 +2080,22 @@ impl Ledger {
     /// `with_limits(limits, records)`. Once the builder always holds a [`Limits`]
     /// the shim had no caller, so it is gone rather than kept for symmetry — a
     /// deleted shim stays deleted.
-    pub(crate) fn new(limits: Limits, records: Records) -> Arc<Self> {
+    pub(crate) fn new(
+        limits: Limits,
+        records: Records,
+        contract: crate::version::RecordCodec,
+    ) -> Arc<Self> {
+        #[cfg(not(feature = "persist"))]
+        let _ = contract;
         #[cfg(feature = "persist")]
-        let inner = records
-            .store()
-            .map_or_else(Inner::default, |store| recover(store.take_recovered()));
+        let inner = records.store().map_or_else(Inner::default, |store| {
+            recover(store.take_recovered(contract.upgrade.as_ref()))
+        });
         #[cfg(not(feature = "persist"))]
         let inner = Inner::default();
         let ledger = Arc::new(Self {
+            #[cfg(feature = "persist")]
+            contract_hash: contract.current,
             inner: Mutex::new(inner),
             limits,
             records,
@@ -3063,18 +3073,30 @@ mod tests {
     /// The ordinary ledger every test below this line wants: memory-backed, with
     /// the shipped bounds.
     fn ledger() -> Arc<Ledger> {
-        Ledger::new(Limits::default(), Records::Memory)
+        Ledger::new(
+            Limits::default(),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        )
     }
 
     /// The same, with the bounds moved. One test door rather than two, so
     /// `Records::Memory` is stated once for every test that is not about it.
     fn bounded(limits: Limits) -> Arc<Ledger> {
-        Ledger::new(limits, Records::Memory)
+        Ledger::new(
+            limits,
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        )
     }
 
     /// A ledger that claims keys and records no replies.
     fn recordless() -> Arc<Ledger> {
-        Ledger::new(Limits::default(), Records::None)
+        Ledger::new(
+            Limits::default(),
+            Records::None,
+            crate::version::RecordCodec::testing(),
+        )
     }
 
     fn refusal(claim: Claim) -> IdempotencyRefusal {
@@ -3358,7 +3380,11 @@ mod tests {
             let id = StateId::new("test/ledger").expect("a valid id");
             let records = now(crate::durable::DurableRecords::open(store, &id))
                 .expect("nobody else holds this ledger");
-            Ledger::new(Limits::default(), Records::Durable(records))
+            Ledger::new(
+                Limits::default(),
+                Records::Durable(records),
+                crate::version::RecordCodec::testing(),
+            )
         }
 
         fn stalling() -> Arc<Ledger> {
@@ -3582,9 +3608,17 @@ mod tests {
 
             // Cloned rather than copied: `Limits` is deliberately not `Copy`, so a
             // later field can hold a port behind an `Arc`.
-            let recording = Ledger::new(bounds.clone(), Records::Memory);
+            let recording = Ledger::new(
+                bounds.clone(),
+                Records::Memory,
+                crate::version::RecordCodec::testing(),
+            );
             settle_eight(&recording);
-            let recordless = Ledger::new(bounds, Records::None);
+            let recordless = Ledger::new(
+                bounds,
+                Records::None,
+                crate::version::RecordCodec::testing(),
+            );
             settle_eight(&recordless);
 
             assert!(

@@ -399,13 +399,9 @@ async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
 ///
 /// # What this does NOT prove
 ///
-/// It proves **mount** safety, not ALPN-**pairing** safety.
-/// `ServiceBuilder::new(alpn: &'static [u8], ..)` takes the ALPN as an untyped
-/// slice, so nothing at the type level stops `alpha`'s dispatch from being
-/// registered under `beta`'s ALPN. What prevents that is the generated pairing —
-/// `registry.service(..)` is the only path that calls `alpha::registry_alpn()` —
-/// and a hand-written registration could still get it wrong. Saying so is the
-/// difference between a probe and a claim about a probe.
+/// This probe proves mount safety. ALPN pairing is now typed too:
+/// `ServiceBuilder::new` takes a `Lineage<Request, Response>`, not an untyped
+/// ALPN slice, so alpha's lineage cannot be paired with beta's dispatch.
 fn a_system_mounts_only_its_own_services_actors(
     system: &alpha::Registry,
     id: ActorId,

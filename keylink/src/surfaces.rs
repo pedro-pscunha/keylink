@@ -11,6 +11,8 @@ use crate::{
 
 /// Operations shared by asynchronous remote caller surfaces.
 pub trait Wire {
+    /// The contract version negotiated by this connection.
+    fn version(&self) -> crate::Version;
     /// Ask what this peer's ledger knows about a key.
     fn key_state(&self, key: IdempotencyKey) -> impl Future<Output = Result<KeyState>> + Send;
 
@@ -23,6 +25,8 @@ pub trait Wire {
 
 /// Operations shared by blocking remote caller surfaces.
 pub trait BlockingWire {
+    /// The contract version negotiated by this connection.
+    fn version(&self) -> crate::Version;
     /// Ask what this peer's ledger knows about a key.
     fn key_state(&self, key: IdempotencyKey) -> Result<KeyState>;
 

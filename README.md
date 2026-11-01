@@ -234,19 +234,21 @@ end, in one process or between two machines.
 
 ### Schema safety
 
-postcard is not self-describing — enum variants encode by declaration index, so
-swapping two variants with identical shapes decodes cleanly as the wrong one.
-So the ALPN is a hash of the contract, and a drifted peer is refused at the
-handshake:
+postcard is not self-describing: swapping two same-shaped enum variants silently changes their meaning. A service's ALPN is `<crate>/<Service>/<version label>/<shape hash>`. The label names a version; the derived hash still decides whether two declarations agree. A field added or renamed anywhere in the contract moves the hash. Renaming a type or moving its module does not.
 
-```
-Error: schema mismatch: the peer was built against a different contract (ours is <hash>)
-```
+With no common contract, the dial returns `Error::SchemaMismatch(Box<Mismatch>)`. An admitted peer answers a per-service probe in the same handshake, so the error names both windows. If both sides claim one label with different shapes, it names that too. A peer that serves neither a matching version nor the probe is reported as unknown, not as a guessed version.
 
-Nothing to bump by hand. Change the *shape* of any type reachable from the
-protocol — add or rename a field three structs deep — and the ALPN moves with
-it. Renaming that type, or moving it to another module, does not: the hash walks
-fields and variants, never paths.
+### Contract windows
+
+Declare `version 3;` immediately after `service Inventory;`; leaving it out means version 1. Add `previous 2 { hash frozen::inventory::VERSION.hash(); ... }` after every current declaration. Repeat the original wire declarations in their original order. A shipped application's pin is the literal hash read from that release's `VERSION`; examples in this repository name a frozen module's `VERSION` so changes to keylink's own wire remain free.
+
+Mark each changed or removed method `changed`. Implement the generated `version_2::Convert` for `version_2::Step`: all four request/reply upgrade/downgrade functions are required. Unchanged methods are carried automatically. More blocks extend the window through adjacent conversion steps. Blocks must descend by label, and a frozen declaration that no longer matches its pin fails to compile. Use `crate::` paths inside blocks rather than `super::`, since the frozen types live one generated module deeper. See `demo/src/main.rs` for the complete implementation.
+
+One handler serves every version. Authorization, layers, blob grants and the idempotency ledger see only current types. The server selects its newest common version in one handshake. `client.version()` reports it; `inventory::window()` reports the build's supported versions. A newer client talking to an older server converts both ways. A call that cannot be represented is `Error::Unsupported` before any stream opens; `tell` has its own `TellError::Unsupported`. A server-side conversion refusal is `RemoteError::Unsupported`.
+
+Conversions own the policy: adding a field needs an explicit upgrade default, and downgrading may lose it. Bodies and blob content are application bytes and are not versioned. Durable replies carry a contract hash: recovery upgrades a known older reply to the current shape, and an unknown or unconvertible reply becomes `Forgotten`, never a newly executable call. Older connections run the downgrade again on replay; use deterministic conversions when byte-for-byte replies matter.
+
+Keylink's own envelope and errors are in every hash. Until its wire is stable, two binaries must use the same keylink wire revision even when their application versions differ. A window does not promise compatibility across keylink wire changes.
 
 ### Authorization
 
@@ -938,6 +940,8 @@ With one machine and no internet, set `KEYLINK_OFFLINE=1` on both sides: the
 demo binds without discovery, prints a `<id>@<ip:port>` line, and accepts that
 form as the dial target.
 
+Build both application versions from one commit to try the window. Leave the server on the default build (version 3), then connect from the other machine with `cargo run -p demo --features demo/previous-contract -- connect <id>`. Swap roles: serve with `--features demo/previous-contract`, then connect with the default build. Both directions print `speaking 2` and finish with `contract: OK`. The newer client fills `aisle: None` and reports the version-3-only `Count` as `Unsupported` when talking to 2.
+
 `cargo run -p demo --features demo/swap-variants -- connect <id>` builds a peer
 whose `Currency` variants are swapped — identical shapes, so postcard would
 decode `Brl` as `Usd` silently. The handshake refuses it instead.
@@ -1024,6 +1028,8 @@ the decisions, including the reversed ones.
 ## Status
 
 Early. The API will move. Not published to crates.io.
+
+Contract windows support frozen application versions with explicit conversions, for singleton services and keyed registries. The application owns conversion policy; keylink's own wire is not yet versioned.
 
 Greenfield: nothing here has ever run in production, so an ALPN move costs
 nothing and no compatibility shim is owed. Changes are taken in their correct

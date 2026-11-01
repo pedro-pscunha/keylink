@@ -225,8 +225,9 @@ pub(crate) fn encode_slot(slot: &Slot, fingerprint: [u8; 32]) -> Vec<u8> {
     let state = match slot {
         Slot::Running(_) => vec![TAG_CLAIMED],
         Slot::Done(frame) => {
-            let mut bytes = Vec::with_capacity(1 + frame.len());
+            let mut bytes = Vec::with_capacity(9 + frame.len());
             bytes.push(TAG_DONE);
+            bytes.extend_from_slice(&hash.to_le_bytes());
             bytes.extend_from_slice(frame);
             bytes
         }
@@ -242,6 +243,12 @@ fn bound_bytes(state: &[u8], fingerprint: [u8; 32]) -> Vec<u8> {
     value.extend_from_slice(&fingerprint);
     value.extend_from_slice(state);
     value
+}
+
+/// A stored reply has not crossed the service's recovery conversion yet.
+enum StoredSlot {
+    Plain(Slot),
+    Done { hash: u64, frame: Bytes },
 }
 
 /// What a stored record becomes when the process comes back.
@@ -267,10 +274,16 @@ fn decode_state(stored: &[u8]) -> Result<Slot, RecordFault> {
     match *tag {
         // The claim outlived the call that took it, which is the definition of
         // this state and not a guess about it.
-        TAG_CLAIMED | TAG_INTERRUPTED => Ok(Slot::Interrupted),
-        TAG_DONE => Ok(Slot::Done(Bytes::copy_from_slice(rest))),
-        TAG_UNRECORDABLE => Ok(Slot::Unrecordable),
-        TAG_FORGOTTEN => Ok(Slot::Forgotten),
+        TAG_CLAIMED | TAG_INTERRUPTED => Ok(StoredSlot::Plain(Slot::Interrupted)),
+        TAG_DONE => match rest.split_first_chunk::<8>() {
+            Some((hash, frame)) => Ok(StoredSlot::Done {
+                hash: u64::from_le_bytes(*hash),
+                frame: Bytes::copy_from_slice(frame),
+            }),
+            None => Ok(StoredSlot::Plain(Slot::Forgotten)),
+        },
+        TAG_UNRECORDABLE => Ok(StoredSlot::Plain(Slot::Unrecordable)),
+        TAG_FORGOTTEN => Ok(StoredSlot::Plain(Slot::Forgotten)),
         tag => Err(RecordFault::UnknownState { tag }),
     }
 }
@@ -399,7 +412,18 @@ impl DurableRecords {
             .recovered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut held)
+        std::mem::take(&mut *held)
+            .into_iter()
+            .map(|(peer, key, stored)| {
+                let slot = match stored {
+                    StoredSlot::Plain(slot) => slot,
+                    StoredSlot::Done { hash, frame } => {
+                        upgrade(hash, &frame).map_or(Slot::Forgotten, Slot::Done)
+                    }
+                };
+                (peer, key, slot)
+            })
+            .collect()
     }
 
     /// Record that a key has been taken, before its call is entered.

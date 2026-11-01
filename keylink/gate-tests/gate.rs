@@ -50,6 +50,7 @@ gate_modules! {
     tell => "../tests/tell.rs",
     trust => "../tests/trust.rs",
     watch => "../tests/watch.rs",
+    versions => "../tests/versions.rs",
 }
 
 #[test]

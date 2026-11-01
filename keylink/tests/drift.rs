@@ -108,12 +108,13 @@ fn build_demo(name: &str, features: &[&str]) -> PathBuf {
 /// `OnceLock` keeps two test threads from running two cargo processes at each
 /// other. The gate deliberately runs `drift` as its own libtest process, so the
 /// lock spans both tests and the nested builds contend with no aggregate test.
-fn binaries() -> &'static (PathBuf, PathBuf) {
-    static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+fn binaries() -> &'static (PathBuf, PathBuf, PathBuf) {
+    static BINARIES: OnceLock<(PathBuf, PathBuf, PathBuf)> = OnceLock::new();
     BINARIES.get_or_init(|| {
         let swapped = build_demo("demo-swapped", &["demo/swap-variants"]);
+        let previous = build_demo("demo-previous", &["demo/previous-contract"]);
         let baseline = build_demo("demo-baseline", &[]);
-        (baseline, swapped)
+        (baseline, swapped, previous)
     })
 }
 
@@ -294,7 +295,7 @@ fn connect_to(demo: &Path, dial: &str) -> String {
 /// or two peers silently disagree about what a price means.
 #[test]
 fn two_type_sets_derive_two_contracts() {
-    let (baseline, swapped) = binaries();
+    let (baseline, swapped, _) = binaries();
 
     // Deliberately no `assert_ne!` on the two files' bytes. It says nothing the
     // ALPN comparison does not say better, and on failure `assert_ne!` prints
@@ -330,12 +331,12 @@ fn two_type_sets_derive_two_contracts() {
 /// baseline one does instead of differently.
 #[test]
 fn a_peer_built_from_other_types_is_refused_at_the_handshake() {
-    let (baseline, swapped) = binaries();
+    let (baseline, swapped, _) = binaries();
     let server = serve(baseline);
 
     let refused = connect_to(swapped, &server.dial);
     assert!(
-        refused.contains("schema mismatch"),
+        refused.contains("no common contract version"),
         "a peer built from other types must be refused for the schema, and told so \
          rather than sent to look at the network. It said:\n{refused}"
     );
@@ -343,7 +344,7 @@ fn a_peer_built_from_other_types_is_refused_at_the_handshake() {
     // The control: same types on both ends, so the whole conversation runs.
     let agreed = connect_to(baseline, &server.dial);
     assert!(
-        !agreed.contains("schema mismatch"),
+        !agreed.contains("no common contract version"),
         "two binaries from one type set must agree on the contract. It said:\n{agreed}"
     );
     assert!(
@@ -358,5 +359,29 @@ fn a_peer_built_from_other_types_is_refused_at_the_handshake() {
     assert!(
         agreed.contains("Brl"),
         "prices must come back in the currency they were sent in. It said:\n{agreed}"
+    );
+}
+
+/// Both feature builds exercise the same connect command that runs on two machines.
+#[test]
+fn both_contract_binaries_talk_in_both_directions() {
+    let (current, _, previous) = binaries();
+    let newer = serve(current);
+    let older_client = connect_to(previous, &newer.dial);
+    assert!(
+        older_client.contains("speaking 2") && older_client.trim_end().ends_with("contract: OK"),
+        "{older_client}"
+    );
+    assert!(!older_client.contains("aisle:"), "{older_client}");
+    let older = serve(previous);
+    let newer_client = connect_to(current, &older.dial);
+    assert!(
+        newer_client.contains("speaking 2") && newer_client.trim_end().ends_with("contract: OK"),
+        "{newer_client}"
+    );
+    assert!(newer_client.contains("aisle: None"), "{newer_client}");
+    assert!(
+        newer_client.contains("count       -> Unsupported"),
+        "{newer_client}"
     );
 }

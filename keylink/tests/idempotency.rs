@@ -1678,6 +1678,13 @@ async fn the_defaults_reproduce_todays_behaviour() {
 ///
 /// The unit guards on this feature do stay green under it: they reach the bounds
 /// through `Ledger::new` and never go through the builder at all.
+///
+/// The original quoted anchor is spent: version mounts share a ledger, so its
+/// constructor moved from a struct field to a local binding. Re-watched with
+/// `scripts/break-once.sh` replacing the constructor argument `self.limits,`
+/// with `Limits::default(),`. The isolated test again failed at "a one-byte
+/// frame ceiling must refuse the repeat: 1"; the configured ceiling, not any
+/// version mount, owns this refusal. Restored.
 #[tokio::test]
 async fn a_frame_ceiling_set_on_the_builder_reaches_the_ledger() {
     let limited = start_limited(Limits::default().frame_bytes(nz(1))).await;
