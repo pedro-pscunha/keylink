@@ -1325,3 +1325,119 @@ async fn a_shared_trust_binding_cannot_be_redirected_to_another_blob_store() {
         Err(Error::Config(keylink::ConfigError::ConflictingBlobStores))
     ));
 }
+
+#[tokio::test]
+async fn removing_one_root_withdraws_grants_while_another_keeps_the_holder_admitted() {
+    let (root, device, _, _) = fixture();
+    let other = SecretKey::from_bytes(&[4; 32]);
+    let blobs = keylink::Blobs::memory();
+    let blob = blobs
+        .add_bytes(b"removed root grant".as_slice())
+        .await
+        .unwrap();
+    let trust = Trust::new(Roots::only([root.public(), other.public()]).unwrap())
+        .with_blobs(&blobs)
+        .unwrap();
+    trust
+        .insert(Chain::new(vec![Certificate::issue(
+            &root,
+            grant(device.public(), "repo/a", 0),
+        )
+        .unwrap()]))
+        .unwrap();
+    trust
+        .insert(Chain::new(vec![Certificate::issue(
+            &other,
+            grant(device.public(), "repo/b", 0),
+        )
+        .unwrap()]))
+        .unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = trust
+        .guard::<trust_shelf::Request, _>(WithinCaveats)
+        .resource(shelf_resource)
+        .install(|allow| trust_shelf::service(TrustShelf(blob.into()), allow))
+        .with_blobs(&blobs)
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let (_, handle) = client.read("repo/a".into()).await.unwrap();
+    assert_eq!(
+        fetch_old_grant(&handle).await.unwrap(),
+        b"removed root grant"
+    );
+    assert!(trust
+        .apply(Change::Roots(Roots::only([other.public()]).unwrap()))
+        .unwrap()
+        .is_empty());
+    denied(client.read("repo/a".into()).await.unwrap_err());
+    assert_eq!(client.ping().await.unwrap(), 7);
+    assert_eq!(trust.live(), 1);
+    assert!(matches!(
+        fetch_old_grant(&handle).await,
+        Err(Error::BlobRefused { .. })
+    ));
+}
+
+#[tokio::test]
+async fn retention_eviction_withdraws_grants_while_other_proofs_keep_the_holder_admitted() {
+    let (root, device, _, trust) = fixture();
+    let blobs = keylink::Blobs::memory();
+    let blob = blobs
+        .add_bytes(b"evicted proof grant".as_slice())
+        .await
+        .unwrap();
+    let trust = trust.with_blobs(&blobs).unwrap();
+    let mut shortest = grant(device.public(), "repo/a", 0);
+    shortest.caveats.validity = Validity::new(
+        Timestamp::from_unix_secs(0),
+        Timestamp::from_unix_secs(u64::MAX - 1),
+    )
+    .unwrap();
+    trust
+        .insert(Chain::new(vec![
+            Certificate::issue(&root, shortest).unwrap()
+        ]))
+        .unwrap();
+    for serial in 1..trust::MAX_CHAINS_PER_HOLDER as u64 {
+        let mut keeper = grant(device.public(), "repo/b", 0);
+        keeper.serial = serial;
+        trust
+            .insert(Chain::new(vec![Certificate::issue(&root, keeper).unwrap()]))
+            .unwrap();
+    }
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device.clone()).await.unwrap();
+    let service = trust
+        .guard::<trust_shelf::Request, _>(WithinCaveats)
+        .resource(shelf_resource)
+        .install(|allow| trust_shelf::service(TrustShelf(blob.into()), allow))
+        .with_blobs(&blobs)
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = trust_shelf::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let (_, handle) = client.read("repo/a".into()).await.unwrap();
+    assert_eq!(
+        fetch_old_grant(&handle).await.unwrap(),
+        b"evicted proof grant"
+    );
+    let mut replacement = grant(device.public(), "repo/b", 0);
+    replacement.serial = trust::MAX_CHAINS_PER_HOLDER as u64;
+    trust
+        .insert(Chain::new(vec![
+            Certificate::issue(&root, replacement).unwrap()
+        ]))
+        .unwrap();
+    denied(client.read("repo/a".into()).await.unwrap_err());
+    assert_eq!(client.ping().await.unwrap(), 7);
+    assert_eq!(trust.live(), 1);
+    assert!(matches!(
+        fetch_old_grant(&handle).await,
+        Err(Error::BlobRefused { .. })
+    ));
+}

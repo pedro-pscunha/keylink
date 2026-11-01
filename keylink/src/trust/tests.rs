@@ -657,7 +657,7 @@ fn an_upstream_revocation_does_not_charge_a_downstream_issuers_budget() {
 
 // Native sockets and a subprocess watchdog are intentionally not browser work.
 #[cfg(not(target_arch = "wasm32"))]
-mod lock_order {
+mod native {
     use super::*;
     use crate::{Context, Grant, Node, SeqId, Server, Wire};
     use std::sync::{
@@ -676,6 +676,70 @@ mod lock_order {
             (2, self.0.into())
         }
     }
+
+    // Search `                if self.roots.contains(&credential.principal())`.
+    // Made red with scripts/break-once.sh by adding a current-time validity
+    // filter to that authority snapshot condition. Expire then lost the old
+    // proof before taking its checkpoint, so the closure remained fetchable.
+    // Watched: the final BlobRefused assertion failed after the successful fetch.
+    #[tokio::test]
+    async fn expire_withdraws_a_disconnected_holders_grant_from_its_historical_proof() {
+        let (root, _, device) = keys();
+        let roots = Roots::only([root.public()]).unwrap();
+        let mut old = grant(device.public(), "repo/a", 0);
+        old.caveats.validity =
+            Validity::new(Timestamp::from_unix_secs(0), Timestamp::from_unix_secs(1)).unwrap();
+        let chain = Chain::new(vec![Certificate::issue(&root, old).unwrap()]);
+        // Seed verified history instead of sleeping across a wall-clock expiry.
+        // This is the cache left after an earlier valid proof expires while the
+        // holder is disconnected, with no clock override or elapsed-time assertion.
+        let credential = chain.verify(&roots, Timestamp::from_unix_secs(0)).unwrap();
+        assert!(Timestamp::now() >= Timestamp::from_unix_secs(1));
+        let blobs = Blobs::memory();
+        let trust = Trust::new(roots).with_blobs(&blobs).unwrap();
+        trust
+            .store()
+            .chains
+            .insert(device.public(), vec![Arc::new(credential)]);
+        let a = blobs
+            .add_bytes(b"expired authority member a".as_slice())
+            .await
+            .unwrap();
+        let b = blobs
+            .add_bytes(b"expired authority member b".as_slice())
+            .await
+            .unwrap();
+        let seq = blobs.add_seq([a, b]).await.unwrap();
+        let node = Node::bind_local().await.unwrap();
+        let peer = Node::bind_local_with_secret(device).await.unwrap();
+        // The node-wide grant outlives its granting RPC connection. The static
+        // admission here does not populate Trust's live-connection registry.
+        let service =
+            concurrent_shelf::service(ConcurrentShelf(seq), crate::Allowlist::only([peer.id()]))
+                .with_blobs(&blobs)
+                .build();
+        let _running = Server::builder(&node).service(service).spawn().unwrap();
+        let client = concurrent_shelf::Client::connect(&peer, node.endpoint().addr())
+            .await
+            .unwrap();
+        let (_, handle) = client.read().await.unwrap();
+        client.close().await.unwrap();
+        assert_eq!(trust.live(), 0);
+        let before = Blobs::memory();
+        handle.fetch_into(&before).await.unwrap();
+        assert_eq!(
+            handle.missing(&before).await.unwrap(),
+            crate::Missing::Nothing
+        );
+        assert!(trust.apply(Change::Expire).unwrap().is_empty());
+        assert!(!trust.store().chains.contains_key(&peer.id()));
+        // A fresh store forces another root/member request, not a local hit.
+        assert!(matches!(
+            handle.fetch_into(&Blobs::memory()).await,
+            Err(crate::Error::BlobRefused { .. })
+        ));
+    }
+
     const REVERSE_LOCK_ORDER: bool = false;
 
     // Made red with scripts/break-once.sh by enabling this module's reverse-order
