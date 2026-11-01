@@ -80,6 +80,36 @@ async fn pages_fit_the_wire_and_an_oversized_event_changes_nothing() {
     assert_eq!(next.events[0].0, Seq(2));
 }
 
+/// Finding 5 was watched red with post-batch trimming: even though length was
+/// one, `ring allocation followed the batch instead of the retention window`.
+#[tokio::test]
+async fn a_large_batch_does_not_leave_its_allocation_in_the_ring() {
+    let policy = retention(1, 1024);
+    let control = EventLog::memory(policy);
+    control.append(0_u64).await.unwrap();
+    control.append(1).await.unwrap();
+    let insertion_capacity = control.inner.ring().events.capacity();
+    let log = EventLog::memory(policy);
+    let (stage, mut publish) = log.stage();
+    for value in 0..100_000_u64 {
+        stage.push(value).unwrap();
+    }
+    publish
+        .after_turn(
+            &(),
+            TurnInfo::for_test(TurnOutcome::Completed, "Batch", Duration::ZERO),
+        )
+        .await
+        .unwrap();
+    let ring = log.inner.ring();
+    assert_eq!(ring.head, Seq(100_000));
+    assert_eq!(ring.events.len(), 1);
+    assert!(
+        ring.events.capacity() <= insertion_capacity,
+        "ring allocation followed the batch instead of the retention window"
+    );
+}
+
 #[tokio::test]
 async fn age_and_byte_retention_keep_the_newest_event_and_expire_old_cursors() {
     let policy = retention(100, 1).max_age(Duration::from_millis(10));

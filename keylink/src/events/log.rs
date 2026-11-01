@@ -277,9 +277,10 @@ where
                 let seq = Seq(before + offset as u64 + 1);
                 ring.bytes += bytes.len() as u64;
                 ring.events.push_back(Held { seq, at_ms, bytes });
+                // Bound the backing allocation too, not just the final length.
+                ring.trim(self.inner.retention, at_ms);
             }
             ring.head = Seq(last);
-            ring.trim(self.inner.retention, at_ms);
             (ring.oldest(), ring.events.len())
         };
         self.inner.changed.send_replace(last);
