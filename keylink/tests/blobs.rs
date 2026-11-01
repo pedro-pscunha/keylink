@@ -3805,7 +3805,9 @@ mod on_disk {
     /// Watched red with `scripts/break-once.sh` (row `HK67`) by replacing
     /// `if damaged(&error) {`
     /// with `if false {` in `keylink/src/blobs.rs`: the store's refusal then
-    /// arrives as `Error::Io` and the typed-error assertion fails.
+    /// arrives as `Error::Io` and the typed-error assertion fails. Watched: `expected
+    /// BlobCorrupt at the damaged window, got Io(Custom { kind: Other, error: "inner
+    /// error: Error::Io" })`.
     #[tokio::test]
     async fn on_disk_the_local_reader_refuses_a_blob_whose_data_changed() {
         const LEN: usize = 1024 * 1024;
@@ -3875,7 +3877,8 @@ mod on_disk {
     /// `None => by_kind(io),`
     /// with `None => true,` in `keylink/src/blobs.rs` (every export failure that
     /// is not an `EncodeError` counted as damage): the assertion below fails with
-    /// `BlobCorrupt`.
+    /// `BlobCorrupt`. Watched: `an unreadable store is an I/O failure, got
+    /// BlobCorrupt { id: BlobId(74cb441f..), offset: 0 }`.
     #[tokio::test]
     async fn on_disk_a_store_that_cannot_be_read_is_an_io_error_and_not_corruption() {
         const LEN: usize = 1024 * 1024;
