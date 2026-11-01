@@ -62,6 +62,9 @@ fn signed_envelopes_and_chains_refuse_noncanonical_outer_lengths() {
 }
 
 #[test]
+// Search `    for certificate in chain.links() {`.
+// Made red with scripts/break-once.sh replacing it with `    for certificate in chain.links().iter().take(0) {`.
+// Watched: a renewed chain opened successfully instead of BadSignature.
 fn a_forwarder_cannot_substitute_another_authority_chain() {
     use super::super::{Caveats, Certificate, Delegation};
     let root = SecretKey::from_bytes(&[1; 32]);
@@ -100,6 +103,9 @@ fn a_forwarder_cannot_substitute_another_authority_chain() {
 }
 
 #[test]
+// Made red with scripts/break-once.sh by replacing the purpose alphabetic predicate with `b.is_ascii_lowercase()`.
+// The multi-line or same-file edit is described rather than quoted.
+// Watched: Inventory/GetItem was refused as BadPurpose.
 fn generated_operation_names_are_case_sensitive_purposes() {
     let key = SecretKey::from_bytes(&[6; 32]);
     let purpose = Purpose::new("Inventory/GetItem").unwrap();

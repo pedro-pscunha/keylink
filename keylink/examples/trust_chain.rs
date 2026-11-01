@@ -181,6 +181,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 mod tests {
     use super::*;
     #[tokio::test]
+    // Made red with scripts/break-once.sh by changing the enrollment serial increment to `fetch_add(0, Ordering::Relaxed)`.
+    // The multi-line or same-file edit is described rather than quoted.
+    // Watched: the second client was refused because its parent certificate had already been revoked.
     async fn enrollment_works_after_a_previous_client_revokes() -> Result<(), Box<dyn StdError>> {
         let node = Node::bind_local().await?;
         let first = Node::bind_local().await?;

@@ -247,6 +247,10 @@ async fn a_connection_admitted_during_a_revocation_is_still_closed() {
 }
 
 #[test]
+// Search `    pub(super) fn trust_roots(&mut self, roots: &Roots) {`.
+// Made red with scripts/break-once.sh replacing it with `    pub(super) fn trust_roots(&mut self, roots: &Roots) {
+//         self.accepted.clear();`.
+// Watched: removing the revoker root resurrected the previously revoked chain.
 fn removing_a_root_never_resurrects_an_accepted_revocation() {
     let (root, _, chain, _) = fixture();
     let revoker = SecretKey::from_bytes(&[8; 32]);
@@ -291,6 +295,9 @@ fn removing_a_root_never_resurrects_an_accepted_revocation() {
 }
 
 #[test]
+// Made red with scripts/break-once.sh by replacing retention_order with the expiry-only comparator, without its certificate-ID tie-breaker.
+// The multi-line or same-file edit is described rather than quoted.
+// Watched: opposite feed orders retained different certificate IDs.
 fn equal_expiry_retention_is_independent_of_feed_order() {
     let (root, _, device) = keys();
     let make = || Trust::new(Roots::only([root.public()]).unwrap());
@@ -325,6 +332,9 @@ fn budget_key(index: usize) -> SecretKey {
     SecretKey::from_bytes(&bytes)
 }
 #[test]
+// Search `            if total >= MAX_RETAINED_CHAINS`.
+// Made red with scripts/break-once.sh replacing it with `        if total > MAX_RETAINED_CHAINS`.
+// Watched: one additional holder was accepted instead of StoreFull.
 fn trust_store_budgets_bound_retained_chains() {
     let (root, _, _, roots) = fixture();
     let trust = Trust::new(roots);
@@ -352,6 +362,9 @@ fn trust_store_budgets_bound_retained_chains() {
     );
 }
 #[test]
+// Search `                    >= super::MAX_PENDING_REVOCATIONS`.
+// Made red with scripts/break-once.sh replacing it with `                    > super::MAX_PENDING_REVOCATIONS`.
+// Watched: one additional pending revocation was accepted instead of a typed capacity error.
 fn trust_store_budgets_bound_pending_records_and_never_drop_tombstones() {
     let (root, _, chain, roots) = fixture();
     let trust = Trust::new(roots);

@@ -567,6 +567,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
+    // Made red with scripts/break-once.sh by zeroing the fingerprint bytes in bound_bytes, using `value.extend_from_slice(&[0; 32]);`.
+    // The multi-line or same-file edit is described rather than quoted.
+    // Watched: the recovered fingerprint was zero rather than the original [9; 32].
     fn request_fingerprints_roundtrip_with_durable_record_states() {
         for slot in [
             Slot::Done(Bytes::from_static(b"reply")),

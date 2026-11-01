@@ -95,3 +95,37 @@ fn remove(inner: &Inner, registration: Registration) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[tokio::test]
+    // Made red with scripts/break-once.sh by making the generation comparison in remove unconditionally `true`.
+    // The multi-line or same-file edit is described rather than quoted.
+    // Watched: cleanup for the old registration erased the new one (0 rather than 1).
+    async fn stale_cleanup_cannot_remove_a_new_registration() {
+        let server = crate::Node::bind_local().await.unwrap();
+        let client = crate::Node::bind_local().await.unwrap();
+        server
+            .endpoint()
+            .set_alpns(vec![b"live-registration".to_vec()]);
+        let accept = async { server.endpoint().accept().await.unwrap().await.unwrap() };
+        let (dialed, accepted) = tokio::join!(
+            client
+                .endpoint()
+                .connect(server.endpoint().addr(), b"live-registration"),
+            accept
+        );
+        let _dialed = dialed.unwrap();
+        let peer = crate::ProvenPeer::on(&accepted);
+        let connection = LiveConnection::new(accepted, peer);
+        let live = Live::default();
+        let old = live.insert(connection.clone());
+        let new = live.insert(connection);
+        live.remove(old);
+        assert_eq!(live.len(), 1);
+        live.remove(new);
+        assert_eq!(live.len(), 0);
+    }
+}

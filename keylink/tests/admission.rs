@@ -1,5 +1,10 @@
 //! Changing your mind about a peer, without restarting.
 //!
+//! The replay break records below originally observed UnexpectedResponse when
+//! preflight was removed. Request-bound records now refuse those changed-method
+//! attempts as RequestMismatch instead. Production must still answer Unauthorized
+//! before consulting the record; the tests retain that stronger assertion.
+//!
 //! An [`Allowlist`] is read once at startup, so revoking a key used to mean a
 //! restart — and a restart drops every connection, including the ones that were
 //! fine. `DynamicAdmission` is the same value behind a lock, plus the one thing

@@ -19,6 +19,9 @@ impl Revoked {
     pub(super) fn new() -> Self {
         Self::default()
     }
+    pub(super) fn accepted_len(&self) -> usize {
+        self.accepted.len()
+    }
     pub(super) fn add(
         &mut self,
         revocation: &super::Revocation,

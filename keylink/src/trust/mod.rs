@@ -188,61 +188,76 @@ impl Trust {
     pub fn insert(&self, chain: Chain) -> Result<(), ChainError> {
         let credential = Arc::new(structure(&chain)?);
         let mut store = self.store();
-        store.standing(&chain, Timestamp::now())?;
-        let held = store.chains.get(&credential.holder());
-        let duplicate = held.is_some_and(|chains| {
-            chains.iter().any(|c| {
+        let before = store.revoked.accepted_len();
+        let result = (|| {
+            store.standing(&chain, Timestamp::now())?;
+            let held = store.chains.get(&credential.holder());
+            let duplicate = held.is_some_and(|chains| {
+                chains.iter().any(|c| {
+                    c.chain()
+                        .links()
+                        .iter()
+                        .map(Certificate::id)
+                        .eq(chain.links().iter().map(Certificate::id))
+                })
+            });
+            if duplicate {
+                return Ok(());
+            }
+            let total: usize = store.chains.values().map(Vec::len).sum();
+            if total >= MAX_RETAINED_CHAINS
+                && held.is_none_or(|chains| chains.len() < MAX_CHAINS_PER_HOLDER)
+            {
+                return Err(ChainError::StoreFull {
+                    max: MAX_RETAINED_CHAINS as u32,
+                });
+            }
+            let chains = store.chains.entry(credential.holder()).or_default();
+            if chains.iter().any(|c| {
                 c.chain()
                     .links()
                     .iter()
                     .map(Certificate::id)
                     .eq(chain.links().iter().map(Certificate::id))
-            })
-        });
-        if duplicate {
-            return Ok(());
-        }
-        let total: usize = store.chains.values().map(Vec::len).sum();
-        if total >= MAX_RETAINED_CHAINS
-            && held.is_none_or(|chains| chains.len() < MAX_CHAINS_PER_HOLDER)
-        {
-            return Err(ChainError::StoreFull {
-                max: MAX_RETAINED_CHAINS as u32,
-            });
-        }
-        let chains = store.chains.entry(credential.holder()).or_default();
-        if chains.iter().any(|c| {
-            c.chain()
-                .links()
-                .iter()
-                .map(Certificate::id)
-                .eq(chain.links().iter().map(Certificate::id))
-        }) {
-            return Ok(());
-        }
-        chains.push(credential);
-        if chains.len() > MAX_CHAINS_PER_HOLDER {
-            if let Some((index, _)) = chains
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| retention_order(a, b))
-            {
-                let offered = index == chains.len() - 1;
-                chains.remove(index);
-                if offered {
-                    return Err(ChainError::NotRetained);
+            }) {
+                return Ok(());
+            }
+            chains.push(credential);
+            if chains.len() > MAX_CHAINS_PER_HOLDER {
+                if let Some((index, _)) = chains
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| retention_order(a, b))
+                {
+                    let offered = index == chains.len() - 1;
+                    chains.remove(index);
+                    if offered {
+                        return Err(ChainError::NotRetained);
+                    }
                 }
             }
+            chains.sort_by(|a, b| retention_order(a, b));
+            Ok(())
+        })();
+        let promoted = store.revoked.accepted_len() != before;
+        drop(store);
+        if promoted {
+            let _ = self.sweep();
         }
-        chains.sort_by(|a, b| retention_order(a, b));
-        Ok(())
+        result
     }
     /// Verify a chain against this view's roots and revocations at `now`.
     pub fn verify(&self, chain: &Chain, now: Timestamp) -> Result<Credential, ChainError> {
         let credential = structure(chain)?;
         let mut store = self.store();
-        store.standing(chain, now)?;
-        Ok(credential)
+        let before = store.revoked.accepted_len();
+        let result = store.standing(chain, now).map(|()| credential);
+        let promoted = store.revoked.accepted_len() != before;
+        drop(store);
+        if promoted {
+            let _ = self.sweep();
+        }
+        result
     }
     /// Open a forwarded value against this view's roots and revocations.
     /// Checks signature, chain standing and the purpose's operation caveat before
@@ -255,13 +270,21 @@ impl Trust {
         now: Timestamp,
     ) -> Result<Opened<T>, SignedError> {
         // User-provided serde runs outside the store lock.
-        let (roots, mut revoked) = {
+        let (roots, mut revoked, promoted) = {
             let mut store = self.store();
             // Certificate signatures already verified independently of T. Resolve
             // pending authority in the shared view before copying it for serde.
+            let before = store.revoked.accepted_len();
             let _ = store.standing(signed.chain(), now);
-            (store.roots.clone(), store.revoked.clone())
+            (
+                store.roots.clone(),
+                store.revoked.clone(),
+                store.revoked.accepted_len() != before,
+            )
         };
+        if promoted {
+            let _ = self.sweep();
+        }
         signed.open_with(purpose, &roots, &mut revoked, now)
     }
     /// Advisory count of remembered live connections.
@@ -277,13 +300,35 @@ impl Trust {
     pub fn presentation(&self) -> ServiceBuilder<present::wire::Request, present::wire::Response> {
         present::service(self.clone())
     }
+    fn sweep(&self) -> Vec<PublicKey> {
+        let mut closed = BTreeSet::new();
+        for (registration, live) in self.0.live.snapshot() {
+            let id = live.peer().id();
+            if !self.admitting(id) {
+                live.close();
+                self.0.live.remove(registration);
+                closed.insert(id);
+            }
+        }
+        // TODO: wire the separate Blobs::revoke_peer capability for every
+        // affected holder, including inactive ones. `closed` names only live
+        // connections; closing RPC alone does not retract prior blob grants.
+        closed.into_iter().collect()
+    }
     fn current(&self, credential: &Credential, now: Timestamp) -> bool {
         let mut store = self.store();
-        if credential.chain().links().is_empty() {
+        let before = store.revoked.accepted_len();
+        let current = if credential.chain().links().is_empty() {
             store.roots.contains(&credential.holder())
         } else {
             store.standing(credential.chain(), now).is_ok()
+        };
+        let promoted = store.revoked.accepted_len() != before;
+        drop(store);
+        if promoted {
+            let _ = self.sweep();
         }
+        current
     }
     fn admitting(&self, peer: PublicKey) -> bool {
         !self
@@ -374,19 +419,7 @@ impl Revocable for Trust {
             }
         }
         // Mutate FIRST, then snapshot: reconnects must meet the new view.
-        let mut closed = BTreeSet::new();
-        for (registration, live) in self.0.live.snapshot() {
-            let id = live.peer().id();
-            if !self.admitting(id) {
-                live.close();
-                self.0.live.remove(registration);
-                closed.insert(id);
-            }
-        }
-        // TODO: wire the separate Blobs::revoke_peer capability for every
-        // affected holder, including inactive ones. `closed` names only live
-        // connections; closing RPC alone does not retract prior blob grants.
-        Ok(closed.into_iter().collect())
+        Ok(self.sweep())
     }
 }
 

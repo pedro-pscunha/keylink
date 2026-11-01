@@ -432,6 +432,12 @@ mod tests {
         let cases = [
             (Error::Closed, GatewayError::UpstreamUnavailable),
             (
+                Error::Remote(RemoteError::Idempotency(
+                    IdempotencyRefusal::RequestMismatch,
+                )),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
                 Error::Remote(RemoteError::AccessUnavailable),
                 GatewayError::UpstreamUnavailable,
             ),

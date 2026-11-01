@@ -73,6 +73,9 @@ fn denied(error: Error) {
 // The replacement is `sweep + mutation`, rather than `mutation + sweep`.
 // Watched: apply returned no closed peers instead of the device key.
 #[tokio::test]
+// Made red with scripts/break-once.sh by capturing the sweep result before Trust::apply mutates the store, then returning that result.
+// The multi-line or same-file edit is described rather than quoted.
+// Watched: apply reported no closed peer instead of the device key; the former inline-sweep break is spent after extraction of sweep.
 async fn a_revoked_certificate_is_refused_and_its_live_connection_closed() {
     let (root, device, chain, trust) = fixture();
     let node = Node::bind_local().await.unwrap();
@@ -355,6 +358,9 @@ impl ungated::Handler for Ungated {
     }
 }
 #[tokio::test]
+// Search `        for (registration, live) in self.0.live.snapshot() {`.
+// Made red with scripts/break-once.sh replacing it with `        for (registration, live) in self.0.live.snapshot().into_iter().take(1) {`.
+// Watched: one connection remained live instead of zero.
 async fn revocation_closes_every_connection_across_two_alpns() {
     let (root, device, chain, trust) = fixture();
     let node = Node::bind_local().await.unwrap();
@@ -397,8 +403,8 @@ async fn revocation_closes_every_connection_across_two_alpns() {
             .unwrap(),
         vec![peer.id()]
     );
-    let _ = tokio::join!(wa, wb);
     assert_eq!(trust.live(), 0);
+    let _ = tokio::join!(wa, wb);
     assert_eq!(
         a.read("repo/a".into()).await.unwrap_err().refusal(),
         Some(Refusal::Denied)
@@ -419,6 +425,9 @@ impl Access for PolicyBarrier {
     }
 }
 #[tokio::test]
+// Search `            store.standing(credential.chain(), now).is_ok()`.
+// Made red with scripts/break-once.sh replacing it with `            true`.
+// Watched: the revoked credential dispatched after the policy barrier.
 async fn revoking_the_selected_chain_during_access_refuses_dispatch() {
     let (root, device, _, trust) = fixture();
     let selected = Chain::new(vec![Certificate::issue(
@@ -464,6 +473,9 @@ async fn revoking_the_selected_chain_during_access_refuses_dispatch() {
 }
 
 #[tokio::test]
+// Search `                    Err(AccessError::Forbidden) => continue,`.
+// Made red with scripts/break-once.sh replacing it with `                    Err(AccessError::Forbidden) => return Err(RemoteError::Unauthorized(method.to_owned())),`.
+// Watched: the first forbidden principal masked the second authorized one.
 async fn a_forbidden_principal_does_not_mask_an_authorized_candidate() {
     struct PrincipalAccess(keylink::EndpointId);
     impl Access for PrincipalAccess {
@@ -486,21 +498,22 @@ async fn a_forbidden_principal_does_not_mask_an_authorized_candidate() {
     let b = SecretKey::from_bytes(&[11; 32]);
     let device = SecretKey::from_bytes(&[12; 32]);
     let trust = Trust::new(Roots::only([a.public(), b.public()]).unwrap());
-    for root in [&a, &b] {
-        trust
-            .insert(Chain::new(vec![Certificate::issue(
-                root,
-                grant(device.public(), "repo/a", 0),
-            )
-            .unwrap()]))
-            .unwrap();
-    }
+    let ca = Certificate::issue(&a, grant(device.public(), "repo/a", 0)).unwrap();
+    let cb = Certificate::issue(&b, grant(device.public(), "repo/a", 0)).unwrap();
+    // Retention sorts ascending by ids, so authorize only the second candidate.
+    let allowed = if ca.id() > cb.id() {
+        a.public()
+    } else {
+        b.public()
+    };
+    trust.insert(Chain::new(vec![ca])).unwrap();
+    trust.insert(Chain::new(vec![cb])).unwrap();
     let node = Node::bind_local().await.unwrap();
     let peer = Node::bind_local_with_secret(device).await.unwrap();
     let service = trust
-        .guard::<methods::Request, _>(PrincipalAccess(b.public()))
+        .guard::<methods::Request, _>(PrincipalAccess(allowed))
         .resource(resource)
-        .install(|allow| methods::service(PrincipalMethods(b.public()), allow))
+        .install(|allow| methods::service(PrincipalMethods(allowed), allow))
         .build();
     let _running = Server::builder(&node).service(service).spawn().unwrap();
     let client = methods::Client::connect(&peer, node.endpoint().addr())
@@ -510,6 +523,9 @@ async fn a_forbidden_principal_does_not_mask_an_authorized_candidate() {
 }
 
 #[tokio::test]
+// Search `                    if offered {`.
+// Made red with scripts/break-once.sh replacing it with `                if false {`.
+// Watched: presentation claimed Held for the immediately evicted offer.
 async fn presentation_never_reports_held_for_an_evicted_offer() {
     let (root, device, _, trust) = fixture();
     for serial in 0..trust::MAX_CHAINS_PER_HOLDER as u64 {
@@ -543,6 +559,9 @@ async fn presentation_never_reports_held_for_an_evicted_offer() {
 }
 
 #[tokio::test]
+// Search `                if entry.fingerprint != fingerprint {`.
+// Made red with scripts/break-once.sh replacing it with `                if false {`.
+// Watched: the changed-resource call returned the original cached reply instead of RequestMismatch.
 async fn a_request_fingerprint_prevents_cross_resource_replay_after_revocation() {
     let (root, device, _, trust) = fixture();
     let a = Chain::new(vec![Certificate::issue(
@@ -616,6 +635,9 @@ impl keylink::Middleware<files::Request, files::Response> for ResourceCache {
     }
 }
 #[tokio::test]
+// Search `    for policy in required {`.
+// Made red with scripts/break-once.sh replacing it with `    for policy in required.iter().take(0) {`.
+// Watched: the revoked resource received its old replay before the cache test could proceed.
 async fn resource_changes_refuse_before_real_replays_and_short_circuit_layers() {
     let (root, device, _, trust) = fixture();
     let a = Chain::new(vec![Certificate::issue(
@@ -677,5 +699,108 @@ async fn resource_changes_refuse_before_real_replays_and_short_circuit_layers() 
     assert_eq!(
         client.key_state(key).await.unwrap(),
         keylink::KeyState::Done
+    );
+}
+
+#[tokio::test]
+// Search `    for (policy, credential) in required.iter().zip(&checked) {`.
+// Made red with scripts/break-once.sh replacing it with `    for (policy, credential) in required.iter().zip(&checked).take(0) {`.
+// Watched: the earlier revoked credential dispatched after a later policy waited.
+async fn nested_policy_waits_recheck_earlier_selected_credentials() {
+    let (root, device, _, first) = fixture();
+    let a = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/a", 0),
+    )
+    .unwrap()]);
+    let b = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    first.insert(a.clone()).unwrap();
+    first.insert(b).unwrap();
+    let second = Trust::new(Roots::only([root.public()]).unwrap());
+    second.insert(a.clone()).unwrap();
+    let (entered, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let service = second
+        .guard::<files::Request, _>(PolicyBarrier {
+            entered,
+            release: release.clone(),
+        })
+        .resource(file_resource)
+        .install(|_| {
+            first
+                .guard::<files::Request, _>(WithinCaveats)
+                .resource(file_resource)
+                .install(|allow| files::service(Files(Arc::new(AtomicUsize::new(0))), allow))
+        })
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = files::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let pending = tokio::spawn(async move { client.read("repo/a/file".into()).await });
+    observed.recv().await.unwrap();
+    assert!(first
+        .apply(Change::Revoke(Revocation::issue(&root, a.links()[0].id())))
+        .unwrap()
+        .is_empty());
+    release.notify_one();
+    denied(pending.await.unwrap().unwrap_err());
+}
+
+#[tokio::test]
+// Made red with scripts/break-once.sh by suppressing the promoted-tombstone sweep in Trust::verify with `if false`.
+// The multi-line or same-file edit is described rather than quoted.
+// Watched: the admitted-only connection remained live after its revocation became authoritative.
+async fn learning_pending_revocation_authority_also_closes_existing_connections() {
+    let root = SecretKey::from_bytes(&[1; 32]);
+    let issuer = SecretKey::from_bytes(&[2; 32]);
+    let device = SecretKey::from_bytes(&[3; 32]);
+    let upstream = SecretKey::from_bytes(&[4; 32]);
+    let leaf = Certificate::issue(&issuer, grant(device.public(), "repo/a", 0)).unwrap();
+    let old = Chain::new(vec![
+        Certificate::issue(&root, grant(issuer.public(), "repo", 1)).unwrap(),
+        leaf.clone(),
+    ]);
+    let new = Chain::new(vec![
+        Certificate::issue(&root, grant(upstream.public(), "repo", 2)).unwrap(),
+        Certificate::issue(&upstream, grant(issuer.public(), "repo", 1)).unwrap(),
+        leaf.clone(),
+    ]);
+    let trust = Trust::new(Roots::only([root.public()]).unwrap());
+    trust.insert(old.clone()).unwrap();
+    trust
+        .apply(Change::Revoke(Revocation::issue(&upstream, leaf.id())))
+        .unwrap();
+    assert!(trust.verify(&old, Timestamp::now()).is_ok());
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let _running = Server::builder(&node)
+        .service(
+            ungated::service(Ungated, keylink::Allowlist::anyone())
+                .admission(Arc::new(trust.clone()))
+                .build(),
+        )
+        .spawn()
+        .unwrap();
+    let client = ungated::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    assert_eq!(client.read().await.unwrap(), 7);
+    let watch = client.watch();
+    assert!(matches!(
+        trust.verify(&new, Timestamp::now()),
+        Err(ChainError::Revoked { at: 2 })
+    ));
+    assert_eq!(trust.live(), 0);
+    let _ = watch.await;
+    assert_eq!(
+        client.read().await.unwrap_err().refusal(),
+        Some(Refusal::Denied)
     );
 }

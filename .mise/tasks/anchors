@@ -537,6 +537,17 @@ ROOT = pathlib.Path(
 # C5/C5b and C8/C8b for REPLAY, which no row's reason mentioned before. Each pair's own
 # comment states which.
 ANCHORS = [
+    ('RF1', 'keylink/tests/trust.rs', 'keylink/src/idempotency.rs', '                if entry.fingerprint != fingerprint {'),
+    ('RF2', 'keylink/src/trust/sign_tests.rs', 'keylink/src/trust/sign.rs', '    for certificate in chain.links() {'),
+    ('RF3', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '            store.standing(credential.chain(), now).is_ok()'),
+    ('RF4', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '    for (policy, credential) in required.iter().zip(&checked) {'),
+    ('RF5', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '    pub(super) fn trust_roots(&mut self, roots: &Roots) {'),
+    ('RF6', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '        for (registration, live) in self.0.live.snapshot() {'),
+    ('RF7', 'keylink/src/trust/tests.rs', 'keylink/src/trust/mod.rs', '            if total >= MAX_RETAINED_CHAINS'),
+    ('RF8', 'keylink/src/trust/tests.rs', 'keylink/src/trust/chain.rs', '                    >= super::MAX_PENDING_REVOCATIONS'),
+    ('RF9', 'keylink/tests/trust.rs', 'keylink/src/trust/guard.rs', '                    Err(AccessError::Forbidden) => continue,'),
+    ('RF10', 'keylink/tests/trust.rs', 'keylink/src/trust/mod.rs', '                    if offered {'),
+    ('RF11', 'keylink/tests/trust.rs', 'keylink/src/rpc.rs', '    for policy in required {'),
     ("TR1", "keylink/src/trust/tests.rs", "keylink/src/trust/chain.rs",
      "        if !child.resources.subset_of(&parent.resources) {"),
     ("TR2", "keylink/src/trust/tests.rs", "keylink/src/trust/sign.rs",
