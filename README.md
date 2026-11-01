@@ -166,7 +166,13 @@ read, and never hashes a peer supplied.
 the members the store lacks, 4096 members per request. `Blobs::missing` (and
 `handle.missing(&store)`) answer what that is, from the fetcher's own store.
 
-A closure has no limit on how many members it lists. The fetcher plans each
+A closure has no limit on how many members it lists. Planning memory and
+request size are bounded, the work is not linear: iroh-blobs 0.104 walks offsets
+one at a time on both ends, so a window starting at member `k` costs `k` steps and
+a whole closure about `N^2 / 4096` of them. A 300,000-member closure with
+alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, not in
+the gate), 12,289 members take 8 s (in it). A blob listed twice in one window is
+requested once. The fetcher plans each
 window of 4096 members from that slice of the root alone, so what it holds in
 memory is a window's, and a window's request has at most 4096 entries, far under
 iroh-blobs' message limit (a compile-time check). The root is checked for a whole
@@ -186,17 +192,24 @@ blobs connections, so a transfer in flight stops, and it refuses the grant of a
 call whose handler was already running when it landed
 (`RemoteError::GrantsWithdrawn`). Bytes already delivered stay with the
 fetcher. Remove a peer from admission first, then call `revoke_peer`:
-removing it from an allowlist does not touch its blob grants.
+removing it from an allowlist does not touch its blob grants. **That recipe is
+complete only if admission closes every RPC connection of the peer.**
+`DynamicAdmission` keeps one revocation handle per peer today, so a second live
+connection of the same peer survives a `replace` and can still take a fresh
+fence; the `trust` branch fixes the registry, which already tracks connections
+by id.
 
-The ledger holds at most `GRANT_LIMIT` grants (524,288) across every peer, and
+The ledger holds at most `GRANT_LIMIT` grants (172,032) across every peer, and
 `Blobs::set_grant_limit` changes it. A grant past the limit is answered
 `RemoteError::GrantsExhausted { limit }`, and nothing is evicted to make room. A
 peer has an entry only while it holds a grant, so one count bounds both tables,
 and a table is rebuilt when its length falls under half the most it has held, so
-what a revoke leaves allocated stays bounded. The limit is about 64 MiB at the
-measured cost, `grant_allocation` counting the heap: 64.2 bytes per grant filling
-to 100,000, and at worst 128.5 under trade-one-for-one churn, on aarch64 macOS.
-Grants die with the process.
+what a revoke leaves allocated stays bounded. The cost is measured with a
+counting allocator, on aarch64 macOS: the dense shape (a few peers, many grants
+each, `grant_allocation`) is 64.2 bytes per grant filling to 100,000 and at worst
+128.5 under trade-one-for-one churn; the sparse shape (one grant per peer) is
+386.3 at 1,000 peers and 320.7 at 100,000. The default limit's size, about 64 MiB,
+uses the worst of these, the sparse 386.3. Grants die with the process.
 
 The [`closure_share`](keylink/examples/closure_share.rs) example runs it end to
 end, in one process or between two machines.

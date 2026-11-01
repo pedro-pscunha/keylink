@@ -9,8 +9,10 @@
 //! counter is per thread, and the runtime's threads are not this one.
 //!
 //! Every figure is printed (run with `--nocapture`) and compared with a ceiling
-//! written here. The ceilings are what `GRANT_LIMIT`'s documentation relies on:
-//! `GRANT_LIMIT` is about 64 MiB at the per-grant cost these runs measure.
+//! written here. This is the dense shape: a few real peers, many grants each. The
+//! sparse shape, one grant per peer, needs more peers than real connections can
+//! supply and is measured by a unit test in `src/blobs.rs`; `GRANT_LIMIT`'s
+//! documentation gives both, and sizes its default on the worse, the sparse one.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

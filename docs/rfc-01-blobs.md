@@ -1498,3 +1498,15 @@ What it costs is measured, not derived. `keylink/tests/grant_allocation.rs`, an 
 A closure of 300,000 tiny members, of which the fetcher holds every other one, is fetched in the suite. Before the change it failed with `BlobRefused { id: BlobId(0eed953e…) }` on the tree that asked for the whole closure in one request.
 
 **13.7.3 No rpc sends a list of what is missing.** `Missing` has no `Serialize`, so a handler that wanted to tell a peer what a store lacks would have to convert it by hand, and the oracle warning on `Blobs::missing` still applies.
+
+### 13.8 Corrections after the last review
+
+Appended to §13.7. The limit changes here, so the figure in §13.7.1 is superseded.
+
+**13.8.1 The revoke recipe needs every connection closed.** §13.6.1 says removing a peer closes its connection first, so a fence taken after `revoke_peer` finds it closed. That holds for each connection admission closes. `DynamicAdmission` keeps one revocation handle per peer, so a second live connection of the same peer survives a `replace`, is still open, and can take a fresh fence after `revoke_peer`. The documentation of `revoke_peer` and the README now say so. The `trust` branch fixes the registry, which already tracks connections by id; admission is not changed here.
+
+**13.8.2 Windowing bounds memory and request size, not work.** §13.6.3 says the planning is linear in the closure across all windows. iroh-blobs 0.104 walks a request's offsets one at a time (`iter_non_empty_infinite`) on both ends, so a window that starts at member `k` costs `k` steps before its first member, and a closure of `N` members costs about `N^2 / 4096`. That is not measured on its own. What is measured: a 300,000-member closure with alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, which also adds both stores' members and makes about a million store round trips), and 12,289 members take 8 s, in the gate.
+
+**13.8.3 The sparse shape costs more per grant, and sets the default.** §13.7.1 measured only grants concentrated on a few peers. With one grant per peer each grant also pays for a slot in the peers' table and a table of its own: 386.3 bytes at 1,000 peers and 320.7 at 100,000 (a unit test in `src/blobs.rs`, because real connections cannot supply that many peers). `GRANT_LIMIT` is 172,032, about 64 MiB at 386.3 bytes; at the dense figures the same limit is 11 MB to 22 MB.
+
+**13.8.4 A blob listed twice in one window crossed the wire twice.** Each place a member lacked was requested. Now only the first occurrence of a lacking hash in a window is; the sequence keeps its order and its repeats, and `missing` still lists them.

@@ -109,7 +109,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, RemoteError, Result};
 
-/// The most grants one node's ledger holds, across every peer: 524,288.
+/// The most grants one node's ledger holds, across every peer: 172,032.
 ///
 /// A grant is one `(peer, root)` pair, and one closure is one grant however many
 /// blobs it lists. A grant past the limit is refused with
@@ -125,17 +125,24 @@ use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, RemoteError, Resul
 ///
 /// # What it costs
 ///
-/// Measured by `grant_allocation`: 64.2 bytes of heap per grant filling to
-/// 100,000 grants over 8 peers, and at worst 128.5 bytes per grant for 100,000
-/// held after 300,000 trades of one grant for another (deleted slots are
-/// tombstones, and hashbrown answers a table full of them by doubling it), on
-/// aarch64 macOS. The default is about 64 MiB at the worse cost: 524,288 grants
-/// are 67 MB at 128.5 bytes and 34 MB at 64.2. The figure moves with the
-/// platform's pointer width and the hash table's layout; the test prints it and
-/// asserts a ceiling on it. It leaves out the allocator's own bookkeeping and the
-/// table of calls in flight, which is bounded by the calls the node is already
-/// running and is rebuilt by the same rule.
-pub const GRANT_LIMIT: usize = 524_288;
+/// Measured on aarch64 macOS, in bytes of heap per grant, for two shapes:
+///
+/// - **Dense**, a few peers holding many grants each (`grant_allocation`, 8
+///   peers): 64.2 filling to 100,000 grants, and at worst 128.5 for 100,000 held
+///   after 300,000 trades of one grant for another (deleted slots are
+///   tombstones, and hashbrown answers a table full of them by doubling it).
+/// - **Sparse**, every peer holding one grant (`blobs::tests`, the sparse
+///   ledger test): 386.3 at 1,000 peers and 320.7 at 100,000, because each grant
+///   also pays for a slot in the peers' table and a table of its own.
+///
+/// **The default's size estimate uses the worst, the sparse 386.3**: 172,032
+/// grants are 66.5 MB, about 64 MiB. A ledger of the dense shape at the same
+/// limit is 11 MB to 22 MB. The figures move with the platform's pointer width
+/// and the hash table's layout; the tests print them and assert a ceiling on each
+/// run. They leave out the allocator's own bookkeeping and the table of calls in
+/// flight, which is bounded by the calls the node is already running and is
+/// rebuilt by the same rule.
+pub const GRANT_LIMIT: usize = 172_032;
 
 // ────────────────────────────────────────────────────────────── the address
 
@@ -1286,6 +1293,16 @@ impl Blobs {
     /// [`DynamicAdmission`](crate::DynamicAdmission) does not touch its blob
     /// grants, because the ledger is per node and does not record which service
     /// granted what: drop the peer from admission first, then call this.
+    ///
+    /// **That recipe is complete only if admission closes every RPC connection
+    /// of the peer.** A call is fenced when its stream is accepted and refused if
+    /// its connection is closed by then, so a connection admission left open can
+    /// still take a fresh fence after this has run. [`DynamicAdmission`](crate::DynamicAdmission) keeps one
+    /// revocation handle per peer today, so a second live connection of the same
+    /// peer survives a `replace` and is exactly that. The `trust` branch fixes
+    /// the registry, which already tracks connections by id; until it lands,
+    /// close the peer's connections some other way (restart the server, or admit
+    /// by an allowlist that cannot hold a peer twice) before relying on this.
     pub fn revoke_peer(&self, peer: EndpointId) -> usize {
         let grants = self.inner.grants.revoke_peer(peer);
         self.inner.live.close_peer(peer);
@@ -1420,8 +1437,17 @@ const ROOT_WINDOW: u64 = 32 * 1024;
 /// read off the store, each of its members is asked of the store, and the
 /// request names the ones it lacks, one run per stretch of them. So the plan's
 /// memory is a window's and the request is a few bytes per gap, **whatever the
-/// closure's length**: this is what lets a closure have no member limit. The work
-/// across windows is linear in the closure, not repeated per window.
+/// closure's length**: this is what lets a closure have no member limit.
+///
+/// **It does not make the work linear.** iroh-blobs 0.104 walks a request's
+/// offsets one at a time (`iter_non_empty_infinite`), on both ends, so a window
+/// that starts at member `k` costs `k` steps before it reaches its first member,
+/// and a whole closure of `N` members costs about `N^2 / 4096` of them. That is
+/// not measured on its own. The sizes measured: a 300,000-member closure with
+/// alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, which
+/// includes adding both stores' members and about a million store round trips
+/// asking what is held), against 8 s for 12,289. It is the thing to look at
+/// first if closures get much larger.
 ///
 /// A member held only in part counts as lacking and is requested whole, so a
 /// window's request can have an entry for every one of its members, and the
@@ -2132,9 +2158,14 @@ impl BlobHandle {
         while start < members {
             let end = (start + FETCH_WINDOW).min(members);
             let listed = store.listed(self.id(), start..end).await?;
+            // Only the first occurrence of a hash that is lacking is requested:
+            // a sequence may list the same blob twice, and one transfer fills
+            // both places. The sequence itself is untouched, so order and
+            // duplicates stay; only the request is deduplicated.
+            let mut asked = std::collections::HashSet::new();
             let mut lacking = Vec::with_capacity(listed.len());
             for member in &listed {
-                lacking.push(!store.has(*member).await?);
+                lacking.push(!store.has(*member).await? && asked.insert(*member));
             }
             if lacking.contains(&true) {
                 let stats = remote
@@ -2838,6 +2869,92 @@ mod tests {
         bytes[..4].copy_from_slice(&nth.to_le_bytes());
         BlobId(bytes)
     }
+
+    /// Counts the bytes this thread has allocated and not yet freed, so the
+    /// sparse shape (one grant per peer) can be measured here, where peers can be
+    /// minted without a connection each. The dense shape, over real peers, is
+    /// measured by `tests/grant_allocation.rs`.
+    mod heap {
+        #![allow(unsafe_code)]
+
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub(super) struct Counting;
+
+        // SAFETY: every call is delegated unchanged to `System`; the counter is a
+        // plain thread-local cell with no destructor and no allocation of its own.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: the layout is passed through unchanged.
+                let pointer = unsafe { System.alloc(layout) };
+                if !pointer.is_null() {
+                    let _ = LIVE.try_with(|live| live.set(live.get() + layout.size() as isize));
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                let _ = LIVE.try_with(|live| live.set(live.get() - layout.size() as isize));
+                // SAFETY: `pointer` and `layout` came from the allocation above.
+                unsafe { System.dealloc(pointer, layout) }
+            }
+        }
+
+        /// Net bytes this thread has allocated.
+        pub(super) fn live() -> isize {
+            LIVE.with(Cell::get)
+        }
+    }
+
+    #[global_allocator]
+    static HEAP: heap::Counting = heap::Counting;
+
+    /// The sparse shape: every peer holds one grant, so each grant also pays for
+    /// a peer slot in the outer table and a table of its own. N peers are made
+    /// before the measurement starts, so only the ledger is counted.
+    ///
+    /// Watched red with `scripts/break-once.sh` by replacing the ceiling's `450.0`
+    /// below with `190.0`, less than half the measured figure: the run fails with
+    /// `1000 peers with one grant each: 386.3 bytes per grant is over 190`.
+    #[test]
+    fn a_ledger_of_one_grant_per_peer_costs_a_bounded_number_of_bytes_per_grant() {
+        for count in [1_000u64, 100_000] {
+            let peers: Vec<AdmittedPeer> = (0..count)
+                .map(|seed| {
+                    crate::Allowlist::anyone()
+                        .admit(ProvenPeer::for_tests_wide(seed))
+                        .expect("anyone admits everyone")
+                })
+                .collect();
+            let grants = Grants::new();
+            let before = heap::live();
+            for (nth, peer) in (0u32..).zip(&peers) {
+                let fence = grants.fence(peer, || true).expect("open");
+                grants
+                    .reserve(peer, root(nth).into(), &fence)
+                    .expect("within the limit")
+                    .commit();
+            }
+            let per = (heap::live() - before) as f64 / count as f64;
+            println!(
+                "grant_allocation: one grant per peer, {count} peers: {per:.1} bytes per grant"
+            );
+            assert!(
+                per <= SPARSE_CEILING,
+                "{count} peers with one grant each: {per:.1} bytes per grant is over {SPARSE_CEILING}"
+            );
+        }
+    }
+
+    /// A table of 4 buckets per peer plus its slot in the peers' table: measured
+    /// at 386.3 bytes per grant for 1,000 peers and 320.7 for 100,000, on aarch64
+    /// macOS. The ceiling leaves room above the larger.
+    const SPARSE_CEILING: f64 = 450.0;
 
     /// A table is rebuilt when its length falls under half the most entries it
     /// has held since it was last rebuilt, and not before. What that does to the

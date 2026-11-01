@@ -3175,7 +3175,7 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
 /// arrived whole.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK62`) by replacing
-/// `lacking.push(!store.has(*member).await?);`
+/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
 /// with `lacking.push(true);` in `keylink/src/blobs.rs`: every window then asks
 /// for all of its members, and the retry moves every member again (20,480,000
 /// bytes) instead of the roughly half it lacked.
@@ -3341,4 +3341,64 @@ async fn a_closure_of_three_windows_and_one_member_with_alternating_gaps_is_fetc
 #[ignore = "100 to 266 s a run, outside the gate: run it with `mise run closure-300k`"]
 async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
     a_closure_with_alternating_gaps_is_fetched(300_000).await;
+}
+
+// ═══════════════════════════════════════ one blob listed twice crosses the wire once
+
+/// A sequence may list the same blob more than once, and one transfer fills
+/// every place it is listed. Inside a window only the first occurrence of a
+/// member the store lacks is requested; the sequence keeps its order and its
+/// repeats, and `missing` still reports them as listed.
+///
+/// Three blobs of 1000, 2000 and 3000 bytes, listed `a b a c b a`: six places and
+/// three transfers, so 6000 payload bytes where requesting every place would move
+/// 10000.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK63`) by replacing
+/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
+/// with `lacking.push(!store.has(*member).await? && { asked.insert(*member); true });`
+/// in `keylink/src/blobs.rs`: the fetch then moves every listed place and fails
+/// with `each blob crossed once` (left: 10000, right: 6000).
+#[tokio::test]
+async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
+    let cluster = cluster().await;
+    let a = cluster.add_bytes(&payload(1000)).await;
+    let b = cluster.add_bytes(&payload(2000)).await;
+    let c = cluster.add_bytes(&payload(3000)).await;
+    let listed = [a, b, a, c, b, a];
+    let seq = cluster
+        .blobs
+        .add_seq(listed)
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+    let handle = BlobHandle::new(
+        &cluster.peer,
+        cluster.server.endpoint().addr(),
+        Content::Closure(seq.id()),
+    );
+
+    let local = Blobs::memory();
+    assert_eq!(
+        handle.missing(&local).await.expect("fetches the list"),
+        keylink::Missing::Members(listed.to_vec()),
+        "the sequence keeps its order and its repeats"
+    );
+    let moved = handle
+        .fetch_into(&local)
+        .await
+        .expect("fetches the members");
+    assert_eq!(moved, 1000 + 2000 + 3000, "each blob crossed once");
+    assert_eq!(
+        handle.missing(&local).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    let read = read_back(&local, &[a, b, c]).await;
+    assert_eq!(
+        read,
+        vec![payload(1000), payload(2000), payload(3000)],
+        "and every place it was listed is filled"
+    );
 }
