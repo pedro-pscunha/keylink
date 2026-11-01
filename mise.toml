@@ -331,6 +331,7 @@ run = [
     "cargo run -p keylink --example waypoint",
     "cargo run -p keylink --example wire_contract",
     "cargo run -p keylink --example fault_lines",
+    "cargo run -p keylink --example closure_share",
     # The one example that is not at default features. `blobs-fs` is off by
     # default and `required-features` makes cargo SKIP the target rather than
     # build it, so without this flag the line below would run nothing and say

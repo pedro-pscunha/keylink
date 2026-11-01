@@ -2121,6 +2121,12 @@ mod tests {
         assert_eq!(book.by_peer.values().next().map(HashMap::len), Some(1));
     }
 
+    /// The budget refuses, and refusing evicts nothing.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK52`) by replacing
+    /// `if book.used.saturating_add(cost) > book.budget {`
+    /// with `if false {`: the third `reserve` is then granted and the test
+    /// panics at `the third grant does not fit`.
     #[test]
     fn a_grant_past_the_budget_is_refused_and_nothing_is_evicted() {
         let budget = PEER_COST + 2 * GRANT_COST;
@@ -2163,6 +2169,14 @@ mod tests {
         );
     }
 
+    /// A revoke wins over a grant still being written, and a permit from before
+    /// a revoke cannot make a later reservation live.
+    ///
+    /// Watched red by editing `Permit::commit`, whose `.filter(..)` line is the
+    /// same text as the one in `Permit::drop`, so no row can quote it: replace
+    /// the commit's `.filter(|entry| entry.generation == self.generation)` with
+    /// `.filter(|_| true)`. The assertion `a stale permit does not flip
+    /// somebody else's entry` fails.
     #[test]
     fn a_revoke_while_a_grant_is_pending_wins() {
         let grants = Grants::new();
@@ -2189,6 +2203,12 @@ mod tests {
         assert_eq!(scope(&grants, 1, blob(2)), Some(Scope::Blob));
     }
 
+    /// A reply that was never written grants nothing and costs nothing.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK53`) by replacing
+    /// `if !entry.live && entry.pending == 0 {`
+    /// with `if false {`: the dropped reservation stays charged and the
+    /// `assert_eq!(grants.lock().used, 0)` fails.
     #[test]
     fn an_uncommitted_permit_releases_its_charge() {
         let grants = Grants::new();

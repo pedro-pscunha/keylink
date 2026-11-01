@@ -1356,3 +1356,93 @@ Section 4.4 records the last two.
 
 Plus a `blobs-fs` cargo feature, and `iroh-blobs` with
 `default-features = false`.
+
+## 13. Closure grants, revocation, and the end of `MAX_GRANTS`
+
+Appended. Sections 5.7 and 9 (Risk 3) above record what was believed when they
+were written, and they are not edited. This section says what replaced them and why.
+
+### 13.1 What §5.7 and Risk 3 left open
+
+The ledger kept 4096 `(peer, hash)` pairs and evicted the oldest across every
+peer. Nothing revoked a grant. That bound was a judgement, not a measurement, and
+it failed in two ways. A peer fetching a tree of more than 4096 blobs needed more
+grants than the ledger would hold. And an evicted grant took its capability with it
+without anybody deciding to withdraw it, so a peer could lose access because
+another peer was busy.
+
+### 13.2 Decisions
+
+1. **A grant is `(peer, root, scope)`, and the scope is `Blob` or `Closure`.** A
+   closure grant admits any `GetRequest` whose hash is the root, with any ranges.
+   That is safe because iroh-blobs serves exactly the members the holder's own copy
+   of the root lists, by offset. A requester names offsets, never hashes. Admission
+   reads nothing from the store, so it costs the same for 5 members and for 50,000.
+2. **A member is reached through its root, by index.** A request for member *i* is
+   `GetRequest { hash: root, ranges: [empty, ..., ranges at offset i + 1] }`. A bare
+   request for a member by its own hash is refused unless that member was granted on
+   its own. Admitting a bare member would need a reverse index from member to roots,
+   which grows with the total number of chunks. That is the cost this change removes.
+3. **Nested sequences are not followed.** The HashSeq format does not say which
+   children are sequences. Treating "parses as a sequence" as intent is the alignment
+   hole §5.7 already closed for `Blob` grants: any 32-aligned member would grant every
+   hash its bytes spell. A tree with sub-sequences is flattened into one sequence.
+4. **An iroh-blobs `Collection` needs no special case.** Its root is a HashSeq whose
+   child 0 is the metadata blob, so a closure grant on it covers both. keylink adds no
+   `Collection` type, because iroh-blobs calls that format subject to change.
+5. **Have/want is computed in the fetcher's own store.** `fetch_into` fetches the
+   root alone when the store lacks it, then fetches the sequence, and iroh-blobs asks
+   only for the members the store does not hold. Fetching the sequence in one request
+   would send the whole closure when the root is absent, because the fetcher cannot
+   know what it holds until it holds the list. `Blobs::missing` answers the same
+   question without the network. The holder's grant is its claim that it has the
+   closure. GetMany and Observe stay refused, because no caller uses either.
+6. **Revocation is explicit.** `revoke(peer, root)`, `revoke_peer(peer)` and
+   `revoke_everywhere(root)`. The per-root calls refuse the next request and let one
+   already admitted run to completion. `revoke_peer` also closes that peer's live
+   blobs connections, so a transfer in flight stops. Nothing recalls bytes already
+   delivered.
+7. **The bound is bytes, and it fails loudly.** Each grant is charged `GRANT_COST`
+   and each peer `PEER_COST` against `GRANT_BUDGET` (64 MiB). A grant past the budget
+   is answered `RemoteError::GrantsExhausted` and nothing is evicted. Grants do not
+   expire: a clock would drop capabilities silently, which is the failure eviction had.
+8. **A grant is made in two steps.** The ledger reserves it before the reply is
+   encoded, so a full ledger replaces the reply and the caller is never handed an
+   address it cannot spend. It commits once the idempotency ledger has settled, so a
+   refused record leaves no live grant behind. A generation number on each entry stops
+   a reservation from before a revoke from reviving a grant made after it.
+
+### 13.3 Risks and what is not possible
+
+- **A closure authorizes every hash its sequence lists.** If an application builds a
+  granted sequence from hashes a peer supplied, that peer can list any hash the store
+  holds and read it. `SeqId` stops the accidental form (a closure over uploaded bytes)
+  and not this one. The rule is in the `Blobs::add_seq` documentation.
+- **The request cap.** iroh-blobs refuses a request over 1 MiB. An estimate, not
+  measured: a closure of about 150,000 members with scattered gaps can pass it. The fix,
+  if it happens, is to split the second fetch into windows of indices.
+- **Fetcher memory.** During the second fetch iroh-blobs keeps about 100 bytes per
+  member for the length of the fetch. That is the fetcher's memory, not admission's.
+- **`GRANT_COST` and `PEER_COST` are derived from `size_of`, not measured.** A
+  counting-allocator test could pin them.
+- **Restarts.** Grants die with the process while a durable idempotency record
+  survives. A replay after a restart carries an address with no grant, and the fetch is
+  refused. That predates this change.
+- **Removing a peer from an `Allowlist` or `DynamicAdmission` does not touch its blob
+  grants.** The ledger is per node and does not record which service granted what.
+  Drop the peer from admission, then call `revoke_peer`.
+- **Not possible within these bounds:** admitting a bare member by its own hash with
+  constant memory per closure; stopping one admitted request without closing its
+  connection (the only per-transfer hook costs a round trip per 16 KiB); recalling
+  bytes already delivered.
+
+### 13.4 Rejected
+
+- **A membership index so a bare member is admitted.** See decision 2. It also adds
+  state that must be kept in step with revocation, and no have/want caller needs it.
+- **A second macro kind `closure F() -> R` with its own handle.** It doubles every
+  `blob` arm in the macros, the HTTP gateway and OpenAPI, and the two handles would
+  differ in one method's behaviour. The scope belongs to the value a handler returns,
+  not to the method's name. One kind returns `Content`.
+- **Expiring idle grants.** It drops capabilities silently, it needs a sweep, and with
+  explicit revocation and a budget that fails loudly it buys nothing.

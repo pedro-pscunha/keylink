@@ -83,6 +83,7 @@ deep inside a dependency, and `persist-file` stops earlier still, inside tokio.
 | [`durable_ledger`](keylink/examples/durable_ledger.rs) | `Persist` as an observer, storing inside every turn |
 | [`firmware_depot`](keylink/examples/firmware_depot.rs) | `blob`, `send` and `tell` in one service |
 | [`cold_store`](keylink/examples/cold_store.rs) | a blob store on a disk, and the flush that commits it |
+| [`closure_share`](keylink/examples/closure_share.rs) | one grant for a whole tree, have/want, and taking the grant back; one process or two machines |
 | [`match_room`](keylink/examples/match_room.rs) | a keyed registry, two callers on one parked reply, and a `feed` clock |
 | [`substation`](keylink/examples/substation.rs) | supervision, and what a caller parked across a restart is told |
 | [`trading_desk`](keylink/examples/trading_desk/main.rs) | one scenario, run locally and over QUIC, against two backpressure policies |
@@ -144,12 +145,41 @@ A body that ends early is an error, never a short file.
 
 ### Content addressing
 
-A `blob` method returns an address; iroh-blobs moves the bytes, with verified
+A `blob` method returns `Content`; iroh-blobs moves the bytes, with verified
 resume and deduplication. keylink owns the mount, because the mount iroh-blobs'
 own documentation teaches serves every hash to every peer and accepts writes.
-Returning an address to a peer records a grant for that exact `(peer, hash)`
-pair, and a blobs request is admitted only against a grant — so every entry was
+Returning content to a peer records a grant for that exact `(peer, root)` pair,
+and a blobs request is admitted only against a grant — so every entry was
 created by an RPC that already passed its service's allowlist and layers.
+
+`Content` is one blob (`id.into()`) or a closure (`seq.into()`). A closure is a
+hash sequence built with `Blobs::add_seq`, and it is **one** grant that covers
+the sequence and every blob it lists, however many that is. The peer reaches a
+member through the root, by position; a member asked for by its own hash is
+refused unless it was granted on its own. A closure is one level deep, so a
+tree with sub-sequences is flattened into one sequence that lists every blob.
+**A closure authorizes every hash it lists**: list only what the recipient may
+read, and never hashes a peer supplied.
+
+`handle.fetch_into(&store)` fetches a closure in two steps on one dial, the
+root and then only the members the store lacks. `Blobs::missing` (and
+`handle.missing(&store)`) answer what that is, from the fetcher's own store.
+
+A grant lasts until it is revoked. `Blobs::revoke(peer, root)` and
+`Blobs::revoke_everywhere(root)` refuse the next request; a request already
+admitted finishes. `Blobs::revoke_peer(peer)` also closes the peer's live
+blobs connections, so a transfer in flight stops. Bytes already delivered stay
+with the fetcher. Remove a peer from admission first, then call `revoke_peer`:
+removing it from an allowlist does not touch its blob grants.
+
+The ledger is bounded in bytes, not in grants: `GRANT_BUDGET` is 64 MiB by
+default and `Blobs::set_grant_budget` changes it. A grant past the budget is
+answered `RemoteError::GrantsExhausted`, and nothing is evicted to make room.
+The per-grant and per-peer costs (`GRANT_COST`, `PEER_COST`) are derived from
+type sizes, not measured. Grants die with the process.
+
+The [`closure_share`](keylink/examples/closure_share.rs) example runs it end to
+end, in one process or between two machines.
 
 ### Schema safety
 
@@ -433,7 +463,7 @@ the signature.
 It carries `rpc` and none of the other four kinds, because `rpc` is the only kind
 all four surfaces declare: an `ActorRef` and an `IdempotentClient` have no `tell`,
 a `Handle` has no `send` or `recv`, `ActorRef` has no validly servable `send`,
-and `blob` answers a `BlobId` locally
+and `blob` answers a `Content` locally
 against a `BlobHandle` — a content address plus the node that holds it —
 remotely. One behaviour diverges across the bound, and it is documented rather
 than papered over: a handler panic **unwinds into the calling task** against a
@@ -863,6 +893,17 @@ example of that model against an unmodified client. Its upload is a second
 service on a second ALPN, registered beside it on the same node, because a
 `send` method cannot be served as an actor — the split every actor with a bulk
 transfer now has to make.
+
+One grant for a whole tree, between two machines on n0's public relays and
+discovery (a bare `EndpointId` is enough to dial):
+
+```sh
+cargo run -p keylink --example closure_share -- serve                  # machine A, prints its id
+cargo run -p keylink --example closure_share -- fetch <endpoint-id>    # machine B
+```
+
+`fetch` ends with `closure_share: OK` or exits non-zero. With no arguments the
+same flow runs in one process, which is what `mise run examples` does.
 
 ## Working on it
 
