@@ -212,6 +212,14 @@ impl Trust {
     pub fn presentation(&self) -> ServiceBuilder<present::wire::Request, present::wire::Response> {
         present::service(self.clone())
     }
+    fn current(&self, credential: &Credential, now: Timestamp) -> bool {
+        let mut store = self.store();
+        if credential.chain().links().is_empty() {
+            store.roots.contains(&credential.holder())
+        } else {
+            store.standing(credential.chain(), now).is_ok()
+        }
+    }
     fn admitting(&self, peer: PublicKey) -> bool {
         self.store()
             .credential(peer, Timestamp::now(), |_| true)

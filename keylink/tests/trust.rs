@@ -400,3 +400,59 @@ async fn revocation_closes_every_connection_across_two_alpns() {
     );
     assert_eq!(b.read().await.unwrap_err().refusal(), Some(Refusal::Denied));
 }
+
+struct PolicyBarrier {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl Access for PolicyBarrier {
+    async fn authorize(&self, _call: Call<'_>) -> Result<(), AccessError> {
+        let ready = self.release.notified();
+        let _ = self.entered.send(());
+        ready.await;
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn revoking_the_selected_chain_during_access_refuses_dispatch() {
+    let (root, device, _, trust) = fixture();
+    let selected = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/a", 0),
+    )
+    .unwrap()]);
+    let alternative = Chain::new(vec![Certificate::issue(
+        &root,
+        grant(device.public(), "repo/b", 0),
+    )
+    .unwrap()]);
+    trust.insert(selected.clone()).unwrap();
+    trust.insert(alternative).unwrap();
+    let node = Node::bind_local().await.unwrap();
+    let peer = Node::bind_local_with_secret(device).await.unwrap();
+    let (entered, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let service = trust
+        .guard::<files::Request, _>(PolicyBarrier {
+            entered,
+            release: release.clone(),
+        })
+        .resource(file_resource)
+        .install(|allow| files::service(Files(Arc::new(AtomicUsize::new(0))), allow))
+        .build();
+    let _running = Server::builder(&node).service(service).spawn().unwrap();
+    let client = files::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .unwrap();
+    let pending = tokio::spawn(async move { client.read("repo/a/file".into()).await });
+    observed.recv().await.unwrap();
+    assert!(trust
+        .apply(Change::Revoke(Revocation::issue(
+            &root,
+            selected.links()[0].id()
+        )))
+        .is_empty());
+    assert_eq!(trust.live(), 1);
+    release.notify_one();
+    denied(pending.await.unwrap().unwrap_err());
+}

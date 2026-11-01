@@ -199,6 +199,14 @@ pub(crate) type Checked<'a> = std::pin::Pin<
 >;
 pub(crate) trait Preflight<Req>: Send + Sync + 'static {
     fn check<'a>(&'a self, peer: EndpointId, request: &'a Req) -> Checked<'a>;
+    fn recheck(
+        &self,
+        _peer: EndpointId,
+        _request: &Req,
+        _credential: Option<&crate::trust::Credential>,
+    ) -> std::result::Result<(), RemoteError> {
+        Ok(())
+    }
 }
 
 async fn preflight<Req: 'static>(
@@ -206,14 +214,16 @@ async fn preflight<Req: 'static>(
     peer: EndpointId,
     req: &Req,
 ) -> std::result::Result<Option<Arc<crate::trust::Credential>>, RemoteError> {
-    let mut credential = None;
+    let mut checked = Vec::with_capacity(required.len());
     for policy in required {
-        let checked = policy.check(peer, req).await?;
-        if credential.is_none() {
-            credential = checked;
-        }
+        checked.push(policy.check(peer, req).await?);
     }
-    Ok(credential)
+    // A later asynchronous policy can outlive an earlier one's decision.
+    // Recheck every exact credential, not whichever alternative now admits peer.
+    for (policy, credential) in required.iter().zip(&checked) {
+        policy.recheck(peer, req, credential.as_deref())?;
+    }
+    Ok(checked.into_iter().flatten().next())
 }
 
 /// Serves one protocol: authorizes the peer once per connection, then answers

@@ -110,7 +110,20 @@ impl<Req: Rpc + 'static, W: Carries<Req> + Sync, A: Access> Preflight<W> for Gua
                     AccessError::Forbidden => RemoteError::Unauthorized(method.to_owned()),
                     AccessError::Unavailable => RemoteError::AccessUnavailable,
                 })?;
+            self.recheck(peer, request, Some(&credential))?;
             Ok(Some(credential))
         })
+    }
+    fn recheck(
+        &self,
+        _peer: EndpointId,
+        request: &W,
+        credential: Option<&Credential>,
+    ) -> Result<(), RemoteError> {
+        if credential.is_some_and(|c| self.trust.current(c, Timestamp::now())) {
+            Ok(())
+        } else {
+            Err(RemoteError::Unauthorized(request.method().to_owned()))
+        }
     }
 }
