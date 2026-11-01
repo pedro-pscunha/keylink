@@ -58,7 +58,10 @@ impl<Req: Rpc + 'static, A: Access> Guard<Req, A> {
         }
     }
     /// Extract a resource from a typed request. On keyed services it refines the
-    /// actor id to `actor/extracted`. A missing name never matches a narrow scope.
+    /// actor id to `actor/extracted`. If extraction returns `None`, a keyed
+    /// call authorizes the actor id itself; a singleton has no resource and
+    /// passes only an unrestricted resource scope. This is not a missing-name
+    /// rejection policy: return an explicit name when the request needs one.
     #[must_use]
     pub fn resource(mut self, extract: Extract<Req>) -> Self {
         self.resource = Some(extract);
