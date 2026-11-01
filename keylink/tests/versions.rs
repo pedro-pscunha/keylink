@@ -616,3 +616,129 @@ async fn a_closed_older_codec_cannot_block_renegotiation() {
     assert_eq!(peer.connect().await.unwrap().version().label(), 3);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
+
+mod blob_versions {
+    use super::*;
+    static REPLACEMENT: std::sync::OnceLock<keylink::BlobId> = std::sync::OnceLock::new();
+    mod old {
+        keylink::service! { service Content; version 1; blob Get(mode: u8) -> u8; }
+    }
+    keylink::service! {
+        service Content; version 2;
+        blob Get(mode: u8) -> u8;
+        previous 1 { hash old::content::VERSION.hash(); changed blob Get(mode: u8) -> u8; }
+    }
+    impl content::version_1::Convert for content::version_1::Step {
+        fn upgrade_request(
+            r: content::version_1::Request,
+        ) -> Result<content::Request, Unsupported> {
+            match r {
+                content::version_1::Request::Get { mode } => Ok(content::Request::Get { mode }),
+                _ => unreachable!(),
+            }
+        }
+        fn downgrade_request(
+            r: content::Request,
+        ) -> Result<content::version_1::Request, Unsupported> {
+            match r {
+                content::Request::Get { mode } => Ok(content::version_1::Request::Get { mode }),
+                _ => unreachable!(),
+            }
+        }
+        fn upgrade_response(
+            r: content::version_1::Response,
+        ) -> Result<content::Response, Unsupported> {
+            match r {
+                content::version_1::Response::Get(v) => Ok(content::Response::Get(v)),
+                _ => unreachable!(),
+            }
+        }
+        fn downgrade_response(
+            r: content::Response,
+        ) -> Result<content::version_1::Response, Unsupported> {
+            match r {
+                content::Response::Get((0, _)) => {
+                    Err(Unsupported::new("Get", "no older representation"))
+                }
+                content::Response::Get((n, _)) => Ok(content::version_1::Response::Get((
+                    n,
+                    *REPLACEMENT.get().unwrap(),
+                ))),
+                _ => unreachable!(),
+            }
+        }
+    }
+    struct Handler(keylink::BlobId);
+    impl content::Handler for Handler {
+        async fn get(&self, _cx: &keylink::Context, mode: u8) -> (u8, keylink::BlobId) {
+            (mode, self.0)
+        }
+    }
+    /// Watched red: grant the current response's address instead of the
+    /// encoded response's address. The refusal leaked a grant in this isolated
+    /// test: 0 passed, 1 failed. Restored the converted grant source.
+    #[tokio::test]
+    async fn only_the_transmitted_converted_blob_is_granted() {
+        let server = node().await;
+        let caller = node().await;
+        let store = keylink::Blobs::memory();
+        let original = store.add_bytes(b"original".as_slice()).await.unwrap();
+        let replacement = store.add_bytes(b"replacement".as_slice()).await.unwrap();
+        REPLACEMENT.set(replacement).unwrap();
+        let _running = keylink::Server::builder(&server)
+            .service(
+                content::service(Handler(original), Allowlist::anyone())
+                    .with_blobs(&store)
+                    .build(),
+            )
+            .spawn()
+            .unwrap();
+        let c = old::content::Client::connect(&caller, server.endpoint().addr())
+            .await
+            .unwrap();
+        assert!(matches!(
+            c.get(0).await,
+            Err(Error::Remote(
+                keylink::RemoteError::UnsupportedResponse { .. }
+            ))
+        ));
+        let guessed = keylink::BlobHandle::new(&caller, server.endpoint().addr(), original);
+        assert!(
+            matches!(guessed.verified_len().await, Err(Error::BlobRefused { .. })),
+            "a conversion refusal must grant no address"
+        );
+        let (metadata, handle) = c.get(1).await.unwrap();
+        assert_eq!(metadata, 1);
+        assert_eq!(handle.id(), replacement);
+        assert_eq!(handle.verified_len().await.unwrap(), 11);
+        assert!(
+            matches!(guessed.verified_len().await, Err(Error::BlobRefused { .. })),
+            "the unsent current address must remain ungranted"
+        );
+        // The shared ledger holds the current address. A retry negotiated at
+        // current must grant that address even if the first reply carried another.
+        let key = keylink::IdempotencyKey::new("blob-replay").unwrap();
+        let old_raw =
+            keylink::RpcClient::connect(&caller, server.endpoint().addr(), old::content::lineage())
+                .await
+                .unwrap();
+        let _ = old_raw
+            .with_idempotency(key.clone())
+            .call(
+                old::content::Request::Get { mode: 1 },
+                keylink::Body::empty(),
+            )
+            .await
+            .unwrap();
+        let current_raw =
+            keylink::RpcClient::connect(&caller, server.endpoint().addr(), content::lineage())
+                .await
+                .unwrap();
+        let _ = current_raw
+            .with_idempotency(key)
+            .call(content::Request::Get { mode: 1 }, keylink::Body::empty())
+            .await
+            .unwrap();
+        assert_eq!(guessed.verified_len().await.unwrap(), 8);
+    }
+}

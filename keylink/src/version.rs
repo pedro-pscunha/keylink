@@ -257,6 +257,16 @@ impl<Req: 'static, Resp: 'static, P: Toward<Req, Resp>> Toward<Addressed<Req>, R
     }
 }
 
+pub(crate) enum GrantSource {
+    Current(Option<crate::BlobId>),
+    Recorded,
+}
+pub(crate) struct EncodedReply {
+    pub(crate) frame: Bytes,
+    pub(crate) carry_body: bool,
+    pub(crate) grant: Option<crate::BlobId>,
+}
+
 pub(crate) trait Codec<Req, Resp>: Send + Sync + fmt::Debug {
     fn encode_request(
         &self,
@@ -270,7 +280,7 @@ pub(crate) trait Codec<Req, Resp>: Send + Sync + fmt::Debug {
         bytes: &[u8],
     ) -> Result<std::result::Result<Envelope<WireRequest<Req>>, RemoteError>>;
     /// The encoded header and whether the handler's body can follow it.
-    fn reencode_response(&self, frame: Bytes) -> Result<(Bytes, bool)>;
+    fn reencode_response(&self, frame: Bytes, grant_source: GrantSource) -> Result<EncodedReply>;
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes>;
 }
@@ -305,8 +315,9 @@ fn response_map<A, B>(
 impl<Req, Resp, P> Codec<Req, Resp> for At<P>
 where
     Req: Serialize + DeserializeOwned + 'static,
-    Resp: Serialize + DeserializeOwned + 'static,
+    Resp: Serialize + DeserializeOwned + crate::Granting + 'static,
     P: Toward<Req, Resp>,
+    P::Response: crate::Granting,
 {
     fn encode_request(
         &self,
@@ -351,9 +362,25 @@ where
                 detail: e.to_string(),
             }))
     }
-    fn reencode_response(&self, frame: Bytes) -> Result<(Bytes, bool)> {
+    fn reencode_response(&self, frame: Bytes, grant_source: GrantSource) -> Result<EncodedReply> {
         if P::CURRENT {
-            return Ok((frame, true));
+            let grant = match grant_source {
+                GrantSource::Current(grant) => grant,
+                GrantSource::Recorded => {
+                    let current: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
+                    match current.message {
+                        WireResponse::Call(Outcome::Ok(response)) => {
+                            crate::Granting::granted(&response)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            return Ok(EncodedReply {
+                frame,
+                carry_body: true,
+                grant,
+            });
         }
         let r: Envelope<WireResponse<Resp>> = postcard::from_bytes(&frame[4..])?;
         let (message, len, carry_body) = match response_map(r.message, P::down_response) {
@@ -367,10 +394,15 @@ where
                 false,
             ),
         };
-        Ok((
-            wire::encode_header(len, r.idempotency.as_ref(), &message)?,
+        let grant = match &message {
+            WireResponse::Call(Outcome::Ok(response)) => crate::Granting::granted(response),
+            _ => None,
+        };
+        Ok(EncodedReply {
+            frame: wire::encode_header(len, r.idempotency.as_ref(), &message)?,
             carry_body,
-        ))
+            grant,
+        })
     }
     #[cfg(feature = "persist")]
     fn upgrade_recorded(&self, frame: &[u8]) -> Option<Bytes> {
@@ -393,9 +425,12 @@ pub struct Lineage<Req, Resp> {
 impl<Req, Resp> Lineage<Req, Resp>
 where
     Req: Serialize + DeserializeOwned + 'static,
-    Resp: Serialize + DeserializeOwned + 'static,
+    Resp: Serialize + DeserializeOwned + crate::Granting + 'static,
 {
-    pub fn new<P: Toward<Req, Resp>>(protocol: &'static str, current: Version) -> Self {
+    pub fn new<P: Toward<Req, Resp>>(protocol: &'static str, current: Version) -> Self
+    where
+        P::Response: crate::Granting,
+    {
         let mut this = Self {
             entries: Vec::new(),
             probe: crate::derive_alpn::<ProbeReply>(&format!("{protocol}/versions")),
@@ -408,11 +443,17 @@ where
         this
     }
     #[must_use]
-    pub fn previous<P: Toward<Req, Resp>>(mut self, version: Version) -> Self {
+    pub fn previous<P: Toward<Req, Resp>>(mut self, version: Version) -> Self
+    where
+        P::Response: crate::Granting,
+    {
         self.push::<P>(version);
         self
     }
-    fn push<P: Toward<Req, Resp>>(&mut self, version: Version) {
+    fn push<P: Toward<Req, Resp>>(&mut self, version: Version)
+    where
+        P::Response: crate::Granting,
+    {
         self.entries.push(Entry {
             version,
             alpn: version.alpn(&self.window.service),
@@ -549,6 +590,16 @@ pub(crate) async fn read_probe(connection: &Connection, service: &str) -> PeerWi
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+    impl crate::Granting for u8 {
+        fn granted(&self) -> Option<crate::BlobId> {
+            None
+        }
+    }
+    impl crate::Granting for u64 {
+        fn granted(&self) -> Option<crate::BlobId> {
+            None
+        }
+    }
     fn window(labels: &[u32]) -> Window {
         Window {
             service: "p/S".into(),
@@ -605,7 +656,11 @@ mod tests {
         };
         let current = wire::encode_header(Some(17), None, &WireResponse::Call(Outcome::Ok(7_u8)))
             .expect("encodes");
-        let (frame, carry_body) = codec.reencode_response(current).expect("refusal encodes");
+        let encoded = codec
+            .reencode_response(current, None)
+            .expect("refusal encodes");
+        let frame = encoded.frame;
+        let carry_body = encoded.carry_body;
         assert!(
             !carry_body,
             "a conversion refusal must not stream the current body's bytes"

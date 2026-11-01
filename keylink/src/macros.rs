@@ -5687,17 +5687,6 @@ macro_rules! __keylink_service {
             /// store and the [`AdmittedPeer`](keylink::AdmittedPeer) the grant
             /// must be recorded against. The handler has neither and needs
             /// neither: returning the id is the whole of its part.
-            impl $crate::Granting for Response {
-                fn granted(&self) -> ::core::option::Option<$crate::Content> {
-                    match self {
-                        $( $( #[$cfg] )* Self::$rpc(__value) =>
-                            $crate::__keylink_granted_id!([<$kind>], __value), )+
-                        // A status read names no content, so there is no grant
-                        // for `serve_one` to record against the peer.
-                        Self::__Status(_) => ::core::option::Option::None,
-                    }
-                }
-            }
 
             /// Whether any method here serves content, folded at compile time.
             ///
@@ -10171,6 +10160,18 @@ macro_rules! __keylink_contract {
                 kinds: $crate::WireKinds,
             }
 
+
+            impl $crate::Granting for Response {
+                fn granted(&self) -> ::core::option::Option<$crate::Content> {
+                    match self {
+                        $( $( #[$cfg] )* Self::$rpc(__value) =>
+                            $crate::__keylink_granted_id!([<$kind>], __value), )+
+                        // A status read names no content, so there is no grant
+                        // for `serve_one` to record against the peer.
+                        Self::__Status(_) => ::core::option::Option::None,
+                    }
+                }
+            }
 
             /// This build's declared contract label and derived shape hash.
             pub const VERSION: $crate::Version = $crate::Version::__new($label, $crate::__schema_hash::<Contract>(PROTOCOL));
