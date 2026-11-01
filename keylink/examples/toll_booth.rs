@@ -1,5 +1,5 @@
-//! Layers around a call, and the two budgets that answer the same way and mean
-//! opposite things.
+//! Layers around a call, and the two budgets that answer in different words and
+//! mean opposite things.
 //!
 //! ```sh
 //! cargo run -p keylink --example toll_booth
@@ -15,23 +15,22 @@
 //! [`Rpc::method`] rather than matching a service's own enum, and `Tally` below
 //! compiles against both services here without knowing either.
 //!
-//! # `Timeout` and `QueueTimeout` are not two spellings of one bound
+//! # A deadline and `QueueTimeout` are not two spellings of one bound
 //!
-//! Both answer [`RemoteError::TimedOut`], deliberately, so a peer cannot tell
-//! them apart by the refusal. What differs is what the call left behind.
+//! They answer in different words, [`RemoteError::DeadlinePassed`] and
+//! [`RemoteError::TimedOut`], because they say opposite things about the work.
+//! What differs is what the call left behind.
 //!
-//! | layer | refuses | the key it carried |
+//! | bound | says | the key it carried |
 //! |---|---|---|
-//! | [`Timeout`] | a call that is running | settles `Interrupted`, and every retry is refused for good |
-//! | [`QueueTimeout`] | a message that never started | stays claimable, so the retry is a first attempt |
+//! | [`deadline`](keylink::ServiceBuilder::deadline) | the service stopped waiting, and the work was not cancelled | stays running and settles as what the call really returned, so a retry is handed that answer |
+//! | [`QueueTimeout`] | a message never started, and nothing ran | stays claimable, so the retry is a first attempt |
 //!
-//! **Act 3 measures the bottom row and nothing here measures the top one.** The
-//! `Interrupted` claim is `keylink/src/middleware.rs`'s, not this file's: act 2
-//! puts `Timeout` on a `Handler`, where dropping the future genuinely cancels
-//! the work, and no keyed call in this file passes through a `Timeout` layer. On
-//! an *actor* that layer drops the wait for the reply and cancels nothing — the
-//! turn runs to completion whatever the caller does — which is why it is the
-//! liveness backstop for a turn that never returns rather than load shedding.
+//! **Act 2 measures the top row and act 3 the bottom one.** An unkeyed call on a
+//! `Handler` has nothing to settle, so its future is dropped where it stands. A
+//! keyed one is awaited to the end, so the retry gets the real answer and the
+//! work runs once. On an *actor* a deadline cancels no turn either way: the turn
+//! runs to completion whatever the caller does.
 //!
 //! # A limit is a decision, and `Forgotten` is what it produces
 //!
@@ -53,7 +52,7 @@ use keylink::prelude::*;
 use keylink::{
     Allowlist, Body, BodyReader, Caller, Context, Error, IdempotencyKey, IdempotencyRefusal,
     KeyState, Limits, Middleware, Next, Node, Outcome, QueueTimeout, QueueTimeoutError,
-    RemoteError, Rpc, Server, Timeout,
+    RemoteError, Rpc, Server,
 };
 use tokio::sync::mpsc;
 
@@ -203,8 +202,8 @@ fn one() -> Result<NonZeroUsize, Box<dyn StdError>> {
 async fn main() -> Result<(), Box<dyn StdError>> {
     // ── 1. A layer that observes, and a layer that refuses.
     //
-    //  Both on a `Handler`, where dropping the future genuinely cancels the
-    //  work. That is the shape `Timeout` is written for.
+    //  Both on a `Handler`, where dropping the future of an unkeyed call genuinely
+    //  cancels the work.
     let booth_node = Node::bind_local().await?;
     let caller_node = Node::bind_local().await?;
     let tally = Tally::new("Ledger");
@@ -212,7 +211,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .service(
             booth::service(Booth::default(), Allowlist::anyone())
                 .layer(tally.clone())
-                .layer(Timeout::after(Duration::from_millis(150)))
+                .deadline(Duration::from_millis(150))
                 .build(),
         )
         .spawn()?;
@@ -229,18 +228,22 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         "got {refused:?}"
     );
 
-    // ── 2. `Timeout` on a handler, where the budget really does cancel.
+    // ── 2. A deadline on a handler: an unkeyed call is cancelled, a keyed one is not.
     //
-    //  The handler sleeps 600 ms and the budget is 150 ms, so the future is
-    //  dropped where it stands and the counter it would have incremented never
-    //  moves. That is the measurement; the refusal alone would not show it.
+    //  The handler sleeps 600 ms and the budget is 150 ms, so the caller is told
+    //  at 150 ms and the future is dropped where it stands: the counter it would
+    //  have incremented never moves. That is the measurement; the refusal alone
+    //  would not show it.
     let timed_out = caller
         .stall(600)
         .await
         .err()
         .ok_or("a handler over its budget must be refused")?;
     assert!(
-        matches!(timed_out, Error::Remote(RemoteError::TimedOut { .. })),
+        matches!(
+            timed_out,
+            Error::Remote(RemoteError::DeadlinePassed { millis: 150 })
+        ),
         "got {timed_out:?}"
     );
     n0_future::time::sleep(Duration::from_millis(700)).await;
@@ -251,6 +254,47 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!("the handler was cancelled at its budget and never finished: {timed_out}");
     assert_eq!(tally.counted("Stall"), 1, "the layer saw the call it timed");
+
+    //  The same overrun under a key. The caller is told at 150 ms all the same,
+    //  but the call is not dropped: the service goes on waiting for the handler,
+    //  and the key settles as what it really returned. The retry attaches to the
+    //  call still running and is handed that answer, and the handler ran once.
+    //  The retry sends the same request, as a retry must: a key is bound to the
+    //  bytes of the call it first met, and a different argument under it is
+    //  refused as a mismatch.
+    let key = IdempotencyKey::new("stall-1")?;
+    let passed = caller
+        .with_idempotency(key.clone())
+        .stall(300)
+        .await
+        .err()
+        .ok_or("the deadline passes while the keyed handler runs")?;
+    assert!(
+        matches!(
+            passed,
+            Error::Remote(RemoteError::DeadlinePassed { millis: 150 })
+        ),
+        "got {passed:?}"
+    );
+    let answer = caller
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key,
+            Duration::from_secs(10),
+        ))
+        .stall(300)
+        .await?;
+    assert_eq!(
+        answer, 300,
+        "the retry is handed the first call's real answer"
+    );
+    assert_eq!(
+        caller.finished().await?,
+        1,
+        "and the handler ran to the end exactly once"
+    );
+    println!(
+        "a keyed call past its deadline finished anyway, and its retry got the answer: {answer}"
+    );
 
     // ── 3. `QueueTimeout` on an actor, and the key it leaves behind.
     //

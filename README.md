@@ -345,7 +345,7 @@ configuration error, not a last-one-wins race.
 
 A `Middleware` sees the request *typed*, so a per-method rule is a `match` on
 the real enum. Make the impl generic over `Req: Rpc` and one layer covers every
-service you ever define. `Timeout` ships with the crate.
+service you ever define. `QueueTimeout` ships with the crate.
 
 ### Actors, when shared state is the awkward part
 
@@ -368,12 +368,12 @@ state. Under the concurrent model that same edit fails the build, because
 `clippy::await_holding_lock` is deny-level here and a `std::sync` guard is what
 `&self` state needs.
 
-Two costs, both structural. A turn is not cancellable: dropping the call does
-not stop the handler, and a layer such as `Timeout` refuses the caller without
-ending the turn. The way to keep a slow step from holding the actor is to take it
-out of the turn with `Deferred::away`, below. And an actor must not call itself:
-keylink detects a re-entrant local call by actor identity and refuses it instead
-of relying on mailbox depth.
+Two costs, both structural. A turn is never cancelled: dropping the call does not
+stop the handler, and a deadline answers the caller without ending the turn. Two
+remedies, both below: a deadline bounds the caller's wait and sheds work that has
+not started, and `Deferred::away` takes a slow step out of the turn so it does not
+hold the actor. And an actor must not call itself: keylink detects a re-entrant
+local call by actor identity and refuses it instead of relying on mailbox depth.
 
 ### Local mailbox policy
 
@@ -517,6 +517,32 @@ reference to the state. It is not durable: a crash loses it, and the actor
 reconciles what was pending on restart. `stop` does not wait for it to finish. Calling `away` outside a turn, or with another state
 type than the running turn's, drops the work and tells the caller `Dropped` on the
 first call.
+
+### A deadline ends the wait, never the work
+
+`ServiceBuilder::deadline(budget)` answers `RemoteError::DeadlinePassed` to any
+call with no answer after `budget`, and a caller can set a shorter one of its own
+with `with_deadline`, which travels in the request. Neither cancels anything. An
+unkeyed call's answer is discarded, and a concurrent `Handler`'s future is dropped
+where it stands. A running turn finishes. A keyed call is awaited to the end and
+its key settles as what the call really returned, so a retry with the same key
+attaches to it or replays its answer and the work runs once.
+
+```rust
+let reserved = client
+    .with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(30)))
+    .with_deadline(Duration::from_secs(2))
+    .reserve("ADU-014".into(), 2)
+    .await;
+// Err(Error::DeadlinePassed { .. }) here is the caller's own timer. Retry with the same key.
+```
+
+The budget is also stamped on the call as a queueing bound, as `QueueTimeout`
+does, so a message that is still queued when the caller stops waiting never
+starts and its key stays claimable. The caller's own error is
+`Error::DeadlinePassed`, and it knows nothing about the far side: the call may not
+have arrived, may be running, or may have finished with its reply lost. It does
+not bound the body of a `recv` reply, and the blocking clients do not take one.
 
 ### Many instances behind one ALPN
 
@@ -873,10 +899,10 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    encoding of one service's own response type.
 6. **`Interrupted` is permanent, and it is the answer that needs a decision.** A
    call whose handler was entered and produced no reply — a dead connection, a
-   shutdown, a layer that stopped waiting after dispatch — settles the key as
-   `Interrupted`. Whether the work took effect is genuinely unknown and no record
-   can make it known, so retrying that key is refused forever, by design. What a
-   caller *does*: reconcile against its own domain, then issue a **new** key.
+   shutdown — settles the key as `Interrupted`. Whether the work took effect is
+   genuinely unknown and no record can make it known, so retrying that key is
+   refused forever, by design. What a caller *does*: reconcile against its own
+   domain, then issue a **new** key.
    `client.key_state(key).await` asks without running anything, which is the only
    way to learn a state you are not willing to discover by executing.
 7. **A `feed` has no delivery guarantee at all.** It is a local stream into an
@@ -1112,14 +1138,14 @@ Known gaps, in rough priority order:
   cannot open a UDP socket, so QUIC is out of reach whatever keylink does.
   Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
-- **A running actor turn cannot be bounded from outside.** `Timeout` drops the
-  wait for the reply, not the turn, so it sheds no load once a turn has started.
-  It no longer settles an idempotency key as its own refusal — a turn that ran
-  leaves `Interrupted`, which is the truth — but the retry does not receive the
-  turn's real reply either. `QueueTimeout` is the half that does shed load: it
-  refuses a message that has not started, and leaves its key claimable, because
-  nothing ran. Past that point, bound the work inside the method, or take the slow
-  step out of the turn with `Deferred::away`. RFC-05 §7.
+- **A turn is never cancelled.** A deadline bounds the caller's wait and sheds work
+  that has not started; slow work goes off the turn with `Deferred::away`. A
+  deadline's answer to a caller does not stop a turn that is running, so it sheds
+  nothing once the turn has started, and a wedged keyed turn keeps its key
+  `Running` past the caller's deadline, bounded by the per-peer running cap. It
+  does record the turn's real reply under the key, so the retry receives it.
+  `QueueTimeout` and a deadline both refuse a message that has not started, and
+  leave its key claimable, because nothing ran.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - Idempotency records are in memory by default, so a retry across a restart

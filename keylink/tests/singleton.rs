@@ -757,12 +757,13 @@ async fn a_concurrent_service_refuses_status_by_name() {
 // ───────────────────────────────────────────────────── shedding queued load
 
 /// `QueueTimeout` refuses a message that is still **queued** and never one that
-/// has started, which is the whole difference from `Timeout`.
+/// has started.
 ///
-/// `Timeout` on this path drops the wait for the reply and the turn runs to
-/// completion anyway, so ten callers get `TimedOut` and the actor still spends
-/// ten turns producing replies nobody wants. This one refuses before the work
-/// starts, so the load is genuinely shed.
+/// A deadline's answer to a caller does not stop a turn that is running, so ten
+/// callers get `DeadlinePassed` and the actor still spends ten turns producing
+/// replies nobody wants. This one refuses before the work starts, so the load is
+/// genuinely shed. (A deadline sheds the messages that were still queued too, by
+/// stamping the same bound; see `a_deadline_sheds_...` below.)
 ///
 /// The proof is the run counter: one turn was held while the second message
 /// waited behind it past its budget, the second message was refused, and the
@@ -835,7 +836,7 @@ async fn a_queue_timeout_refuses_before_the_mailbox() {
 
 /// The other half, and the one that makes `QueueTimeout` safe to combine with
 /// an idempotency key: a message it refuses never ran, so the key is still
-/// claimable. `Timeout` cannot promise that, because it cannot tell.
+/// claimable.
 ///
 /// Made red by the `began` edit recorded on the test above. Watched:
 /// `refused while queued: 2`.
@@ -938,7 +939,9 @@ struct BehindAHeldTurn {
 /// message it reports on was already in the mailbox, so FIFO decides what it
 /// sees. Nothing waits on a clock to decide whether a turn has run.
 async fn entries_behind_a_held_turn(
-    bound: impl Middleware<ledger::Request, ledger::Response>,
+    bound: impl FnOnce(
+        keylink::ServiceBuilder<ledger::Request, ledger::Response>,
+    ) -> keylink::ServiceBuilder<ledger::Request, ledger::Response>,
 ) -> BehindAHeldTurn {
     let node = local_node().await;
     let caller = local_node().await;
@@ -948,7 +951,7 @@ async fn entries_behind_a_held_turn(
         ..Ledger::default()
     });
     let server = Server::builder(&node)
-        .service(actor.service(Allowlist::anyone()).layer(bound).build())
+        .service(bound(actor.service(Allowlist::anyone())).build())
         .spawn()
         .expect("serves");
     let client = ledger::Client::connect(&caller, node.endpoint().addr())
@@ -977,10 +980,11 @@ async fn entries_behind_a_held_turn(
     assert!(
         matches!(
             refused,
-            keylink::Error::Remote(RemoteError::TimedOut { .. })
+            keylink::Error::Remote(
+                RemoteError::TimedOut { .. } | RemoteError::DeadlinePassed { .. }
+            )
         ),
-        "both bounds refuse this message, and the difference is what the actor does about it \
-         afterwards; got {refused:?}"
+        "both bounds refuse this message, and they say it in two words; got {refused:?}"
     );
     assert_eq!(held.await.expect("no panic").expect("running"), 1);
 
@@ -988,7 +992,18 @@ async fn entries_behind_a_held_turn(
     // message ran after its caller had already given up on it.
     let before_the_retry = actor.entries().await.expect("running");
 
-    let retry = client.with_idempotency(key).post(2, 0).await;
+    // Attaching, because a deadline answers its caller **before** the shed message
+    // is taken off the mailbox and the key is given back. A bare key retried that
+    // quickly could still find the first call running; one that attaches waits for
+    // it and then claims the key afresh, which is how a retry after a deadline is
+    // meant to be written.
+    let retry = client
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key,
+            Duration::from_secs(30),
+        ))
+        .post(2, 0)
+        .await;
 
     // Local, and issued last, so it sits behind every message above in the one
     // mailbox. FIFO, not a wall-clock guess about when the refused turn ran.
@@ -1001,69 +1016,57 @@ async fn entries_behind_a_held_turn(
     }
 }
 
-/// The two bounds through one scenario: each runs a keyed message **once**, and
-/// they differ in which retry is allowed to be that once.
+/// The two bounds through one scenario: each sheds a keyed message that was still
+/// queued, and each leaves its key claimable, so the retry is the one time the
+/// work happens.
 ///
-/// `Timeout` sits outside the mailbox, so its budget expiring drops the wait for
-/// the reply and not the turn: the caller reads `TimedOut` while the message is
-/// queued, and the turn runs anyway. The key therefore settles `Interrupted` and
-/// the retry is refused — the honest answer, because nobody can say from out
-/// there whether the work landed. `QueueTimeout` is re-read on the actor's own
-/// task, so a message it refuses genuinely never runs and giving the key back is
-/// the truth: the retry is a first attempt and it is what does the work.
+/// `QueueTimeout` is re-read on the actor's own task, so a message it refuses
+/// genuinely never runs and giving the key back is the truth. A deadline stamps
+/// the same bound on the call, so it sheds the same message for the same reason.
+/// What differs is the word the caller is told: `TimedOut` for the first, which
+/// says the message waited past its budget and nothing ran, and `DeadlinePassed`
+/// for the second, which says the service stopped waiting and makes no claim
+/// about the work. Here the work did not run, and the actor's own entry list says
+/// so.
 ///
-/// # This inverts a pin that recorded a defect
+/// # This inverts a pin that recorded the layer it replaced
 ///
-/// The `Timeout` half used to assert `[1, 2, 2]` and a retry that succeeded:
-/// nothing marked a still-queued message, the ledger gave the key back, the turn
-/// ran, and the retry ran the same work a second time — at-least-once, out of
-/// the module whose one promise is at-most-once. That pin asked to be changed
-/// deliberately by whoever fixed the behaviour, and RFC-04 §16.12 is that
-/// commit: the progress marker records reaching a mailbox as its own fact, which
-/// an arm that knows nothing ran then overrides.
+/// The deadline half used to be a `Timeout` layer, which sat outside the mailbox:
+/// its budget expiring dropped the wait for the reply and not the turn, the turn
+/// ran anyway (`[1, 2]`), and the key settled `Interrupted` so the retry was
+/// refused. That was the honest answer for a layer that could not see where the
+/// message was. The deadline lives in `serve_one`, where the key's guard is, and
+/// the same bound that answers the caller sheds the message.
 ///
-/// Still **one** test, for the reason the pin gave: either half alone says
-/// nothing about the difference between the two bounds, and that difference is
-/// the whole of what `Timeout`'s and `QueueTimeout`'s rustdoc promise a reader.
-/// It is now a difference in the key and not in the work.
+/// Still **one** test, for the reason the pin gave: either half alone says nothing
+/// about the other, and what they share is the property this file is about.
 ///
-/// The `Timeout` half is made red by `scripts/break-once.sh` on
-/// `keylink/src/middleware.rs`, replacing `Timeout::handle`'s
-/// `n0_future::time::timeout(budget, next(cx, req, body))` with the same call at
-/// `Duration::from_secs(3600)` — a bound that never fires. Watched: `the queued
-/// message outlives its budget behind the held turn: 2`. The `QueueTimeout` half
-/// goes red on the `began` edit recorded above.
+/// Both halves go red on the `began` edit recorded above, because a deadline sheds
+/// through the same queueing bound a `QueueTimeout` stamps.
 #[tokio::test]
-async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it_claimable() {
-    let timed_out = entries_behind_a_held_turn(keylink::Timeout::after(BUDGET)).await;
+async fn a_deadline_sheds_a_queued_message_like_a_queue_timeout_and_leaves_its_key_claimable() {
+    let deadline = entries_behind_a_held_turn(|service| service.deadline(BUDGET)).await;
     assert_eq!(
-        timed_out.before_the_retry,
-        vec![1, 2],
-        "the turn ran after its caller was told TimedOut, which is `turns.rs`'s promise that \
-         dropping the wait does not cancel the turn"
-    );
-    let refused = timed_out
-        .retry
-        .expect_err("the key of a message that was queued when its caller gave up must settle");
-    assert!(
-        matches!(
-            refused,
-            keylink::Error::Remote(RemoteError::Idempotency(
-                keylink::IdempotencyRefusal::Interrupted
-            ))
-        ),
-        "a caller that cannot be told whether its work landed must be refused rather than \
-         invited to run it again; got {refused:?}"
+        deadline.before_the_retry,
+        vec![1],
+        "a message the deadline stamped as queued never ran, which is what makes releasing \
+         its key the truth"
     );
     assert_eq!(
-        timed_out.entries,
+        deadline
+            .retry
+            .expect("the key must still be claimable, because the shed proved nothing ran"),
+        2,
+    );
+    assert_eq!(
+        deadline.entries,
         vec![1, 2],
-        "the refused retry must not have run the work a second time"
+        "the retry under the released key is the only time the work happened"
     );
 
-    let queued = entries_behind_a_held_turn(
-        keylink::QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"),
-    )
+    let queued = entries_behind_a_held_turn(|service| {
+        service.layer(keylink::QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"))
+    })
     .await;
     assert_eq!(
         queued.before_the_retry,

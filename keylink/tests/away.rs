@@ -202,6 +202,20 @@ async fn launched(desk: &desk::Handle<Desk>, want: u64) {
 
 // ───────────────────────────────────────────── the actor serves while work is away
 
+/// Records the name every turn is observed under.
+struct Naming(Arc<Mutex<Vec<&'static str>>>);
+
+impl Observer<Desk> for Naming {
+    fn name(&self) -> &'static str {
+        "naming"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Desk, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        self.0.lock().unwrap().push(turn.method);
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// An hour of work does not hold the actor, and the work comes back as a turn.
 ///
 /// The ordering is the proof, and it needs no clock: with the work an hour long on
@@ -214,7 +228,7 @@ async fn launched(desk: &desk::Handle<Desk>, want: u64) {
 /// constant it bounds. It exists so that a `back` turn that never comes fails the
 /// test instead of hanging it.
 ///
-/// Made red twice, by `scripts/break-once.sh`.
+/// Made red three times, by `scripts/break-once.sh`.
 ///
 /// The work run inline: `keylink/tests/away.rs`, this file, so the search edit is
 /// described and not quoted. In `Desk::land`, the eight-space-indented statement
@@ -229,10 +243,19 @@ async fn launched(desk: &desk::Handle<Desk>, want: u64) {
 /// Poll::<Option<Result<(&'static str, Comeback<A>), n0_future::task::JoinError>>>::Pending {`.
 /// The work finishes and nothing runs it, so the bounded wait fails with `a back
 /// turn never came: Elapsed(())`.
+///
+/// The back turn left unnamed: `keylink/src/turns.rs`, in `Deferred::away`,
+/// `let method = reply.method;` (indented eight spaces) replaced by `let method =
+/// "";`. The observer then sees the back turn under no name, and the last
+/// assertion fails with `the launching turn and the back turn are both named for
+/// the call: ["Launched", "Land", "Launched", "Applied", "", "Applied"]`.
 #[tokio::test(start_paused = true)]
 async fn a_slow_off_turn_step_does_not_hold_the_actor() {
     const SLOW: Duration = Duration::from_secs(3600);
-    let desk = desk::actor(Desk::new(Work::Sleep(SLOW)));
+    let names = Arc::new(Mutex::new(Vec::new()));
+    let desk = desk::setup(Desk::new(Work::Sleep(SLOW)))
+        .observe(Naming(Arc::clone(&names)))
+        .actor();
 
     let landing = {
         let desk = desk.clone();
@@ -253,6 +276,16 @@ async fn a_slow_off_turn_step_does_not_hold_the_actor() {
         .expect("the caller is not itself panicking");
     assert_eq!(landed.expect("the actor is running"), 1);
     assert_eq!(desk.applied().await.expect("the actor is running"), 1);
+
+    // The back turn is a turn like any other, observed under the method of the
+    // call it answers: `Land` ran twice, once to launch and once to come back.
+    let names = names.lock().unwrap();
+    assert_eq!(
+        names.iter().filter(|name| **name == "Land").count(),
+        2,
+        "the launching turn and the back turn are both named for the call: {names:?}"
+    );
+    assert!(!names.contains(&""), "no turn goes unnamed: {names:?}");
 }
 
 // ─────────────────────────────────────────────── the actor ending cancels the work

@@ -426,8 +426,8 @@ impl From<RouteError> for RemoteError {
 /// # The send succeeding is itself a fact the key needs
 ///
 /// Once the permit is in hand the message will be taken, and nothing above this
-/// can stop it. A caller that gives up from here on — a
-/// [`Timeout`](crate::Timeout) expiring, an aborted connection task — is giving
+/// can stop it. A caller that gives up from here on — an aborted connection
+/// task, because the connection ended — is giving
 /// up on work that runs anyway, so `enqueued()` is marked and the key settles
 /// `Interrupted` rather than being handed back to a retry that would do the work
 /// a second time. RFC-04 §16.12.

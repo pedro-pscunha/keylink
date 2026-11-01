@@ -106,7 +106,13 @@ pub enum RemoteError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
-    /// The handler did not finish inside its budget.
+    /// The message waited past its budget and never started: nothing ran.
+    ///
+    /// Produced only by a [`QueueTimeout`](crate::QueueTimeout) budget, or by a
+    /// deadline that stamps one: the wait for a mailbox permit, or the actor
+    /// taking a message that had already expired. A call that had started and was
+    /// still running is [`DeadlinePassed`](Self::DeadlinePassed) instead, which
+    /// says the opposite about the work.
     #[error("timed out after {millis} ms")]
     TimedOut {
         /// The budget that expired.
@@ -322,6 +328,22 @@ pub enum RemoteError {
     /// The access policy could not be consulted; try later, not forbidden.
     #[error("the access policy could not be consulted")]
     AccessUnavailable,
+
+    /// The service stopped waiting for this call's answer after `millis`.
+    ///
+    /// The work was not cancelled: if it started, it runs to the end, and a keyed
+    /// call's answer is recorded under its key, so retry with the same key and
+    /// the retry attaches to it or replays it. An unkeyed call's answer is
+    /// discarded. The budget is the shorter of the service's
+    /// [`deadline`](crate::ServiceBuilder::deadline) and the caller's own.
+    ///
+    /// Appended last, like every variant before it: an insert would renumber the
+    /// ones after it.
+    #[error("no answer within the {millis} ms deadline; the work was not cancelled")]
+    DeadlinePassed {
+        /// The budget that passed.
+        millis: u64,
+    },
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.

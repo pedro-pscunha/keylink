@@ -119,6 +119,17 @@ pub(crate) struct Control {
     /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
     /// much as an actor message does.
     pub(crate) idempotency: Option<crate::Idempotency>,
+    /// How long the caller will wait for the reply, in milliseconds, counted
+    /// from the moment the serving side reads this frame.
+    ///
+    /// Relative on purpose: the two machines do not share a clock, so an
+    /// absolute time would be wrong by their skew. `None` is a caller that set no
+    /// deadline, and on every response and every `tell`. The serving side takes
+    /// the shorter of this and its own deadline.
+    ///
+    /// Inside [`Control`] and so outside the fingerprint of the message: a retry
+    /// that names a different deadline is still the same request.
+    pub(crate) wait_ms: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,10 +165,21 @@ pub(crate) async fn write_frame(stream: &mut SendStream, frame: Bytes) -> Result
     Ok(())
 }
 
-/// Build one header frame, length prefix included.
+/// Build one header frame, length prefix included, for a message that carries no
+/// deadline: every response, and every request that is not a call.
 pub(crate) fn encode_header<T: Serialize>(
     body_len: Option<u64>,
     idempotency: Option<&crate::Idempotency>,
+    message: &T,
+) -> std::result::Result<Bytes, HeaderError> {
+    encode_request_header(body_len, idempotency, None, message)
+}
+
+/// Build one header frame that names how long its sender will wait for the reply.
+pub(crate) fn encode_request_header<T: Serialize>(
+    body_len: Option<u64>,
+    idempotency: Option<&crate::Idempotency>,
+    wait_ms: Option<u64>,
     message: &T,
 ) -> std::result::Result<Bytes, HeaderError> {
     let mut buf = BytesMut::with_capacity(256);
@@ -170,6 +192,7 @@ pub(crate) fn encode_header<T: Serialize>(
             control: Control {
                 body_len,
                 idempotency: idempotency.cloned(),
+                wait_ms,
             },
             message,
         },
@@ -306,9 +329,12 @@ mod tests {
         let link = testing::link().await;
         let (mut send, _recv) = link.client.open_bi().await.unwrap();
 
-        write_header(&mut send, Some(3), None, &"hello".to_string())
-            .await
-            .unwrap();
+        write_frame(
+            &mut send,
+            encode_request_header(Some(3), None, Some(250), &"hello".to_string()).unwrap(),
+        )
+        .await
+        .unwrap();
         send.write_all(b"abc").await.unwrap();
         send.finish().unwrap();
 
@@ -318,6 +344,7 @@ mod tests {
         let header = reader.read_header::<String>().await.unwrap().unwrap();
         assert_eq!(header.message, "hello");
         assert_eq!(header.control.body_len, Some(3));
+        assert_eq!(header.control.wait_ms, Some(250));
         assert_eq!(&reader.next_chunk().await.unwrap().unwrap()[..], b"abc");
     }
 
@@ -404,6 +431,7 @@ mod tests {
                 control: Control {
                     body_len: None,
                     idempotency: None,
+                    wait_ms: None,
                 },
                 message: &long,
             },

@@ -351,7 +351,7 @@ pub use idempotency::{
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{
-    Caller, Context, Middleware, Next, QueueTimeout, QueueTimeoutError, Queueing, Rpc, Timeout,
+    Caller, Context, Middleware, Next, QueueTimeout, QueueTimeoutError, Queueing, Rpc,
 };
 pub use node::{derive_alpn, Node};
 pub use observe::{
@@ -370,11 +370,11 @@ pub use rpc::{
 pub use subscribers::Subscribers;
 #[doc(hidden)]
 pub use surfaces::RegistryDispatch;
-pub use surfaces::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+pub use surfaces::{BlockingWire, Own, Servable, Status, Wire, WithDeadline, WithIdempotency};
 
 /// Extension traits for generated caller surfaces.
 pub mod prelude {
-    pub use crate::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+    pub use crate::{BlockingWire, Own, Servable, Status, Wire, WithDeadline, WithIdempotency};
 }
 pub use turns::{
     deliver_unkeyed, feed_turn, run_keyed, run_keyed_supervised, serving_unkeyed, turn,

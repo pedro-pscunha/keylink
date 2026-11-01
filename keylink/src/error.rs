@@ -302,6 +302,24 @@ pub enum Error {
     #[error("peer closed the connection")]
     Closed,
 
+    /// This caller stopped waiting after `millis`, by its own
+    /// [`with_deadline`](crate::RpcClient::with_deadline).
+    ///
+    /// It says nothing about the far side. The call may not have arrived, may be
+    /// running, or may have finished and had its reply lost on the way back; the
+    /// work is not cancelled. **A keyed call should be retried with the same
+    /// key**, which attaches to the first call if it is still running and replays
+    /// its answer if it finished. An unkeyed call has no such answer to ask for.
+    ///
+    /// Distinct from [`RemoteError::DeadlinePassed`], which is the serving side saying it stopped waiting. A caller usually
+    /// sees this one, because its timer started first by about the one-way
+    /// latency.
+    #[error("this caller's {millis} ms deadline passed before an answer arrived")]
+    DeadlinePassed {
+        /// The caller's budget.
+        millis: u64,
+    },
+
     /// The serving side answered with a [`RemoteError`] instead of a value.
     ///
     /// Distinct from a transport failure: the call arrived and was understood.

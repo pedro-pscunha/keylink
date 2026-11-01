@@ -2380,8 +2380,34 @@ ANCHORS = [
      "        set.shutdown().await;"),
     ("OT3", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => crate::away::push::<A>(Box::pin(async move {"),
+    # `GP1` and `AT1` live in the file they break, share the arm that hands the
+    # permit's commit to `Guard::record`, and break it two ways. The record's quote
+    # is unindented where the literal carries twelve spaces, which is what keeps it
+    # unique.
+    ("GP1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "            Reached::Completed => return guard.record(frame, payload, commit).await,"),
     ("OT5", "keylink/tests/away.rs", "keylink/src/away.rs",
      "    Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))"),
+    ("OT4", "keylink/tests/away.rs", "keylink/src/turns.rs",
+     "        let method = reply.method;"),
+    # ── the deadline (`ServiceBuilder::deadline`, `with_deadline`), the three breaks of
+    # `tests/deadline.rs`. Cross-file, so the records' quotes add no occurrence to
+    # `rpc.rs`; the indentation is the literal's own and `rustfmt` owns it, so
+    # re-measure these three after a reformat.
+    ("DL1", "keylink/tests/deadline.rs", "keylink/src/rpc.rs",
+     "    match n0_future::time::timeout(budget, call).await {"),
+    ("DL2", "keylink/tests/deadline.rs", "keylink/src/rpc.rs",
+     "                finish_late(said, call).await;"),
+    ("DL3", "keylink/tests/deadline.rs", "keylink/src/rpc.rs",
+     "            Some(budget) => n0_future::time::timeout(budget, self.exchange(request, body))"),
+    # The three unit tests beside `race`, `finish_late` and `settle_key`. They live in
+    # the file they break, so each quote is unindented where the literal is not.
+    ("DL4", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "    match n0_future::time::timeout(budget, call).await {"),
+    ("DL5", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "    let mut written = false;"),
+    ("AT1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "            Reached::Completed => return guard.record(frame, payload, commit).await,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -4111,7 +4137,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 403
+RECORD_BLOCKS = 425
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

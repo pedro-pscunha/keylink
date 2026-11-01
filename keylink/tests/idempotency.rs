@@ -1099,19 +1099,40 @@ async fn a_refusal_before_dispatch_leaves_the_key_claimable() {
     );
 }
 
-/// The third arm: dispatched, and no answer of its own came out. A `Timeout`
-/// drops the wait for a handler that is still running, so whether the work
-/// landed is genuinely unknown — and `Interrupted` is the only honest thing to
-/// record. Recording the layer's own `TimedOut` would tell the caller a lie
-/// with a straight face, forever.
+/// The third arm used to be a layer that gave up on a handler still running, and
+/// the only honest thing to record was `Interrupted`: whether the work landed was
+/// unknown. A deadline is not that. It answers the caller and goes on waiting for
+/// the handler, so when the handler finishes the key settles as **its real
+/// answer**, and a retry is handed that answer instead of a refusal.
+///
+/// **This inverts a pin.** It asserted `Interrupted` for the repeat, which was the
+/// truth for a layer that could not see the handler finish and is a lie for a
+/// guard that can. The repeat attaches, because the first call is still running
+/// when it arrives; it is answered with `1`, the first run, which also proves the
+/// handler was not entered a second time.
+///
+/// Made red by the break `tests/deadline.rs` records for its second test, the same
+/// late-path settle in `serve_one` replaced by `drop((guard, reply));`. The key then
+/// settles `Interrupted` and the repeat is refused. Watched here too, in the same
+/// run: `the repeat gets the first call's real answer:
+/// Remote(Idempotency(Interrupted))`.
 #[tokio::test]
-async fn a_refusal_after_dispatch_settles_interrupted() {
+async fn a_deadline_after_dispatch_settles_the_key_from_what_really_happened() {
     let server = local_node().await;
     let client_node = local_node().await;
+    // The handler waits on this semaphore before it does anything, so the test
+    // decides when it finishes. A handler that slept for a fixed time would be a
+    // bet that the deadline fires before the sleep ends, which a stall can lose.
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let till = Till {
+        release: Some(release.clone()),
+        ..Till::default()
+    };
+    let slows = till.slows.clone();
     let _running = keylink::Server::builder(&server)
         .service(
-            till::service(Till::default(), Allowlist::anyone())
-                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+            till::service(till, Allowlist::anyone())
+                .deadline(Duration::from_millis(50))
                 .build(),
         )
         .spawn()
@@ -1120,28 +1141,44 @@ async fn a_refusal_after_dispatch_settles_interrupted() {
         .await
         .expect("dials");
 
-    let timed_out = client
+    let passed = client
         .with_idempotency(key("slow"))
-        .slow(5_000)
+        .slow(0)
         .await
-        .expect_err("the budget expires while the handler runs");
-    assert!(
-        matches!(timed_out, Error::Remote(RemoteError::TimedOut { .. })),
-        "got {timed_out:?}"
-    );
-
-    let repeat = client
-        .with_idempotency(key("slow"))
-        .slow(5_000)
-        .await
-        .expect_err("the repeat must not be answered with the layer's refusal");
+        .expect_err("the deadline passes while the handler is held");
     assert!(
         matches!(
-            repeat,
-            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+            passed,
+            Error::Remote(RemoteError::DeadlinePassed { millis: 50 })
         ),
-        "a dispatched call with no answer is unknown, not timed out: got {repeat:?}"
+        "got {passed:?}"
     );
+
+    // One permit, so a retry that ran the handler again would wait for a second
+    // one that never comes and fail on the bound below instead of passing.
+    let repeat = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .with_idempotency(keylink::Idempotency::attaching_for(
+                    key("slow"),
+                    Duration::from_secs(30),
+                ))
+                .slow(0)
+                .await
+        })
+    };
+    release.add_permits(1);
+    let repeat = tokio::time::timeout(Duration::from_secs(30), repeat)
+        .await
+        .expect("a retry that re-ran the handler would wait for ever")
+        .expect("the retry does not panic")
+        .expect("the repeat gets the first call's real answer");
+    assert_eq!(
+        repeat, 1,
+        "the first run's answer, so the handler was not entered a second time"
+    );
+    assert_eq!(slows.runs(), 1, "the handler ran once");
 }
 
 /// A serving task killed between the accept and the dispatch never entered
@@ -2088,12 +2125,15 @@ async fn attaching_to_a_settled_key_does_not_wait() {
     );
 }
 
-// ─────────────────────────────────────────────── the actor path and a Timeout
+// ─────────────────────────────────────────────── the actor path and a deadline
 
 #[derive(Default)]
 struct TillActor {
     reserves: u64,
     slows: u64,
+    /// `None` unless a test holds a `slow` turn open: it waits for a permit here
+    /// before it sleeps.
+    release: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl till::Actor for TillActor {
@@ -2105,6 +2145,13 @@ impl till::Actor for TillActor {
     async fn slow(&mut self, _cx: Caller<'_>, ms: u64) -> u64 {
         self.slows += 1;
         let run = self.slows;
+        if let Some(release) = &self.release {
+            release
+                .acquire()
+                .await
+                .expect("the test never closes the semaphore")
+                .forget();
+        }
         tokio::time::sleep(Duration::from_millis(ms)).await;
         run
     }
@@ -2114,30 +2161,44 @@ impl till::Actor for TillActor {
     }
 }
 
-/// The defect that made a key and a `Timeout` unusable together on an actor.
+/// The defect that made a key and a bound on the caller's wait unusable together
+/// on an actor.
 ///
 /// A layer cannot cancel a turn — it drops the *wait* for the reply, and the
 /// turn runs on and mutates. The refusal used to be recorded as the key's
 /// settled answer, so the caller was told `TimedOut` on every retry forever
-/// while the actor had applied the message exactly once.
+/// while the actor had applied the message exactly once. The fix before this
+/// one recorded `Interrupted`: true, and still not what the caller hoped for.
 ///
-/// Now the turn's own progress decides: it was entered and produced no answer
-/// anybody received, so the key is `Interrupted` — which is the truth, and
-/// which tells the caller to find out out of band instead of trusting a lie.
+/// Now the deadline lives where the guard is. The caller is told at the deadline,
+/// the turn runs to the end, and the key settles as the turn's **real reply**, so
+/// the retry receives it and the actor still ran the message once. This is the
+/// promise RFC-05 §7 declined to make.
 ///
-/// **Not** promised, and deliberately: the retry does not receive the turn's
-/// real reply. That needs the guard to travel inside the mailbox and be settled
-/// by the turn itself. See RFC-05 §7.
+/// Made red by the same late-path settle as
+/// `a_deadline_after_dispatch_settles_the_key_from_what_really_happened`, which
+/// `tests/deadline.rs` records: with `drop((guard, reply));` in its place the retry
+/// is refused `Interrupted`. Watched: `the repeat is told what the turn really
+/// returned: Remote(Idempotency(Interrupted))`.
 #[tokio::test]
-async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
+async fn a_deadline_on_an_actor_turn_records_the_turns_real_answer() {
+    // A deadline also sheds a message that has not started, so this one is long
+    // enough that an idle actor takes its turn inside it however a stall falls,
+    // and the turn is held on a semaphore the test owns so that "running" is not a
+    // sleep a stall can spend.
+    const DEADLINE: Duration = Duration::from_secs(1);
     let server = local_node().await;
     let client_node = local_node().await;
-    let actor = till::actor(TillActor::default());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let actor = till::actor(TillActor {
+        release: Some(release.clone()),
+        ..TillActor::default()
+    });
     let _running = keylink::Server::builder(&server)
         .service(
             actor
                 .service(Allowlist::anyone())
-                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+                .deadline(DEADLINE)
                 .build(),
         )
         .spawn()
@@ -2146,30 +2207,39 @@ async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
         .await
         .expect("dials");
 
-    let timed_out = client
+    let passed = client
         .with_idempotency(key("k"))
-        .slow(500)
+        .slow(0)
         .await
-        .expect_err("the budget expires while the turn runs");
+        .expect_err("the deadline passes while the turn is held");
     assert!(
-        matches!(timed_out, Error::Remote(RemoteError::TimedOut { .. })),
-        "got {timed_out:?}"
+        matches!(
+            passed,
+            Error::Remote(RemoteError::DeadlinePassed { millis: 1000 })
+        ),
+        "got {passed:?}"
     );
 
-    // Let the turn finish, so the state really has been mutated by the time the
-    // retry asks. This is the half a `TimedOut` record used to hide.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    let repeat = client
-        .with_idempotency(key("k"))
-        .slow(500)
+    // One permit, as in the handler test above.
+    let repeat = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .with_idempotency(keylink::Idempotency::attaching_for(
+                    key("k"),
+                    Duration::from_secs(30),
+                ))
+                .slow(0)
+                .await
+        })
+    };
+    release.add_permits(1);
+    let repeat = tokio::time::timeout(Duration::from_secs(30), repeat)
         .await
-        .expect_err("the repeat must not be told the layer's refusal");
-    assert_eq!(
-        refusal(&repeat),
-        IdempotencyRefusal::Interrupted,
-        "a turn that ran and whose reply nobody received is unknown, not timed out"
-    );
+        .expect("a retry that ran the turn again would wait for ever")
+        .expect("the retry does not panic")
+        .expect("the repeat is told what the turn really returned");
+    assert_eq!(repeat, 1, "the first turn's reply, recorded under the key");
 
     assert_eq!(
         actor
@@ -2177,7 +2247,7 @@ async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
             .await
             .expect("running"),
         1,
-        "the turn ran exactly once, which is what the caller could not be told before"
+        "the turn ran exactly once"
     );
 }
 
@@ -2417,6 +2487,170 @@ mod stored {
             1,
             "a key whose record failed must not be free to run again"
         );
+    }
+
+    /// A store that is the file adapter in every way but one: its second write
+    /// parks until the test lets it go. The first write is the claim and the
+    /// second is the settle, so this stalls exactly the part of a keyed call that
+    /// comes after the handler has returned.
+    struct StallsTheSettle {
+        files: keylink_persist::file::Files,
+        gate: Arc<tokio::sync::Notify>,
+        stalled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct StallingLog {
+        inner: <keylink_persist::file::Files as keylink_persist::Entries>::Held,
+        gate: Arc<tokio::sync::Notify>,
+        stalled: Arc<std::sync::atomic::AtomicBool>,
+        puts: usize,
+    }
+
+    impl keylink_persist::Entries for StallsTheSettle {
+        type Held = StallingLog;
+
+        async fn hold(
+            &self,
+            id: &keylink_persist::StateId,
+        ) -> keylink_persist::Result<StallingLog> {
+            Ok(StallingLog {
+                inner: self.files.hold(id).await?,
+                gate: Arc::clone(&self.gate),
+                stalled: Arc::clone(&self.stalled),
+                puts: 0,
+            })
+        }
+    }
+
+    impl keylink_persist::Held for StallingLog {
+        async fn load(&self) -> keylink_persist::Result<Vec<(keylink_persist::EntryKey, Vec<u8>)>> {
+            self.inner.load().await
+        }
+
+        async fn put(
+            &mut self,
+            key: &keylink_persist::EntryKey,
+            bytes: &[u8],
+        ) -> keylink_persist::Result<()> {
+            self.puts += 1;
+            if self.puts == 2 {
+                self.stalled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.gate.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn remove(&mut self, key: &keylink_persist::EntryKey) -> keylink_persist::Result<()> {
+            self.inner.remove(key).await
+        }
+
+        async fn compact(&mut self) -> keylink_persist::Result<()> {
+            self.inner.compact().await
+        }
+    }
+
+    /// A deadline answers a caller whose handler has returned and whose key is
+    /// still being settled.
+    ///
+    /// The deadline used to be raced against the layer chain alone. A fast handler
+    /// followed by a durable settle that waits on its store left the caller with no
+    /// answer past the deadline, for as long as the store took. Now the one future
+    /// that runs the chain, encodes the reply and settles the key is the one the
+    /// deadline is raced against, so the caller is told, and the same future goes
+    /// on settling: once the store answers, the key reads `Done` and the work ran
+    /// once.
+    ///
+    /// The call is bounded at ten seconds so that a deadline that does not cover
+    /// the settle fails the test instead of hanging it; that bound is never
+    /// reached on a pass. The handler is `reserve`, which returns at once, and the
+    /// scenario is run again on a fresh service if the stalled write had not
+    /// started by the time the caller was answered, which only a machine too slow
+    /// to run a trivial handler in the deadline would see.
+    ///
+    /// Made red by hand, with an edit `scripts/break-once.sh` cannot express because
+    /// it is in two places: `serve_one`'s `call` future stops at the chain's
+    /// output (it returns the guard instead of settling the key) and the settle is
+    /// done after the race, which is the shape before this fix. Watched: `the
+    /// deadline must answer a call whose settle is stalled: Elapsed(())`, after the
+    /// ten seconds the bound allows.
+    #[tokio::test]
+    async fn a_deadline_answers_a_caller_whose_durable_settle_is_stalled() {
+        const DEADLINE: Duration = Duration::from_millis(500);
+
+        for _ in 0..3 {
+            let scratch = Scratch::new("deadline-settle");
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let store = StallsTheSettle {
+                files: keylink_persist::file::Files::open(&scratch.0)
+                    .await
+                    .expect("opens")
+                    .limit(ROOMY),
+                gate: Arc::clone(&gate),
+                stalled: Arc::clone(&stalled),
+            };
+            let records = keylink::DurableRecords::open(&store, &ledger_id())
+                .await
+                .expect("nobody else holds this ledger");
+            let reserves = Counter::default();
+            let till = Till {
+                reserves: reserves.clone(),
+                ..Till::default()
+            };
+
+            let server = local_node().await;
+            let client_node = local_node().await;
+            let _running = KeylinkServer::builder(&server)
+                .service(
+                    till::service(till, Allowlist::anyone())
+                        .records(Records::Durable(records))
+                        .deadline(DEADLINE)
+                        .build(),
+                )
+                .spawn()
+                .expect("one service, no duplicate ALPN");
+            let client = till::Client::connect(&client_node, server.endpoint().addr())
+                .await
+                .expect("dials");
+
+            let answered = n0_future::time::timeout(
+                Duration::from_secs(10),
+                client
+                    .with_idempotency(key("settling"))
+                    .reserve("ADU-014".to_string(), 1),
+            )
+            .await
+            .expect("the deadline must answer a call whose settle is stalled");
+            if !stalled.load(std::sync::atomic::Ordering::SeqCst) {
+                gate.notify_one();
+                continue;
+            }
+            assert!(
+                matches!(
+                    &answered,
+                    Err(Error::Remote(RemoteError::DeadlinePassed { .. }))
+                ),
+                "the caller is told the deadline passed while the store is stalled: got {answered:?}"
+            );
+
+            gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if client.key_state(key("settling")).await.expect("asks")
+                        == keylink::KeyState::Done
+                    {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the same future went on settling once the store answered");
+            assert_eq!(reserves.runs(), 1, "and the work ran once");
+            return;
+        }
+        panic!("the stalled write never started before the caller was answered, 3 times in a row");
     }
 
     /// A durable store on a service that accepts no key is refused at startup.
@@ -2719,6 +2953,7 @@ async fn identical_received_map_bytes_replay_despite_fresh_hashers_and_retry_con
     struct Reply {
         body_len: Option<u64>,
         idempotency: Option<keylink::Idempotency>,
+        wait_ms: Option<u64>,
         message: keylink::WireResponse<map_counter::Response>,
     }
     async fn call(
@@ -2726,7 +2961,7 @@ async fn identical_received_map_bytes_replay_despite_fresh_hashers_and_retry_con
         message: &[u8],
         retry: keylink::Idempotency,
     ) -> keylink::WireResponse<map_counter::Response> {
-        let mut header = postcard::to_stdvec(&(Some(0u64), Some(retry))).unwrap();
+        let mut header = postcard::to_stdvec(&(Some(0u64), Some(retry), None::<u64>)).unwrap();
         header.extend_from_slice(message);
         let mut frame = (header.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(&header);
@@ -2742,6 +2977,7 @@ async fn identical_received_map_bytes_replay_despite_fresh_hashers_and_retry_con
         let reply: Reply = postcard::from_bytes(&bytes[4..]).unwrap();
         assert_eq!(reply.body_len, Some(0));
         assert!(reply.idempotency.is_none());
+        assert!(reply.wait_ms.is_none());
         reply.message
     }
     let node = local_node().await;

@@ -7454,6 +7454,15 @@ macro_rules! __keylink_service {
                 }
             }
 
+            impl $crate::WithDeadline for RegistryClient {
+                fn with_deadline(&self, budget: ::core::time::Duration) -> Self {
+                    Self {
+                        inner: self.inner.with_deadline(budget),
+                        idempotency: self.idempotency.clone(),
+                    }
+                }
+            }
+
             impl $crate::Wire for RegistryClient {
                 fn version(&self) -> $crate::Version { self.inner.version() }
                 async fn key_state(
@@ -7598,6 +7607,14 @@ macro_rules! __keylink_service {
                 }
             }
 
+            impl $crate::WithDeadline for Client {
+                fn with_deadline(&self, budget: ::core::time::Duration) -> Self {
+                    Self {
+                        inner: self.inner.with_deadline(budget),
+                    }
+                }
+            }
+
             impl $crate::Wire for Client {
                 fn version(&self) -> $crate::Version { self.inner.version() }
                 async fn key_state(
@@ -7663,6 +7680,14 @@ macro_rules! __keylink_service {
                         $ret
                     );
                 )+
+            }
+
+            impl $crate::WithDeadline for IdempotentClient {
+                fn with_deadline(&self, budget: ::core::time::Duration) -> Self {
+                    Self {
+                        inner: self.inner.with_deadline(budget),
+                    }
+                }
             }
 
             impl $crate::Wire for IdempotentClient {

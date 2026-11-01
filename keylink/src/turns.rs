@@ -4326,13 +4326,13 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// With a [`QueueTimeout`](crate::QueueTimeout) installed, both dispatch paths
     /// bound the wait for a mailbox *permit*, and neither
-    /// bounds the wait for the *answer*. The crate's answer-bound is
-    /// [`Timeout`](crate::Timeout) — and it is a
-    /// [`Middleware`](crate::Middleware), so it reaches a served dispatch and not
-    /// a local call. A local `ask` carries
-    /// [`Caller::Local`](crate::Caller::Local), which has no peer and therefore
-    /// no queueing budget to spend in the first place. So a local caller behind a
-    /// wedged turn gets no timeout and no refusal.
+    /// bounds the wait for the *answer*. The crate's answer-bound is a
+    /// [deadline](crate::ServiceBuilder::deadline), which answers a peer at the
+    /// deadline whether or not the turn has returned, and it lives in the serving
+    /// task, so it reaches a served dispatch and not a local call. A local `ask`
+    /// carries [`Caller::Local`](crate::Caller::Local), which has no peer and
+    /// therefore no queueing budget to spend in the first place. So a local caller
+    /// behind a wedged turn gets no deadline and no refusal.
     ///
     /// Neither liveness seam reveals it either, which is the part worth knowing.
     /// [`is_running`](Self::is_running) reads the mailbox, and a wedged actor's

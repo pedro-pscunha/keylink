@@ -1458,30 +1458,32 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
     );
 }
 
-/// The same drain read from the peer's end, with a [`keylink::Timeout`] in front
-/// of it — which is what makes *not* `TimedOut` an assertion rather than a hope.
+/// The same drain read from the peer's end, with a service deadline in front of
+/// it — which is what makes *not* `DeadlinePassed` an assertion rather than a hope.
 ///
-/// Without a layer both trees end at `NoSuchActor` and the broken one is merely a
-/// budget late, so the sibling above has to read a clock to tell them apart. A
-/// `Timeout` turns that delay into a **different answer**: the layer drops the
-/// wait at two seconds and renders [`RemoteError::TimedOut`], so the peer is told
-/// its call expired when what happened is that its actor was stopped and the
-/// honest answer was there to be given.
+/// Without a deadline both trees end at `NoSuchActor` and the broken one is merely
+/// a budget late, so the sibling above has to read a clock to tell them apart. A
+/// deadline turns that delay into a **different answer**: the service stops waiting
+/// at two seconds and renders [`RemoteError::DeadlinePassed`], so the peer is told
+/// its call outlived its budget when what happened is that its actor was stopped
+/// and the honest answer was there to be given.
 ///
-/// It is also why the sibling above must **not** have a layer. Dropping the wait
-/// drops `deliver_keyed`'s frame and the sender clone inside it, so on the
-/// broken tree the drain finishes *because the peer gave up* — two seconds in
-/// rather than thirty — and an elapsed assertion passes. One defect, two shapes,
-/// and neither shape sees both halves of it.
+/// It is also why the sibling above must **not** have a deadline. Answering the
+/// caller at the deadline drops the wait on an unkeyed call, and with it
+/// `deliver_keyed`'s frame and the sender clone inside it, so on the broken tree
+/// the drain finishes *because the peer gave up* — two seconds in rather than
+/// thirty — and an elapsed assertion passes. One defect, two shapes, and neither
+/// shape sees both halves of it.
 ///
 /// Made red by the same edit the sibling records, `scripts/break-once.sh
 /// keylink/src/actor/remote.rs`, `    drop(route);` → `    let _held = route;`.
-/// Watched: `a drained actor must answer for itself, and a TimedOut means the peer
-/// waited out the layer instead: Remote(TimedOut { millis: 2000 })`.
+/// Watched: `a drained actor must answer for itself, and a DeadlinePassed means the
+/// peer waited out the deadline instead: Remote(DeadlinePassed { millis: 2000 })`.
+/// Re-watched when the layer this test used was replaced by the deadline.
 #[tokio::test]
 async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
     let nodes = [local_node().await, local_node().await];
-    // Built inline rather than through `keyed`, because the layer is the subject.
+    // Built inline rather than through `keyed`, because the deadline is the subject.
     let system: orders::Registry = orders::Registry::builder(Eviction::Never).build();
     system
         .mount(book_id(), orders::spawn(Book::default()))
@@ -1490,7 +1492,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
         .service(
             system
                 .service(Allowlist::anyone())
-                .layer(keylink::Timeout::after(Duration::from_secs(2)))
+                .deadline(Duration::from_secs(2))
                 .build(),
         )
         .spawn()
@@ -1520,8 +1522,8 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
             &lost,
             keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
         ),
-        "a drained actor must answer for itself, and a TimedOut means the peer \
-         waited out the layer instead: {lost:?}"
+        "a drained actor must answer for itself, and a DeadlinePassed means the peer \
+         waited out the deadline instead: {lost:?}"
     );
 }
 

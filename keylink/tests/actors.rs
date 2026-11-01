@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use keylink::{
     ActorId, Addressed, Allowlist, Backpressure, Body, BodyReader, Context, Ended, Error, Eviction,
-    IdempotencyKey, IdempotencyRefusal, LocalError, Middleware, MountError, Next, Node, Outcome,
-    QueueTimeout, RemoteError, Server, Serving, Timeout, Withheld,
+    IdempotencyKey, IdempotencyRefusal, KeyState, LocalError, Middleware, MountError, Next, Node,
+    Outcome, QueueTimeout, RemoteError, Server, ServiceBuilder, Serving, Withheld,
 };
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
@@ -2666,11 +2666,13 @@ async fn a_garbage_payload_never_reaches_the_actor_and_claims_no_key() {
     struct Garbage {
         body_len: Option<u64>,
         idempotency: Option<keylink::Idempotency>,
+        wait_ms: Option<u64>,
         message: keylink::WireRequest<u32>,
     }
     let payload = postcard::to_allocvec(&Garbage {
         body_len: Some(0),
         idempotency: Some(key.clone().into()),
+        wait_ms: None,
         message: keylink::WireRequest::Call(250),
     })
     .unwrap();
@@ -2970,25 +2972,43 @@ struct Gated {
     /// Read by the `status` tests, which is why it is not `_system`.
     system: gate::Registry,
     _server: Server,
-    _nodes: [Node; 2],
+    /// The server's node and the client's, in that order. Kept for the fixture's
+    /// life, and read by [`Gated::redial`].
+    nodes: [Node; 2],
+}
+
+impl Gated {
+    /// A second connection from the same client node to the same server, for a
+    /// test that closes the first and still has to ask about what it left behind.
+    async fn redial(&self) -> gate::RegistryClient {
+        gate::RegistryClient::connect(&self.nodes[1], self.nodes[0].endpoint().addr())
+            .await
+            .expect("the client dials the actor system again")
+    }
 }
 
 async fn start_gated() -> Gated {
-    gated_behind(QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget")).await
+    gated_behind(|service| {
+        service.layer(QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"))
+    })
+    .await
 }
 
 /// The depth `Gated` is built at unless a test says otherwise: the default, so
 /// every test that predates the knob still runs at one slot.
 const ONE_SLOT: usize = 1;
 
+/// What a test does to the service before it is built: add a bound, or none.
+type Bound =
+    fn(ServiceBuilder<GateWire, gate::Response>) -> ServiceBuilder<GateWire, gate::Response>;
+
 /// The same, behind whichever bound is under test.
 ///
-/// `Timeout` and `QueueTimeout` answer the same caller in the same scenario and
-/// owe the caller's idempotency key opposite things, so the fixture they are
-/// compared through has to be one fixture. `Stamped` stays inside either bound
-/// and simply reports nothing under `Timeout`, which stamps no deadline — the
-/// tests that read `stamped` are the ones that supply a `QueueTimeout`.
-async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated {
+/// A function over the builder and not a layer, because a deadline is not a layer.
+/// `Stamped` stays inside the bound and reports whatever queueing budget it put on
+/// the call — a `QueueTimeout` or a deadline — so the tests that read `stamped`
+/// are the ones that supply a `QueueTimeout`.
+async fn gated_behind(bound: Bound) -> Gated {
     gated_at_depth(bound, ONE_SLOT).await
 }
 
@@ -2997,7 +3017,7 @@ async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated
 /// Only the saturation test needs more than one slot, and it needs the rest of
 /// this fixture unchanged — two real nodes, the same service, the same bound — so
 /// the depth is a parameter here rather than a second fixture drifting beside it.
-async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth: usize) -> Gated {
+async fn gated_at_depth(bound: Bound, depth: usize) -> Gated {
     let server = local_node().await;
     let client_node = local_node().await;
     let system: gate::Registry = gate::Registry::builder(Eviction::Never)
@@ -3011,13 +3031,11 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
     let ticked = Arc::new(Semaphore::new(0));
     let running = Server::builder(&server)
         .service(
-            system
-                .service(Allowlist::anyone())
-                // `registry.service` gives back an ordinary `ServiceBuilder`, so
-                // this compiles — and until RFC-04 §16.7 the deadline a
-                // `QueueTimeout` stamped was read by nobody on this path.
-                .layer(bound)
-                // Added second, so it sits INSIDE the bound and sees whatever
+            // `registry.service` gives back an ordinary `ServiceBuilder`, so
+            // this compiles — and until RFC-04 §16.7 the deadline a
+            // `QueueTimeout` stamped was read by nobody on this path.
+            bound(system.service(Allowlist::anyone()))
+                // Added after the bound, so it sits INSIDE it and sees whatever
                 // that layer put on the context.
                 .layer(Stamped(stamped_tx))
                 .build(),
@@ -3055,7 +3073,7 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
         turns,
         system,
         _server: running,
-        _nodes: [server, client_node],
+        nodes: [server, client_node],
     }
 }
 
@@ -3183,9 +3201,11 @@ async fn busy_stays_true_across_an_await_inside_a_turn() {
     // takes, and under a load average of about 110 that passed the fixture's
     // 200 ms queue budget, so the queued call answered `TimedOut`. This test is
     // about `busy`, not about the budget, so its budget is one load cannot spend.
-    let mut fixture = gated_behind(
-        QueueTimeout::try_after(Duration::from_secs(600)).expect("valid queue timeout budget"),
-    )
+    let mut fixture = gated_behind(|service| {
+        service.layer(
+            QueueTimeout::try_after(Duration::from_secs(600)).expect("valid queue timeout budget"),
+        )
+    })
     .await;
     let client = &fixture.client;
     let release = &fixture.release;
@@ -3291,7 +3311,7 @@ const NOT_STUCK: Duration = Duration::from_secs(30);
 /// the same fact from the other side, since a status that took a slot would count
 /// itself.
 ///
-/// A whole-call `Timeout` rather than the fixture's default `QueueTimeout`,
+/// A long service deadline rather than the fixture's default `QueueTimeout`,
 /// following `a_saturated_mailbox_at_depth_does_not_starve_a_feed`: a message is
 /// meant to sit in this mailbox for as long as the test needs, and a queue budget
 /// would refuse it for doing exactly that. Nothing here is timed.
@@ -3307,7 +3327,7 @@ const NOT_STUCK: Duration = Duration::from_secs(30);
 /// did: Elapsed(())`. Registered as `S1`.
 #[tokio::test]
 async fn a_wedged_actor_answers_status_during_its_turn() {
-    let mut fixture = gated_behind(Timeout::after(Duration::from_secs(60))).await;
+    let mut fixture = gated_behind(|service| service.deadline(Duration::from_secs(60))).await;
     let client = &fixture.client;
     let release = &fixture.release;
     let system = &fixture.system;
@@ -3609,10 +3629,11 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     /// crosses a wire — see `ActorStatus::queued`.
     const SLOTS_SENT: u64 = 3;
 
-    // A whole-call `Timeout` and not the fixture's default `QueueTimeout`: three
+    // A long service deadline and not the fixture's default `QueueTimeout`: three
     // messages are meant to sit in this mailbox for as long as the test needs, and
     // a queue budget would refuse them for doing it.
-    let mut fixture = gated_at_depth(Timeout::after(Duration::from_secs(60)), SLOTS).await;
+    let mut fixture =
+        gated_at_depth(|service| service.deadline(Duration::from_secs(60)), SLOTS).await;
     let client = &fixture.client;
     let release = &fixture.release;
     let ticks = &fixture.ticks;
@@ -3955,83 +3976,119 @@ async fn a_caller_that_cannot_get_a_mailbox_permit_is_refused_at_its_budget() {
     );
 }
 
-// ────────────────────── the bound that gives up from outside the mailbox
+// ───────────────────────── the caller that goes away while its message is queued
 
-/// Puts one keyed message in the mailbox behind a held turn, lets the bound give
-/// up on it from outside, and only then lets the actor go.
+/// Waits until the ledger reads `wanted` for `key`, over `client`.
 ///
-/// Two facts hold at the moment the caller is answered, and neither is left to a
-/// race. **It is queued**: it is not sent until `hold` has entered its turn, and
-/// a turn that is running holds no mailbox slot, so the one slot is free and the
-/// mailbox is the only place the message can be. **It has not run**: the actor
-/// is inside `hold`, waiting on a semaphore this test owns, and the permit is
-/// added only after the caller already has its answer.
-///
-/// Nothing asserts on elapsed time. The clock decides one thing, which is when
-/// the layer above gives up.
-async fn queued_when_the_caller_gave_up(fixture: &mut Gated, key: &str) -> Result<u64, Error> {
-    let keyed = gate_under(fixture, key);
-    let client = &fixture.client;
-    let release = &fixture.release;
-    let entered = &mut fixture.entered;
-    let (go, wait) = oneshot::channel();
-
-    let holding = async { client.at(id("gate")).hold().await };
-    let queued = async {
-        wait.await.expect("the driver says when");
-        let answered = keyed.at(id("gate")).touch().await;
-        // Answered first, released second, and that order is what the caller's
-        // answer is about: it was told something while its message was still
-        // sitting in the mailbox, unrun.
-        release.add_permits(1);
-        answered
-    };
-    let driver = async {
-        entered.recv().await.expect("`hold` entered its turn");
-        go.send(()).expect("the queued call is waiting for this");
-    };
-
-    let (held, answered, ()) = tokio::join!(holding, queued, driver);
-    // Deliberately not asserted, and the reason is the property under test: the
-    // bound is watching this caller too, and `hold` outlasts any budget on
-    // purpose, so a `Timeout` refuses it and the turn goes on holding the actor
-    // regardless. What ends that turn is the semaphore, not the caller.
-    let _ = held;
-    answered
+/// Bounded for `until_idle`'s reason: it fails the test instead of hanging it, and
+/// asserts nothing about how long the ledger took.
+async fn until_key(client: &gate::RegistryClient, key: &str, wanted: impl Fn(KeyState) -> bool) {
+    let key = IdempotencyKey::new(key).expect("a valid key");
+    tokio::time::timeout(NOT_STUCK, async {
+        loop {
+            let state = client.key_state(key.clone()).await.expect("asks");
+            if wanted(state) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ledger must reach the state this test is waiting for");
 }
 
-/// The keyed half of RFC-04 §16.12. It used to be the LATENT half — reaching it
-/// needed a hand-built envelope, because the keyed client could not attach a key
-/// — and it is an ordinary one now, which is the change worth noting where the
-/// old note was.
+/// Keyed messages queued behind a held turn, whose caller then goes away: the
+/// connection they arrived on is closed. Hands back a fresh connection to ask over.
 ///
-/// A `Timeout` runs outside the mailbox, so its budget expiring drops the wait
-/// for the reply and not the turn. The message runs. Releasing its key would
-/// therefore hand the retry the same work to do a second time — at-least-once,
-/// out of the module whose one promise is at-most-once — so reaching the mailbox
-/// is marked, and the key settles `Interrupted` instead.
+/// This is what a layer that gave up used to stand in for, and it is the one way
+/// left to leave a message in the mailbox with nobody waiting for it. A deadline
+/// answers the caller and keeps waiting, so it never abandons the message; a
+/// closed connection aborts the serving task and does.
 ///
-/// Made red by removing the `enqueued()` mark from `deliver_keyed`, which
-/// takes the retry back to a first attempt and the counter to two.
-#[tokio::test]
-async fn a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key() {
-    let mut fixture = gated_behind(Timeout::after(BUDGET)).await;
-
-    let refused = queued_when_the_caller_gave_up(&mut fixture, "gave-up")
+/// What holds at the moment this returns, none of it left to a race:
+///
+/// - **Every key was claimed** before the connection closed, read over the new one
+///   as `Running`.
+/// - **Exactly one message is queued** and the actor is inside `hold`, waiting on
+///   a semaphore this test owns. A turn that is running holds no mailbox slot, so
+///   the slot is free for one and the rest wait for a permit they never get.
+/// - **No key is `Running` any more**: the serving tasks were aborted, which is
+///   what settles or releases each of them.
+///
+/// The turn is NOT let go. The caller releases it, and reads what ran.
+async fn abandoned_behind_a_held_turn(fixture: &mut Gated, keys: &[&str]) -> gate::RegistryClient {
+    let fresh = fixture.redial().await;
+    let holding = fixture.client.clone();
+    tokio::spawn(async move { holding.at(id("gate")).hold().await });
+    fixture
+        .entered
+        .recv()
         .await
-        .expect_err("the budget expires while the message is still queued");
-    assert!(
-        matches!(refused, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
-        "got {refused:?}"
-    );
+        .expect("`hold` entered its turn");
+
+    for key in keys {
+        let keyed = gate_under(fixture, key);
+        tokio::spawn(async move { keyed.at(id("gate")).touch().await });
+    }
+    for key in keys {
+        until_key(&fresh, key, |state| state == KeyState::Running).await;
+    }
+    until_queued(&fixture.system, 1).await;
+
+    fixture
+        .client
+        .clone()
+        .close()
+        .await
+        .expect("a connection closes");
+    for key in keys {
+        until_key(&fresh, key, |state| state != KeyState::Running).await;
+    }
+    fresh
+}
+
+/// Over a given connection: the `touch` count.
+async fn touches_over(client: &gate::RegistryClient) -> u64 {
+    client
+        .at(id("gate"))
+        .touches()
+        .await
+        .expect("the actor answers")
+}
+
+/// A message that reached the mailbox and whose caller went away settles its key.
+///
+/// The message runs. Releasing its key would therefore hand the retry the same
+/// work to do a second time — at-least-once, out of the module whose one promise
+/// is at-most-once — so reaching the mailbox is marked, and the key settles
+/// `Interrupted` instead. (RFC-04 §16.12 is the keyed half of this: it used to be
+/// the latent half, and it is an ordinary one now.)
+///
+/// **This test used to make the caller give up with a `Timeout` layer**, and that
+/// layer is gone: a deadline answers the caller and goes on waiting, so the key
+/// settles from what really happened. A caller that truly goes away is a
+/// connection that ends, and this is that.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on
+/// `deliver_keyed`'s `progress.enqueued();` (indented four spaces) and the
+/// replacement `let _ = &progress;`, which takes the retry back to a first attempt
+/// and the counter to two. Watched: `a key nobody can report on must be settled,
+/// not claimable: 2` — the retry ran and answered `2`.
+#[tokio::test]
+async fn a_keyed_message_whose_caller_went_away_in_the_mailbox_settles_its_key() {
+    let mut fixture = gated_behind(|service| service).await;
+    let fresh = abandoned_behind_a_held_turn(&mut fixture, &["gone"]).await;
+
+    fixture.release.add_permits(1);
     assert_eq!(
-        gate_touches(&fixture).await,
+        touches_over(&fresh).await,
         1,
         "the turn runs whether its caller stayed or not, which is exactly why giving the key \
          back would be an invitation to run the work twice"
     );
 
-    let retried = gate_under(&fixture, "gave-up")
+    let retried = fresh
+        .with_idempotency(IdempotencyKey::new("gone").expect("a valid key"))
         .at(id("gate"))
         .touch()
         .await
@@ -4044,73 +4101,36 @@ async fn a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key() {
         "got {retried:?}"
     );
     assert_eq!(
-        gate_touches(&fixture).await,
+        touches_over(&fresh).await,
         1,
         "the refused retry must not have run the work a second time"
     );
 }
 
-/// The same pair as [`two_behind_a_held_turn`], under keys: exactly one gets the
-/// one mailbox slot, and exactly one is left waiting for a permit it never gets.
-///
-/// **The pair is deliberately identical and unordered**, for that helper's
-/// reason: a slot is only provably occupied while nothing is draining it, so
-/// every assertion here is a count over the two.
-async fn two_keyed_behind_a_held_turn(
-    fixture: &mut Gated,
-    keys: [&str; 2],
-) -> [Result<u64, Error>; 2] {
-    let [first, second] = keys.map(|key| gate_under(fixture, key));
-    let client = &fixture.client;
-    let release = &fixture.release;
-    let entered = &mut fixture.entered;
-    let (go, wait) = oneshot::channel();
-
-    let holding = async { client.at(id("gate")).hold().await };
-    let sending = async {
-        wait.await.expect("the driver says when");
-        let one = first.at(id("gate"));
-        let two = second.at(id("gate"));
-        let answered = tokio::join!(one.touch(), two.touch());
-        release.add_permits(1);
-        answered
-    };
-    let driver = async {
-        entered.recv().await.expect("`hold` entered its turn");
-        go.send(()).expect("the two calls are waiting for this");
-    };
-
-    let (held, (left, right), ()) = tokio::join!(holding, sending, driver);
-    // Not asserted, for [`queued_when_the_caller_gave_up`]'s reason.
-    let _ = held;
-    [left, right]
-}
-
 /// What the mark being placed **after** the send buys, and it is the whole
 /// reason it is not placed before it.
 ///
-/// One of these two got a mailbox permit and one did not, and no test can say
-/// which. The one that did leaves a turn behind that runs, so its key must
-/// settle. The one that did not queued nothing — tokio drops a send it cancelled
-/// — so its key is owed back and its retry is a first attempt. A mark taken on
-/// the way *into* `deliver_keyed` would be indistinguishable on every other
-/// assertion in this file and would burn that second key.
+/// Two keyed messages are behind a held turn and their caller goes away. One of
+/// them got a mailbox permit and one did not, and no test can say which. The one
+/// that did leaves a turn behind that runs, so its key must settle. The one that
+/// did not queued nothing — tokio drops a send it cancelled — so its key is owed
+/// back and its retry is a first attempt. A mark taken on the way *into*
+/// `deliver_keyed` would be indistinguishable on every other assertion in this
+/// file and would burn that second key.
 ///
-/// Made red by moving `progress.enqueued()` above `mail.send` in
-/// `deliver_keyed`, which settles both keys and leaves the count at two.
+/// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on
+/// `deliver_keyed`'s `let queueing = route.mail.send(queued);` (indented eight
+/// spaces), replaced by the same line preceded by `progress.enqueued();`. That is
+/// the mark above the send, which settles both keys, and the mark below it is then
+/// redundant. Watched: `left: 2`, `right: 1` on the `settled` count.
 #[tokio::test]
 async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
-    let mut fixture = gated_behind(Timeout::after(BUDGET)).await;
+    let mut fixture = gated_behind(|service| service).await;
+    let fresh = abandoned_behind_a_held_turn(&mut fixture, &["slot", "no-slot"]).await;
 
-    for answered in two_keyed_behind_a_held_turn(&mut fixture, ["slot", "no-slot"]).await {
-        let error = answered.expect_err("both budgets ran out before either could be answered");
-        assert!(
-            matches!(error, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
-            "got {error:?}"
-        );
-    }
+    fixture.release.add_permits(1);
     assert_eq!(
-        gate_touches(&fixture).await,
+        touches_over(&fresh).await,
         1,
         "exactly one of the two can hold the slot, so exactly one turn runs once the actor \
          is let go"
@@ -4118,7 +4138,12 @@ async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
 
     let mut settled = 0;
     for key in ["slot", "no-slot"] {
-        match gate_under(&fixture, key).at(id("gate")).touch().await {
+        let retry = fresh
+            .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
+            .at(id("gate"))
+            .touch()
+            .await;
+        match retry {
             Ok(_) => {}
             Err(Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))) => {
                 settled += 1;
@@ -4133,7 +4158,7 @@ async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
          never queued is refused forever for work nobody did"
     );
     assert_eq!(
-        gate_touches(&fixture).await,
+        touches_over(&fresh).await,
         2,
         "the released key's retry is the only work left to do, and it must have done it"
     );

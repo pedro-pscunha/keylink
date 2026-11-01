@@ -1,6 +1,7 @@
 //! Capabilities shared by generated caller surfaces.
 
 use std::future::Future;
+use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -42,6 +43,25 @@ pub trait WithIdempotency {
     /// Attach the key to subsequent calls through the returned surface.
     #[must_use = "discarding this value discards the idempotency key"]
     fn with_idempotency(&self, idempotency: impl Into<Idempotency>) -> Self::Output;
+}
+
+/// Bound every call made through a caller surface.
+///
+/// Implemented by the generated asynchronous clients: the plain one, the one that
+/// carries an idempotency key, and the keyed registry's. **The blocking clients
+/// do not implement it**: a blocking call that has to end sooner is bounded by the
+/// thread that made it, and a second timer under the first would answer the same
+/// question twice.
+pub trait WithDeadline: Sized {
+    /// The same surface, with each call's wait bounded by `budget`.
+    ///
+    /// The caller stops waiting after `budget` and gets
+    /// [`Error::DeadlinePassed`](crate::Error::DeadlinePassed), and the budget
+    /// travels in the request so the service stops waiting no later than that. The
+    /// work is not cancelled, so bound a keyed call and retry it with the same
+    /// key. See [`RpcClient::with_deadline`](crate::RpcClient::with_deadline).
+    #[must_use = "discarding this value discards the deadline"]
+    fn with_deadline(&self, budget: Duration) -> Self;
 }
 
 /// Read one actor's current serving state.
