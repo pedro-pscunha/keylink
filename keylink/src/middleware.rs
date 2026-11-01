@@ -18,7 +18,7 @@ use std::time::Duration;
 use iroh::EndpointId;
 use n0_future::time::Instant;
 
-use crate::{ActorId, Body, BodyReader, CallId, Outcome, RemoteError};
+use crate::{ActorId, Body, BodyReader, CallId, Outcome};
 
 pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -71,10 +71,13 @@ pub(crate) enum Reached {
     /// No layer called through. Nothing ran, so a claimed key owes nothing and
     /// is given back.
     NotDispatched,
-    /// The work may have started and did not report finishing — a `Timeout`
-    /// that dropped the wait for an actor turn already running *or* already
-    /// queued, or a connection that died. Whether it took effect is unknown,
-    /// which is what `Interrupted` says.
+    /// The work may have started and did not report finishing — a connection
+    /// that died, or a server that shut down, while an actor turn was running or
+    /// queued. Whether it took effect is unknown, which is what `Interrupted`
+    /// says.
+    ///
+    /// A deadline is not this: it answers the caller and goes on waiting for the
+    /// chain, so the key settles from what really happened.
     ///
     /// "May have" and not "did", since a message sitting in a mailbox is one
     /// nobody can promise did not run. Answering that with a release is the
@@ -251,11 +254,11 @@ impl Context {
         }
     }
 
-    /// The budget a [`QueueTimeout`] put on this call, for generated actor
-    /// dispatch to honour.
+    /// The budget a [`QueueTimeout`] or a deadline put on this call, for generated
+    /// actor dispatch to honour.
     ///
-    /// `None` on every call no `QueueTimeout` layer touched, which is every
-    /// call by default.
+    /// `None` on every call no `QueueTimeout` layer and no deadline touched,
+    /// which is every call by default.
     #[doc(hidden)]
     #[must_use]
     pub fn queueing(&self) -> Option<Queueing> {
@@ -273,6 +276,23 @@ impl Context {
     #[must_use]
     pub fn progress(&self) -> Progress {
         self.progress.clone()
+    }
+
+    /// Bound the time this call may spend **queued**, never beyond what a bound
+    /// already on it allows.
+    ///
+    /// Called by the accept loop for a deadline, and by [`QueueTimeout`] for its
+    /// budget. Where both apply the earlier one wins, so a deadline can only
+    /// shorten the wait a queue budget gave and never extend it. The deadline
+    /// sheds a message that has not started when the caller has stopped waiting;
+    /// it never reaches one that has.
+    pub(crate) fn bounded_by(mut self, deadline: Instant, millis: u64) -> Self {
+        let bound = Queueing { deadline, millis };
+        self.queueing = Some(match self.queueing {
+            Some(existing) if existing.deadline <= bound.deadline => existing,
+            Some(_) | None => bound,
+        });
+        self
     }
 
     /// Record which actor the request addresses. Called by the accept loop for
@@ -444,8 +464,8 @@ impl<'a> Caller<'a> {
     }
 }
 
-/// A [`QueueTimeout`]'s budget, as the two things the serving side needs: when
-/// it runs out, and how long it was, for the refusal to report.
+/// A [`QueueTimeout`]'s budget or a deadline's, as the two things the serving
+/// side needs: when it runs out, and how long it was, for the refusal to report.
 ///
 /// Carried on [`Context`] rather than kept inside the layer, because a layer
 /// cannot tell a queued message from a running one — only the actor's own task
@@ -465,7 +485,7 @@ impl Queueing {
         self.deadline
     }
 
-    /// The budget, for [`RemoteError::TimedOut`].
+    /// The budget, for [`RemoteError::TimedOut`](crate::RemoteError::TimedOut).
     #[doc(hidden)]
     #[must_use]
     pub fn millis(self) -> u64 {
@@ -520,16 +540,19 @@ impl Queueing {
 /// Refuses a message that is still **queued** when its budget expires, and
 /// never one that has started.
 ///
-/// # Why this is not `Timeout`
+/// # Why this is not a deadline
 ///
-/// A layer runs outside the mailbox, so a [`Timeout`]'s budget expiring drops
-/// the *wait for the reply*, not the turn: the turn runs to completion whatever
-/// the caller does. Ten callers get `TimedOut` at 100 ms and the actor still
-/// spends a hundred seconds producing replies nobody is waiting for. That is
-/// not load shedding; it is load shedding's shadow.
+/// A [deadline](crate::ServiceBuilder::deadline) answers the *caller* at a time,
+/// and the turn it was waiting for runs to completion whatever the caller does.
+/// Ten callers get `DeadlinePassed` at 100 ms and the actor still spends a hundred
+/// seconds producing replies nobody is waiting for. That is not load shedding; it
+/// is load shedding's shadow.
 ///
-/// This one sheds real load, because it refuses **before** the work starts. The
-/// deadline travels on the [`Context`] and is checked in two places, on both of
+/// This one sheds real load, because it refuses **before** the work starts. A
+/// deadline sheds the same way for the message it covers: it stamps its budget as
+/// a queueing bound too, the earlier of the two wins, and so a message still
+/// queued when the caller stops waiting never starts. That
+/// bound travels on the [`Context`] and is checked in two places, on both of
 /// the ways an actor is served: once around the wait for a mailbox permit, and
 /// once on the actor's own task immediately before the turn begins. So a message
 /// it refuses is a message that never ran, which is also what makes it the only
@@ -572,8 +595,9 @@ pub struct QueueTimeoutError;
 ///
 /// A [`Handler`](crate::Middleware) is dispatched immediately and never queues,
 /// so no message it serves is ever "still queued when the budget expired". The
-/// answer is honestly zero rather than falsely reported. Use [`Timeout`] there,
-/// where dropping the future genuinely cancels the work.
+/// answer is honestly zero rather than falsely reported. Use a
+/// [deadline](crate::ServiceBuilder::deadline) there: for an unkeyed call it drops
+/// the handler's future where it stands.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueTimeout {
     budget: Duration,
@@ -602,7 +626,7 @@ impl QueueTimeout {
 impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for QueueTimeout {
     fn handle(
         &self,
-        mut cx: Context,
+        cx: Context,
         req: Req,
         body: BodyReader,
         next: Next<Req, Resp>,
@@ -616,10 +640,10 @@ impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for QueueT
         // unrepresentable deadline is safest as an already-expired budget, not a
         // panic in the dispatch task.
         let deadline = now.checked_add(self.budget).unwrap_or(now);
-        cx.queueing = Some(Queueing {
+        let cx = cx.bounded_by(
             deadline,
-            millis: u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
-        });
+            u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
+        );
         next(cx, req, body)
     }
 }
@@ -646,97 +670,6 @@ pub trait Middleware<Req, Resp>: Send + Sync + 'static {
         body: BodyReader,
         next: Next<Req, Resp>,
     ) -> BoxFut<(Outcome<Resp>, Body)>;
-}
-
-/// Refuses a call that outlives its budget.
-///
-/// Bundled because a timeout is the one layer that is identical for every
-/// service and impossible to express without the error channel.
-///
-/// # Cancellation
-///
-/// When the budget expires the handler's future is dropped where it stands. A
-/// handler that must not be interrupted half way has to do that work in a task
-/// the drop cannot reach.
-///
-/// # On an actor it cancels nothing, and a key it gives up on stays refused
-///
-/// An actor's turn is exactly the work "a task the drop cannot reach" describes,
-/// because that is what a mailbox is. This layer runs outside it, so the budget
-/// expiring drops the *wait for the reply* and nothing else: the message is
-/// already queued and the turn runs to completion whatever the caller does. Ten
-/// callers get `TimedOut` at 100 ms and the actor still spends a hundred seconds
-/// producing replies nobody is waiting for. That is not load shedding.
-///
-/// Put an [`IdempotencyKey`](crate::IdempotencyKey) on the same call and the
-/// answer is honest, permanent, and probably not what the caller hoped for. A
-/// key settles on **what ran**, read the instant the chain answers, and this
-/// layer answers while the message is somewhere it cannot see — queued, or in a
-/// turn. Both settle
-/// [`Interrupted`](crate::IdempotencyRefusal::Interrupted), so every retry of
-/// that call is refused for as long as the ledger keeps the entry and the
-/// caller has to reconcile out of band.
-///
-/// That the two cases now agree is the fix, not an accident. A message still
-/// queued when the budget expired used to leave the key **released** — nothing
-/// had marked it — and then the turn ran, and the retry the released key invited
-/// ran the same work a second time: at-least-once, out of the module whose one
-/// promise is at-most-once. Reaching a mailbox is a fact the marker records, so
-/// giving up on a message that reached one can no longer be mistaken for giving
-/// up on one that never did. RFC-04 §16.12.
-///
-/// [`QueueTimeout`] is still the bound for an actor: it refuses only a message
-/// that has not started, which is what leaves the key *claimable* rather than
-/// settled, so the retry is a first attempt instead of a refusal. Keep this one
-/// for a [`Handler`](crate::Middleware), where dropping the future genuinely
-/// cancels the work — and for the one job on an actor that nothing else in the
-/// crate does, below.
-///
-/// # The only bound that answers a caller behind a turn that never returns
-///
-/// Both dispatch paths bound the wait for a mailbox *permit*, and neither
-/// bounds the wait for the *answer*. So a turn that never returns — a self-call
-/// deadlock, an await on something that never fires — holds its caller forever,
-/// and [`QueueTimeout`] cannot help: its permit-side check has already passed,
-/// and its turn-side check runs when the message is taken, which never happens.
-///
-/// This layer is what answers that caller. It is not a worse `QueueTimeout`; it
-/// is the liveness backstop for the case `QueueTimeout` structurally cannot
-/// see, which is why a marker bound refusing it on actor builders was rejected.
-/// RFC-04 §16.12.
-#[derive(Debug, Clone, Copy)]
-pub struct Timeout {
-    budget: Duration,
-}
-
-impl Timeout {
-    /// Refuse any call still running after `budget`.
-    pub fn after(budget: Duration) -> Self {
-        Self { budget }
-    }
-}
-
-impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for Timeout {
-    fn handle(
-        &self,
-        cx: Context,
-        req: Req,
-        body: BodyReader,
-        next: Next<Req, Resp>,
-    ) -> BoxFut<(Outcome<Resp>, Body)> {
-        let budget = self.budget;
-        Box::pin(async move {
-            match n0_future::time::timeout(budget, next(cx, req, body)).await {
-                Ok(reply) => reply,
-                Err(_) => (
-                    Outcome::Err(RemoteError::TimedOut {
-                        millis: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-                    }),
-                    Body::empty(),
-                ),
-            }
-        })
-    }
 }
 
 /// Wrap `inner` in `layer`. Used by [`ServiceBuilder`](crate::ServiceBuilder).

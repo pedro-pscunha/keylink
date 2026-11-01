@@ -22,11 +22,14 @@
 //! call **before** dispatch — an authorization rule, a [`QueueTimeout`] whose
 //! budget expired while the message was still queued — leaves the key
 //! claimable, because that refusal is proof nothing ran and nothing is owed. A
-//! layer that gives up **after** dispatch, such as a
-//! [`Timeout`](crate::Timeout) that drops the wait for an actor turn already
-//! running or already queued to run, settles the key as
-//! [`Interrupted`](IdempotencyRefusal::Interrupted): whether the work landed is
-//! genuinely not known from there.
+//! call that is **cut off** after dispatch, because its connection ended or its
+//! server shut down while an actor turn was running or already queued to run,
+//! settles the key as [`Interrupted`](IdempotencyRefusal::Interrupted): whether
+//! the work landed is genuinely not known from there.
+//!
+//! A [deadline](crate::ServiceBuilder::deadline) is not a cut-off. It answers the
+//! caller and goes on waiting for the call, so the key settles as what the call
+//! really returned and a retry is handed that answer.
 //!
 //! The line is proof, not order. A message that reached a mailbox is one whose
 //! turn runs whether the caller stayed or not, so releasing its key hands a
@@ -1870,8 +1873,9 @@ impl Limits {
     ///
     /// `serve_one` finishes `claim_key` — the whole park, and the re-claim after
     /// it — **before** it calls the layer chain. So a
-    /// [`Timeout`](crate::Timeout) or [`QueueTimeout`](crate::QueueTimeout) layer
-    /// starts its clock once this wait is already over, and neither can bound it.
+    /// [`QueueTimeout`](crate::QueueTimeout) layer, and a
+    /// [deadline](crate::ServiceBuilder::deadline), start their clocks once this
+    /// wait is already over, and neither can bound it.
     /// This setter is the only thing that bounds its **duration** —
     /// [`waiting`](Self::waiting) and
     /// [`waiting_per_peer`](Self::waiting_per_peer) bound how many such waits run
@@ -2865,10 +2869,22 @@ impl Guard {
     /// ledger cannot replay is a reply the caller will ask for again.
     /// `Records::Memory` and `Records::None` cannot fail and this is always
     /// `Ok` for them.
+    ///
+    /// # `before_publish`, and the one moment it runs
+    ///
+    /// Called once, **after** the store has accepted the record and **before** the
+    /// slot is published, which is the instant attaching retries are woken and a
+    /// replay can be written. It exists for the capability a reply carries: a blob
+    /// grant has to exist before anybody can be handed the address, and installing
+    /// it after the publish leaves a window in which an attacher on another worker
+    /// replays a new blob reply and fetches before the grant is there. It is not
+    /// called when the store refuses the record, so a reply this ledger cannot
+    /// replay grants nothing.
     pub(crate) async fn record(
         mut self,
         frame: &Bytes,
         carries_body: bool,
+        before_publish: impl FnOnce(),
     ) -> Result<(), RemoteError> {
         // Three causes, one slot, and that is the whole of Wave 2's wire cost:
         // nothing. `Slot::Unrecordable` reads "the handler ran, and its reply is
@@ -2945,6 +2961,7 @@ impl Guard {
             self.ledger.queue_reconcile(self.peer, &self.key);
             return Err(refusal);
         }
+        before_publish();
         self.ledger.settle(self.peer, &self.key, slot);
         Ok(())
     }
@@ -3140,10 +3157,16 @@ mod tests {
     /// latency regression on every keyed call in the crate and would otherwise
     /// be invisible — the tests would simply get slower.
     fn settle(guard: Guard, frame: &Bytes, carries_body: bool) {
+        settle_then(guard, frame, carries_body, || {});
+    }
+
+    /// [`settle`], with the hook [`Guard::record`] runs between the store and the
+    /// publish.
+    fn settle_then(guard: Guard, frame: &Bytes, carries_body: bool, hook: impl FnOnce()) {
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 
-        let mut recording = std::pin::pin!(guard.record(frame, carries_body));
+        let mut recording = std::pin::pin!(guard.record(frame, carries_body, hook));
         let mut cx = Context::from_waker(Waker::noop());
         match recording.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(())) => {}
@@ -3336,7 +3359,7 @@ mod tests {
 
         /// A future driven to completion, for the parts of the setup that do
         /// answer.
-        fn now<F: Future>(future: F) -> F::Output {
+        pub(super) fn now<F: Future>(future: F) -> F::Output {
             let mut future = std::pin::pin!(future);
             let mut cx = Context::from_waker(Waker::noop());
             match future.as_mut().poll(&mut cx) {
@@ -3382,7 +3405,7 @@ mod tests {
             }
         }
 
-        fn ledger_on<E: Entries>(store: &E) -> Arc<Ledger> {
+        pub(super) fn ledger_on<E: Entries>(store: &E) -> Arc<Ledger> {
             let id = StateId::new("test/ledger").expect("a valid id");
             let records = now(crate::durable::DurableRecords::open(store, &id))
                 .expect("nobody else holds this ledger");
@@ -3397,7 +3420,7 @@ mod tests {
             ledger_on(&Stalling)
         }
 
-        fn dispatched() -> Progress {
+        pub(super) fn dispatched() -> Progress {
             let progress = Progress::new();
             progress.dispatched();
             progress
@@ -3413,7 +3436,7 @@ mod tests {
             // `NotDispatched` guard releases instead, which would be green for
             // the wrong reason.
             let claimed = guard(ledger.claim(peer(A), key("k"), [0; 32])).watching(dispatched());
-            abort(claimed.record(&frame(16), false));
+            abort(claimed.record(&frame(16), false, || {}));
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Interrupted);
         }
@@ -3440,6 +3463,114 @@ mod tests {
             let claim = now(ledger.claim_durably(peer(A), key("k"), [0; 32]));
 
             assert_eq!(refusal(claim), IdempotencyRefusal::NotClaimed);
+        }
+    }
+
+    /// Where [`Guard::record`] runs its hook: after the store has the record, and
+    /// before the slot is published.
+    ///
+    /// The hook is the blob grant, and the order is the whole property. Published
+    /// first, a retry attached to this call is woken and handed the new reply while
+    /// the grant is still to come, and the fetch it makes next is refused. Run
+    /// before the store, a record the store then refuses would have granted an
+    /// address that no reply carries.
+    #[cfg(feature = "persist")]
+    mod publication {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use keylink_persist::{Entries, EntryKey, Held, StateId};
+
+        use super::aborts::{dispatched, ledger_on, now};
+        use super::*;
+
+        /// A store that accepts the first write, which is the claim, and refuses
+        /// every write after it, which is the settle.
+        struct ClaimsThenRefuses;
+
+        struct Claimed(AtomicUsize);
+
+        impl Entries for ClaimsThenRefuses {
+            type Held = Claimed;
+
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Claimed> {
+                Ok(Claimed(AtomicUsize::new(0)))
+            }
+        }
+
+        impl Held for Claimed {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(keylink_persist::Error::TooLarge {
+                        offered: 1,
+                        limit: 0,
+                    })
+                }
+            }
+
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// The key still reads `Running` when the hook runs, and `Done` once
+        /// `record` has returned.
+        ///
+        /// Made red by `scripts/break-once.sh keylink/src/idempotency.rs`, swapping
+        /// the two lines `Guard::record` ends with, the call of `before_publish` and
+        /// the ledger's `settle` of the slot (a two-line edit that cannot quote its
+        /// anchor without making it appear twice, so it is described and not
+        /// registered), which publishes first. Watched: `the hook ran before the
+        /// slot was published`, `left: Some(Done)`.
+        #[test]
+        fn the_hook_runs_before_the_slot_is_published() {
+            let ledger = bounded(Limits::default());
+            let claimed = guard(ledger.claim(peer(A), key("k"), [0; 32]));
+            let seen = std::cell::Cell::new(None);
+
+            settle_then(claimed, &frame(16), false, || {
+                seen.set(Some(ledger.key_state(peer(A), &key("k"))));
+            });
+
+            assert_eq!(
+                seen.get(),
+                Some(KeyState::Running),
+                "the hook ran before the slot was published"
+            );
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Done);
+        }
+
+        /// A record the store refuses runs no hook, so the reply it would have
+        /// carried grants nothing.
+        ///
+        /// The claim is the first write and is accepted; the settle is the second
+        /// and is refused with `TooLarge`, which `record` reports as
+        /// `Unrecordable`. Made red by calling the hook on the refusal path, just
+        /// before that path returns its `Err` (a two-line edit, described and not
+        /// registered), which is what a hook run ahead of the store would do for a
+        /// reply no caller is sent. Watched: `a refused record must grant nothing`.
+        #[test]
+        fn a_record_the_store_refuses_runs_no_hook() {
+            let ledger = ledger_on(&ClaimsThenRefuses);
+            let claimed = match now(ledger.claim_durably(peer(A), key("k"), [0; 32])) {
+                Claim::Fresh(guard) => guard.watching(dispatched()),
+                other => panic!("expected a fresh claim, got {other:?}"),
+            };
+            let ran = std::cell::Cell::new(false);
+
+            let result = now(claimed.record(&frame(16), false, || ran.set(true)));
+
+            assert!(result.is_err(), "the store refused the record");
+            assert!(!ran.get(), "a refused record must grant nothing");
         }
     }
 

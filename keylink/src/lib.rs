@@ -194,6 +194,11 @@ pub mod blocking;
 mod actor;
 mod admission;
 mod authz;
+// Slow work that leaves a turn and comes back as one. Its own module for
+// `parking.rs`'s reason: the invariant, that a launch can only be made inside a
+// running dispatch, belongs to these types together and to nothing else in
+// `turns.rs`.
+mod away;
 mod blobs;
 mod body;
 // The name a keyed call has inside its own handler, and a set to hold what has
@@ -266,6 +271,7 @@ pub mod trust;
 
 pub use admission::{Admission, Admittance, DynamicAdmission, LiveConnection, Refusal, Revocable};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
+pub use away::Back;
 pub use blobs::{
     BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Fetched, Grant, Granting,
     Missing, Retention, SeqId, GRANT_LIMIT,
@@ -345,7 +351,7 @@ pub use idempotency::{
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{
-    Caller, Context, Middleware, Next, QueueTimeout, QueueTimeoutError, Queueing, Rpc, Timeout,
+    Caller, Context, Middleware, Next, QueueTimeout, QueueTimeoutError, Queueing, Rpc,
 };
 pub use node::{derive_alpn, Node};
 pub use observe::{
@@ -364,11 +370,11 @@ pub use rpc::{
 pub use subscribers::Subscribers;
 #[doc(hidden)]
 pub use surfaces::RegistryDispatch;
-pub use surfaces::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+pub use surfaces::{BlockingWire, Own, Servable, Status, Wire, WithDeadline, WithIdempotency};
 
 /// Extension traits for generated caller surfaces.
 pub mod prelude {
-    pub use crate::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+    pub use crate::{BlockingWire, Own, Servable, Status, Wire, WithDeadline, WithIdempotency};
 }
 pub use turns::{
     deliver_unkeyed, feed_turn, run_keyed, run_keyed_supervised, serving_unkeyed, turn,

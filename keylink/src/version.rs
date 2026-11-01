@@ -269,6 +269,7 @@ pub(crate) trait Codec<Req, Resp>: Send + Sync + fmt::Debug {
         &self,
         body_len: Option<u64>,
         idem: Option<&Idempotency>,
+        wait_ms: Option<u64>,
         r: WireRequest<Req>,
     ) -> Result<Bytes>;
     fn decode_response(&self, bytes: &[u8]) -> Result<Envelope<WireResponse<Resp>>>;
@@ -350,6 +351,7 @@ where
         &self,
         body_len: Option<u64>,
         idem: Option<&Idempotency>,
+        wait_ms: Option<u64>,
         r: WireRequest<Req>,
     ) -> Result<Bytes> {
         let message =
@@ -357,7 +359,9 @@ where
                 version: self.version,
                 source,
             })?;
-        Ok(wire::encode_header(body_len, idem, &message)?)
+        Ok(wire::encode_request_header(
+            body_len, idem, wait_ms, &message,
+        )?)
     }
     fn decode_response(&self, bytes: &[u8]) -> Result<Envelope<WireResponse<Resp>>> {
         let r: Envelope<WireResponse<P::Response>> = postcard::from_bytes(bytes)?;

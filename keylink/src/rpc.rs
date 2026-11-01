@@ -39,6 +39,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::{
@@ -47,6 +48,7 @@ use iroh::{
     EndpointAddr, EndpointId,
 };
 use n0_future::task::JoinSet;
+use n0_future::time::Instant;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::admission::settle;
@@ -58,8 +60,8 @@ use crate::error::ConfigError;
 // re-export goes, which would leave that test proving nothing.
 use crate::blobs::{Fence, Permit};
 use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
-use crate::middleware::{wrap, Reached};
-use crate::version::{read_probe, Codec, Lineage, PeerWindow, Probe, Version};
+use crate::middleware::{wrap, Progress, Reached};
+use crate::version::{read_probe, Codec, EncodedReply, Lineage, PeerWindow, Probe, Version};
 use crate::wire::FrameReader;
 use crate::{
     wire, Admission, AdmittedPeer, Allowlist, BlobHandle, Blobs, Body, BodyReader, CallId, Content,
@@ -68,6 +70,17 @@ use crate::{
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The two halves of one call's stream, and the longest this service waits for its
+/// answer.
+///
+/// One value so that `serve_one` keeps the arguments it had before the deadline
+/// existed.
+struct Served {
+    send: SendStream,
+    recv: RecvStream,
+    deadline: Option<Duration>,
+}
 
 /// Which kind of stream the accept loop just took.
 enum Stream {
@@ -269,6 +282,9 @@ pub(crate) struct RpcService<Req, Resp> {
     /// What this service does with an idempotency key: which methods accept
     /// one, and where the accepted ones are recorded.
     keys: Keys,
+    /// How long this service waits for any call's answer. See
+    /// [`ServiceBuilder::deadline`].
+    deadline: Option<Duration>,
     _p: PhantomData<fn(Req) -> Resp>,
 }
 
@@ -282,6 +298,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
             required: self.required.clone(),
             blobs: self.blobs.clone(),
             keys: self.keys.clone(),
+            deadline: self.deadline,
             _p: PhantomData,
         }
     }
@@ -717,6 +734,29 @@ where
 }
 
 /// Answer one call on its own stream.
+///
+/// # The deadline lives here, outside every layer
+///
+/// A layer sits **inside** the idempotency guard this function holds, so a layer
+/// that stopped waiting could only drop the wait and leave the guard to settle
+/// `Interrupted`: the caller lost both the answer and the right to retry, though
+/// the work had run. This function holds the guard and the chain together, so it
+/// can answer the caller at the deadline and **keep waiting** for what the chain
+/// really does.
+///
+/// - An **unkeyed** call is dropped at the deadline. A `Handler`'s future is
+///   cancelled where it stands; an actor turn that is already running finishes,
+///   and its reply is discarded.
+/// - A **keyed** call is awaited to the end and settled from what happened, so a
+///   retry attaches to it or replays its real answer and the work runs once. If
+///   the connection ends first, the task is aborted and the key settles
+///   `Interrupted`, which is limit 6 of the guarantee unchanged.
+///
+/// The budget is the shorter of the service's deadline and the caller's, and it
+/// counts from the moment the call is claimed: a wait for the ledger has its own
+/// bound, [`Limits::attach`](crate::Limits), and must not shed the call a retry
+/// is waiting to run. The same budget is stamped on the call as a queueing bound,
+/// so a message still queued when the caller stops waiting never starts.
 async fn serve_one<Req, Resp>(
     codec: Arc<dyn Codec<Req, Resp>>,
     next: Next<Req, Resp>,
@@ -724,13 +764,17 @@ async fn serve_one<Req, Resp>(
     keys: Keys,
     grants: Option<(Blobs, Fence)>,
     admitted: AdmittedPeer,
-    streams: (SendStream, RecvStream),
+    served: Served,
 ) -> Result<()>
 where
     Req: Rpc + DeserializeOwned + 'static,
     Resp: Serialize + Granting,
 {
-    let (mut send, recv) = streams;
+    let Served {
+        mut send,
+        recv,
+        deadline,
+    } = served;
     let peer = admitted.id();
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
@@ -824,34 +868,239 @@ where
         Claimed::Refuse(refusal) => return refuse(&mut send, refusal, codec.as_ref()).await,
     };
 
+    // Counted from here, after any wait on the ledger, for the reason in this
+    // function's header.
+    let bound = bound_of(deadline, request.control.wait_ms);
+    let cx = match bound {
+        Some((budget, at)) => cx.bounded_by(at, millis_of(budget)),
+        None => cx,
+    };
+
     // The fence in `grants` was taken when this stream was accepted, before the
     // request was read or the key claimed, so a revoke that lands at any point
     // after that reaches the grant this call is about to make.
-    let (outcome, body) = next(
+    let chain = next(
         cx,
         message,
         BodyReader::new(frames, request.control.body_len),
-    )
-    .await;
+    );
 
-    // Prepare the negotiated reply before reserving its Content, and make the
-    // permit live before writing it. Conversion refusals reserve nothing; a
-    // successful conversion preserves the Content kind and root.
-    //
-    // This is also the only place both halves exist. The handler returned the
-    // content and knows nothing about peers; `accept` proved the peer and knows
-    // nothing about content. Neither could record this on its own, which is why
-    // the reply carries the content back here through `Granting` rather than
-    // the store being threaded down into dispatch.
-    //
-    // **Two phases, because the ledger can refuse and a durable idempotency
-    // ledger can too.** Reserving is where the byte budget answers: a reply that
-    // cannot be granted is replaced by `GrantsExhausted` in both the current
-    // record and the negotiated frame, so the caller is never handed unusable
-    // content and the same refusal is what a keyed retry replays. Committing waits for the idempotency ledger to
-    // settle, because a grant made live above and a record refused below would
-    // leave the far side holding a live grant for an address this reply never
-    // carried. An early return drops the permit, which releases the reservation.
+    // **One future from the chain to the decision to write the reply header.** It
+    // runs the chain, prepares the reply (reserving its grant), and settles the
+    // key, and the deadline is raced against all of it. Raced against the chain
+    // alone, a fast handler followed by a durable settle that waits on its store
+    // lock or its disk would leave the caller with no answer past the deadline,
+    // and the deadline would have promised one. If the deadline passes while the
+    // key is settling, this same future goes on settling: the guard inside it is
+    // not dropped, and the permit inside it is committed or released by the same
+    // code that would have run on time.
+    let is_keyed = keyed.is_some();
+    let (codec_ref, grants_ref, admitted_ref, progress_ref) =
+        (codec.as_ref(), grants.as_ref(), &admitted, &progress);
+    let mut call = Box::pin(async move {
+        let (outcome, body) = chain.await;
+        let Prepared {
+            frame,
+            payload,
+            encoded,
+            permit,
+        } = prepare_reply(codec_ref, grants_ref, admitted_ref, outcome, &body)?;
+        let settled = settle_key(keyed, progress_ref, &frame, payload, permit).await;
+        Ok::<_, Error>((encoded, body, settled))
+    });
+
+    let finished = match race(bound.map(|(budget, _)| budget), &mut call).await {
+        Raced::Done(finished) => finished,
+        Raced::Late(budget) => {
+            let said = Box::pin(refuse(
+                &mut send,
+                RemoteError::DeadlinePassed {
+                    millis: millis_of(budget),
+                },
+                codec.as_ref(),
+            ));
+            if is_keyed {
+                // Keyed: the truth, for the key. The call is driven to its end,
+                // and the connection ending first aborts this task and settles
+                // `Interrupted`. A failure to write the notice is dropped: the
+                // caller has gone, and the key is owed whether or not anybody
+                // hears about it.
+                finish_late(said, call).await;
+            } else {
+                // Unkeyed: nothing is owed, so the call is dropped before the
+                // notice is written, and a notice the peer will not read cannot
+                // keep a handler's future alive.
+                drop(call);
+                let _ = said.await;
+            }
+            return Ok(());
+        }
+    };
+
+    let (encoded, body, settled) = finished?;
+    // Settled before the reply is written, so a reply lost on the way back
+    // still replays. That is the failure this exists for: the handler finished
+    // and the caller never heard.
+    if let Err(refusal) = settled {
+        return refuse(&mut send, refusal, codec.as_ref()).await;
+    }
+    wire::write_frame(&mut send, encoded.frame).await?;
+    if encoded.carry_body {
+        body.write_to(&mut send).await?;
+    }
+    send.finish()?;
+    Ok(())
+}
+
+/// What racing a call against its budget decided.
+enum Raced<T> {
+    /// The call finished inside its budget, or had none.
+    Done(T),
+    /// The budget passed first. The call was not polled again and is not dropped:
+    /// the caller still holds it.
+    Late(Duration),
+}
+
+/// Drive `call` for at most `budget`, and say which came first.
+///
+/// Borrows the call and does not consume it, which is the whole shape: the
+/// deadline ends a *wait*, and what to do with the call afterwards (drop it, or go
+/// on driving it) is the caller's decision. `n0_future`'s `timeout` on `&mut call`
+/// is exactly that, and this is the one place it is spelled, so a test of the
+/// boundary does not need a network.
+async fn race<F: Future + Unpin>(budget: Option<Duration>, call: &mut F) -> Raced<F::Output> {
+    let Some(budget) = budget else {
+        return Raced::Done(call.await);
+    };
+    match n0_future::time::timeout(budget, call).await {
+        Ok(done) => Raced::Done(done),
+        Err(_) => Raced::Late(budget),
+    }
+}
+
+/// What a keyed call does after its caller has been told the deadline passed:
+/// write the notice and drive the call to its end, **each independent of the
+/// other**.
+///
+/// The notice is a write to a peer that has stopped waiting, and a peer that
+/// stops waiting may also stop reading: with no receive credit the write simply
+/// never completes. Awaited first, it would hold the call at its current await and
+/// the key would never settle even after the work behind it was ready. So both are
+/// polled together, the call's outcome never depends on the notice, and a notice
+/// still pending when the call is done is awaited last, when nothing is held.
+async fn finish_late<S, C>(mut said: S, mut call: C)
+where
+    S: Future + Unpin,
+    C: Future + Unpin,
+{
+    use std::task::Poll;
+
+    let mut written = false;
+    std::future::poll_fn(|cx| {
+        if !written && Pin::new(&mut said).poll(cx).is_ready() {
+            written = true;
+        }
+        match Pin::new(&mut call).poll(cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    if !written {
+        let _ = said.await;
+    }
+}
+
+/// The longest wait a timer on this target can express.
+///
+/// In a browser `setTimeout` takes a signed 32-bit number of milliseconds, and
+/// `n0_future`'s timer casts a duration to one with `as i32`, unchecked: a wait of
+/// `i32::MAX + 1` milliseconds (about 24.8 days) becomes a negative delay and fires
+/// at once. A deadline that long would then end every unkeyed call the moment it
+/// began, and a keyed one would be answered `DeadlinePassed` immediately. So a
+/// budget is **clamped** to this ceiling, in the browser only: a deadline longer
+/// than it waits this long and no longer. Native timers hold any duration the clock
+/// does, and the ceiling there is `Duration::MAX`, which clamps nothing.
+const TIMER_CEILING: Duration = if cfg!(all(target_family = "wasm", target_os = "unknown")) {
+    Duration::from_millis(i32::MAX as u64)
+} else {
+    Duration::MAX
+};
+
+/// The shorter of the service's deadline and the caller's, and when it runs out.
+///
+/// `None` when neither is set, and also when the instant is not representable on
+/// this clock: a caller that asks to wait for ever is a caller with no deadline,
+/// and a panic in the accept task is not an answer to it. A budget the clock holds
+/// but the timer cannot is clamped to [`TIMER_CEILING`], not dropped.
+fn bound_of(service: Option<Duration>, caller_ms: Option<u64>) -> Option<(Duration, Instant)> {
+    bound_within(service, caller_ms, TIMER_CEILING)
+}
+
+/// [`bound_of`] against a given ceiling, so the clamp is testable on a target whose
+/// own ceiling is not the browser's.
+fn bound_within(
+    service: Option<Duration>,
+    caller_ms: Option<u64>,
+    ceiling: Duration,
+) -> Option<(Duration, Instant)> {
+    let caller = caller_ms.map(Duration::from_millis);
+    let budget = match (service, caller) {
+        (Some(service), Some(caller)) => service.min(caller),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => return None,
+    };
+    let now = Instant::now();
+    now.checked_add(budget)?;
+    let budget = budget.min(ceiling);
+    now.checked_add(budget).map(|at| (budget, at))
+}
+
+/// A budget as the milliseconds `DeadlinePassed` and `TimedOut` report.
+fn millis_of(budget: Duration) -> u64 {
+    u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A finished call's reply, in every shape it is needed in.
+struct Prepared {
+    /// The current-contract frame, length prefix included. This is what a key
+    /// records, whatever contract the connection negotiated.
+    frame: Bytes,
+    /// Whether a body follows the header, which a record cannot hold.
+    payload: bool,
+    /// The same reply in the connection's negotiated shape, and whether the
+    /// handler's body can follow it.
+    encoded: EncodedReply,
+    /// The grant the reply carries, reserved and not yet live.
+    permit: Option<Permit>,
+}
+
+/// Prepare the negotiated reply before reserving its Content, and make the
+/// permit live later. Conversion refusals reserve nothing; a successful
+/// conversion preserves the Content kind and root.
+///
+/// This is also the only place both halves exist. The handler returned the
+/// content and knows nothing about peers; `accept` proved the peer and knows
+/// nothing about content. Neither could record this on its own, which is why the
+/// reply carries the content back here through `Granting` rather than the store
+/// being threaded down into dispatch.
+///
+/// **Two phases, because the ledger can refuse and a durable idempotency ledger
+/// can too.** Reserving is where the byte budget answers: a reply that cannot be
+/// granted is replaced by `GrantsExhausted` in both the current record and the
+/// negotiated frame, so the caller is never handed unusable content and the same
+/// refusal is what a keyed retry replays. Committing waits for the idempotency
+/// ledger to accept the record, because a grant made live above and a record
+/// refused below would leave the far side holding a live grant for an address
+/// this reply never carried. An early return drops the permit, which releases the
+/// reservation.
+fn prepare_reply<Req, Resp: Serialize + Granting>(
+    codec: &dyn Codec<Req, Resp>,
+    grants: Option<&(Blobs, Fence)>,
+    admitted: &AdmittedPeer,
+    outcome: Outcome<Resp>,
+    body: &Body,
+) -> Result<Prepared> {
     let current_grant = match &outcome {
         Outcome::Ok(response) => response.granted(),
         Outcome::Err(_) => None,
@@ -865,8 +1114,8 @@ where
     // preserve the complete Content (both kind and root), not merely its bytes.
     let converted = codec.reencode_response(frame.clone(), current_grant)?;
     let (converted, permit) = grant_or_refuse(
-        grants.as_ref().map(|(blobs, fence)| (blobs, fence)),
-        &admitted,
+        grants.map(|(blobs, fence)| (blobs, fence)),
+        admitted,
         Outcome::Ok(converted),
     );
     let encoded = match converted {
@@ -882,30 +1131,59 @@ where
             encoded
         }
     };
-    // Settled before the reply is written, so a reply lost on the way back
-    // still replays. That is the failure this exists for: the handler finished
-    // and the caller never heard.
-    //
-    // Which way it settles is decided by how far the call got, NOT by whether
-    // the chain returned an `Outcome::Err` — a refusing layer and a panicking
-    // actor turn produce the same value and owe completely different things.
-    //
-    // A reply with a payload behind it is recorded as unrecordable rather than
-    // as itself. Bodies are streamed and never held, and a header replayed
-    // without its payload decodes into a body that never arrives.
-    //
-    // A durable ledger is the one that can REFUSE to settle. Its `record` does
-    // not resolve until the record is on the disk, and if it cannot be, the
-    // reply below is never written: a reply this service cannot replay is a
-    // reply the caller will ask for again, and answering it once would be
-    // exactly the double execution the key was sent to prevent.
+    Ok(Prepared {
+        frame,
+        payload: body.declared_len() != Some(0),
+        encoded,
+        permit,
+    })
+}
+
+/// Settle a keyed call's ledger entry from how far it got, and make the grant its
+/// reply carries live **before** the entry can be replayed.
+///
+/// Which way the key settles is decided by how far the call got, NOT by whether
+/// the chain returned an `Outcome::Err` — a refusing layer and a panicking actor
+/// turn produce the same value and owe completely different things.
+///
+/// A reply with a payload behind it is recorded as unrecordable rather than as
+/// itself. Bodies are streamed and never held, and a header replayed without its
+/// payload decodes into a body that never arrives.
+///
+/// A durable ledger is the one that can REFUSE to settle. Its `record` does not
+/// resolve until the record is on the disk, and if it cannot be, the reply is
+/// never written: a reply this service cannot replay is a reply the caller will
+/// ask for again, and answering it once would be exactly the double execution the
+/// key was sent to prevent. That refusal is the `Err`, and the permit is dropped
+/// with it, which releases the reservation.
+///
+/// # The permit is committed between the store and the publish
+///
+/// The reply names content that the caller fetches next, and a retry that
+/// attached to this call is handed the same reply the instant the slot is
+/// published. So the permit is committed after the store has accepted the record,
+/// which keeps the rule that a refused record grants nothing, and before the slot
+/// is published, which keeps a retry on another worker from fetching ahead of the
+/// grant. Every other arm has no slot to publish and commits after.
+///
+/// Shared by the call that finished inside its deadline and the keyed one that
+/// finished after it, so a late answer is recorded, replayed and granted exactly
+/// as an early one is.
+async fn settle_key(
+    keyed: Option<Guard>,
+    progress: &Progress,
+    frame: &Bytes,
+    payload: bool,
+    permit: Option<Permit>,
+) -> std::result::Result<(), RemoteError> {
+    let commit = move || {
+        if let Some(permit) = permit {
+            permit.commit();
+        }
+    };
     if let Some(guard) = keyed {
         match progress.reached() {
-            Reached::Completed => {
-                if let Err(refusal) = guard.record(&frame, body.declared_len() != Some(0)).await {
-                    return refuse(&mut send, refusal, codec.as_ref()).await;
-                }
-            }
+            Reached::Completed => return guard.record(frame, payload, commit).await,
             // A layer said no WITHOUT calling through. Nothing ran and nothing
             // is owed, so the key goes back — and on a durable service the
             // store has to hear that before this refusal reaches the caller,
@@ -921,14 +1199,7 @@ where
             Reached::Dispatched => drop(guard),
         }
     }
-    if let Some(permit) = permit {
-        permit.commit();
-    }
-    wire::write_frame(&mut send, encoded.frame).await?;
-    if encoded.carry_body {
-        body.write_to(&mut send).await?;
-    }
-    send.finish()?;
+    commit();
     Ok(())
 }
 
@@ -1053,7 +1324,11 @@ where
                         self.keys.clone(),
                         grants,
                         admitted,
-                        (send, recv),
+                        Served {
+                            send,
+                            recv,
+                            deadline: self.deadline,
+                        },
                     ));
                 }
                 Ok(Stream::Uni(recv)) => {
@@ -1088,6 +1363,7 @@ mod tests {
 
     // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
+    use crate::BlobId;
 
     #[test]
     // Made red with scripts/break-once.sh by zeroing the holder contribution in replay_binding with `hash.update(&[0; 32]);`.
@@ -1151,6 +1427,466 @@ mod tests {
         Keys {
             keyable: Keyable::Any,
             ledger: Some(Arc::clone(ledger)),
+        }
+    }
+
+    /// The shorter of the service's deadline and the caller's is the budget, and a
+    /// side that set none leaves the other's alone.
+    ///
+    /// The caller's budget arrives from the network, so this is also where a hostile
+    /// one is made harmless: a budget the clock cannot represent is no deadline,
+    /// and not a panic in the accept task. `Duration::MAX` is more seconds than
+    /// `Instant` holds on native clocks, where `u64::MAX` milliseconds is not
+    /// on all of them, so it is the value the assertion uses.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `bound_of`'s
+    /// `(Some(service), Some(caller)) => service.min(caller),` (indented eight
+    /// spaces) and the replacement `(Some(service), Some(caller)) =>
+    /// service.max(caller),`. Watched: `the shorter budget applies`.
+    #[test]
+    fn the_shorter_budget_applies_and_an_unrepresentable_one_is_no_deadline() {
+        let secs = Duration::from_secs;
+        let budget = |service, caller| bound_of(service, caller).map(|(budget, _)| budget);
+
+        assert_eq!(
+            budget(Some(secs(5)), Some(2_000)),
+            Some(secs(2)),
+            "the shorter budget applies"
+        );
+        assert_eq!(budget(Some(secs(1)), Some(2_000)), Some(secs(1)));
+        assert_eq!(budget(Some(secs(3)), None), Some(secs(3)));
+        assert_eq!(budget(None, Some(4_000)), Some(secs(4)));
+        assert_eq!(
+            budget(None, None),
+            None,
+            "no budget on either side is no deadline"
+        );
+        assert_eq!(
+            budget(Some(Duration::MAX), None),
+            None,
+            "a budget the clock cannot hold must not panic the accept task"
+        );
+    }
+
+    /// A budget longer than the target's timer can hold is clamped to the ceiling
+    /// and not wrapped, and a budget at the ceiling is left alone.
+    ///
+    /// The browser's ceiling is `i32::MAX` milliseconds, because its timer casts to
+    /// `i32` and a longer wait becomes a negative delay that fires at once. This
+    /// native build has no such ceiling, so the test hands `bound_within` the
+    /// browser's and checks both sides of it, on the service's budget and on the
+    /// caller's. A budget the clock cannot hold stays no deadline at all, clamp or
+    /// not.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `bound_within`'s
+    /// `let budget = budget.min(ceiling);` (indented four spaces) and the
+    /// replacement `let budget = budget;`. Watched: `a budget over the ceiling is
+    /// clamped`.
+    #[test]
+    fn a_budget_over_the_timer_ceiling_is_clamped_and_not_wrapped() {
+        const CEILING_MS: u64 = i32::MAX as u64;
+        let ceiling = Duration::from_millis(CEILING_MS);
+        let one_over = ceiling + Duration::from_millis(1);
+        let budget =
+            |service, caller| bound_within(service, caller, ceiling).map(|(budget, _)| budget);
+
+        assert_eq!(
+            budget(None, Some(CEILING_MS + 1)),
+            Some(ceiling),
+            "a budget over the ceiling is clamped: the caller's"
+        );
+        assert_eq!(
+            budget(Some(one_over), None),
+            Some(ceiling),
+            "a budget over the ceiling is clamped: the service's"
+        );
+        assert_eq!(
+            budget(None, Some(CEILING_MS)),
+            Some(ceiling),
+            "a budget at the ceiling is left alone"
+        );
+        assert_eq!(
+            budget(Some(ceiling - Duration::from_millis(1)), None),
+            Some(ceiling - Duration::from_millis(1)),
+            "a budget under the ceiling is left alone"
+        );
+        assert_eq!(
+            budget(Some(Duration::MAX), None),
+            None,
+            "a budget the clock cannot hold is still no deadline, not a clamped one"
+        );
+    }
+
+    /// A ledger over memory, as `build()` makes one for a service that keeps replies.
+    fn memory_ledger() -> Arc<Ledger> {
+        Ledger::new(
+            Limits::default(),
+            Records::Memory,
+            crate::version::RecordCodec::testing(),
+        )
+    }
+
+    /// A claim that has been dispatched and has produced its answer: the state
+    /// `settle_key` reads to decide the key records that answer.
+    fn completed() -> Progress {
+        let progress = Progress::new();
+        progress.dispatched();
+        progress.completed();
+        progress
+    }
+
+    /// A grant reserved for a peer on a blob in a store, and not yet live.
+    ///
+    /// The blob's address is 32 arbitrary bytes read back through its own wire
+    /// form, because `BlobId` has no public constructor and a reservation does not
+    /// look inside the store.
+    fn reserved_grant() -> (Blobs, AdmittedPeer, BlobId, Permit) {
+        let blobs = Blobs::memory();
+        let admitted = Allowlist::anyone()
+            .admit(crate::authz::ProvenPeer::for_tests(1))
+            .expect("anyone admits everyone");
+        let root: BlobId = postcard::from_bytes(&[7_u8; 32]).expect("any 32 bytes is an address");
+        let fence = blobs
+            .fence(&admitted, || true)
+            .expect("the admission is open");
+        let permit = blobs
+            .reserve(&admitted, Content::Blob(root), &fence)
+            .expect("the ledger has room");
+        (blobs, admitted, root, permit)
+    }
+
+    /// A completed keyed call makes the grant its reply carries live, and records
+    /// the reply.
+    ///
+    /// The ordering that matters here, that the grant is live **before** the slot
+    /// is published, is `idempotency.rs`'s `publication` tests: `settle_key` hands
+    /// the commit to `Guard::record` as its `before_publish`, and that is the only
+    /// way it reaches a completed key. Nothing at this seam can see between the two
+    /// steps, because they run without an await between them.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `settle_key`'s
+    /// `Reached::Completed => return guard.record(frame, payload, commit).await,`
+    /// (indented twelve spaces) and the replacement `Reached::Completed => return
+    /// guard.record(frame, payload, || {}).await,`, which never makes the grant
+    /// live. Watched: `the grant is live once the call is settled`.
+    #[tokio::test]
+    async fn a_completed_keyed_call_makes_its_grant_live() {
+        let ledger = memory_ledger();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+        let Claim::Fresh(guard) = ledger.claim(peer, key.clone(), [0; 32]) else {
+            panic!("the first claim must be fresh");
+        };
+        let progress = completed();
+        let (blobs, admitted, root, permit) = reserved_grant();
+
+        settle_key(
+            Some(guard.watching(progress.clone())),
+            &progress,
+            &Bytes::from_static(b"a reply"),
+            false,
+            Some(permit),
+        )
+        .await
+        .expect("a memory ledger records");
+
+        assert!(
+            blobs.revoke(admitted.id(), root),
+            "the grant is live once the call is settled"
+        );
+        assert_eq!(ledger.key_state(peer, &key), KeyState::Done);
+    }
+
+    /// A call with no key makes its grant live as well, after nothing is settled.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `settle_key`'s
+    /// `commit();` after the keyed arm (indented four spaces; the final statement)
+    /// replaced by `drop(commit);`. Watched: `an unkeyed reply's grant is live`.
+    #[tokio::test]
+    async fn an_unkeyed_call_makes_its_grant_live() {
+        let (blobs, admitted, root, permit) = reserved_grant();
+
+        settle_key(
+            None,
+            &Progress::new(),
+            &Bytes::from_static(b"a reply"),
+            false,
+            Some(permit),
+        )
+        .await
+        .expect("nothing is settled, so nothing fails");
+
+        assert!(
+            blobs.revoke(admitted.id(), root),
+            "an unkeyed reply's grant is live"
+        );
+    }
+
+    /// A record the store refuses grants nothing: the permit is released, not made
+    /// live, and the call is told its reply was not recorded.
+    ///
+    /// The store accepts the claim, which is its first write, and refuses the
+    /// settle, which is its second. Made red by `scripts/break-once.sh
+    /// keylink/src/rpc.rs` on `settle_key`'s `Reached::Completed => return
+    /// guard.record(frame, payload, commit).await,` (indented twelve spaces; the
+    /// line is registered as `GP1`) and the replacement `Reached::Completed => {
+    /// commit(); return guard.record(frame, payload, || {}).await; }`, which makes
+    /// the grant live before the store has answered. Watched: `a refused record
+    /// must grant nothing`.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn a_record_the_store_refuses_leaves_no_grant_behind() {
+        use keylink_persist::{Entries, EntryKey, Held, StateId};
+
+        struct ClaimsThenRefuses;
+        struct Claimed(usize);
+        impl Entries for ClaimsThenRefuses {
+            type Held = Claimed;
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Claimed> {
+                Ok(Claimed(0))
+            }
+        }
+        impl Held for Claimed {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                self.0 += 1;
+                if self.0 == 1 {
+                    Ok(())
+                } else {
+                    Err(keylink_persist::Error::TooLarge {
+                        offered: 1,
+                        limit: 0,
+                    })
+                }
+            }
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        let id = StateId::new("rpc/ledger").expect("a valid id");
+        let records = crate::durable::DurableRecords::open(&ClaimsThenRefuses, &id)
+            .await
+            .expect("nobody else holds this ledger");
+        let ledger = Ledger::new(
+            Limits::default(),
+            Records::Durable(records),
+            crate::version::RecordCodec::testing(),
+        );
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+        let Claim::Fresh(guard) = ledger.claim_durably(peer, key, [0; 32]).await else {
+            panic!("the first claim must be fresh");
+        };
+        let progress = completed();
+        let (blobs, admitted, root, permit) = reserved_grant();
+
+        let settled = settle_key(
+            Some(guard.watching(progress.clone())),
+            &progress,
+            &Bytes::from_static(b"a reply"),
+            false,
+            Some(permit),
+        )
+        .await;
+
+        assert!(settled.is_err(), "the store refused the record");
+        assert!(
+            !blobs.revoke(admitted.id(), root),
+            "a refused record must grant nothing"
+        );
+    }
+
+    /// The timer boundary of a deadline, on a paused clock and after an explicit
+    /// barrier: a call that has **entered** and is still waiting when the budget
+    /// passes is reported late, is not dropped, and goes on to its real output.
+    ///
+    /// The barrier is the call signalling that it entered, and it is asserted after
+    /// the race: `Timeout` polls its future before its timer, and the paused clock
+    /// moves only once nothing can run, so the call has been polled to its gate by
+    /// the time the budget can pass. No real network and no scheduling window are
+    /// involved, which is the point; the integration tests in `tests/deadline.rs`
+    /// cover the wire and assert nothing that depends on how fast an actor starts.
+    ///
+    /// The outer bound turns a `race` that never reports into a failure rather
+    /// than a hang. Made red by `scripts/break-once.sh keylink/src/rpc.rs` on
+    /// `race`'s `match n0_future::time::timeout(budget, call).await {` (indented
+    /// four spaces) and the replacement `match Ok::<_, ()>(call.await) {`, which has
+    /// no timer. Watched: `race must report a call that outlives its budget`.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_past_its_budget_is_late_and_then_finishes_whole() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+
+        let entries = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered) = oneshot::channel();
+        let (go_tx, go) = oneshot::channel::<()>();
+        let counted = Arc::clone(&entries);
+        let mut call = Box::pin(async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            let _ = go.await;
+            7_u64
+        });
+        let budget = Duration::from_millis(50);
+
+        let raced =
+            n0_future::time::timeout(Duration::from_secs(10), race(Some(budget), &mut call))
+                .await
+                .expect("race must report a call that outlives its budget");
+        assert!(
+            matches!(raced, Raced::Late(passed) if passed == budget),
+            "the budget passed while the call waited"
+        );
+        assert!(
+            entered.try_recv().is_ok(),
+            "the call had entered before the budget could pass"
+        );
+
+        go_tx.send(()).expect("the call is waiting for this");
+        assert_eq!(call.await, 7, "the same call went on to its real output");
+        assert_eq!(entries.load(Ordering::SeqCst), 1, "and was entered once");
+    }
+
+    /// A call that finishes inside its budget, and one with no budget at all, are
+    /// both done, with the output they produced.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_inside_its_budget_or_with_none_is_done() {
+        let mut quick = Box::pin(async { 7_u64 });
+        assert!(matches!(
+            race(Some(Duration::from_millis(50)), &mut quick).await,
+            Raced::Done(7)
+        ));
+
+        let mut slow = Box::pin(async {
+            n0_future::time::sleep(Duration::from_secs(3600)).await;
+            9_u64
+        });
+        assert!(
+            matches!(race(None, &mut slow).await, Raced::Done(9)),
+            "no budget means the call is waited for, however long it takes"
+        );
+    }
+
+    /// A keyed call settles even when its notice can never be written.
+    ///
+    /// A peer that grants no receive credit leaves the write of `DeadlinePassed`
+    /// pending for ever. The call behind it must not wait on that: the gate opens,
+    /// the call runs to its end, and only then is anything asked of the notice.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `finish_late`'s
+    /// `let mut written = false;` (indented four spaces) and the replacement `let
+    /// mut written = false; let _ = (&mut said).await;`, which awaits the notice
+    /// first. Watched: `the call must settle although the notice cannot be
+    /// written`.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyed_call_settles_even_when_the_notice_cannot_be_written() {
+        use tokio::sync::oneshot;
+
+        let (go_tx, go) = oneshot::channel::<()>();
+        let (settled_tx, settled) = oneshot::channel::<()>();
+        let call = Box::pin(async move {
+            let _ = go.await;
+            let _ = settled_tx.send(());
+        });
+        let said = std::future::pending::<Result<()>>();
+        let finishing = tokio::spawn(finish_late(said, call));
+
+        go_tx.send(()).expect("the call is waiting for this");
+        n0_future::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .expect("the call must settle although the notice cannot be written")
+            .expect("the call signals once");
+        finishing.abort();
+    }
+
+    /// A retry that attached **before** the settle is handed the settled reply.
+    ///
+    /// Polled once so it reaches its park, and the park is asserted, so this is the
+    /// late-settle path and not a replay in disguise. Then the call settles through
+    /// `settle_key`, which is what both the early and the late path use, and the
+    /// parked attacher is woken with the recorded frame.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `settle_key`'s
+    /// `Reached::Completed => return guard.record(frame, payload, commit).await,`
+    /// (indented twelve spaces) replaced by `Reached::Completed => { drop((guard,
+    /// commit)); return Ok(()); }`, which settles nothing and leaves the attacher
+    /// to time out. Watched: `the attacher is handed the settled reply`.
+    #[tokio::test(start_paused = true)]
+    async fn an_attacher_parked_before_the_settle_is_handed_the_reply() {
+        let ledger = memory_ledger();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+        let Claim::Fresh(guard) = ledger.claim(peer, key.clone(), [0; 32]) else {
+            panic!("the first claim must be fresh");
+        };
+        let keys = any(&ledger);
+        let mut attaching = Box::pin(claim_key(
+            &keys,
+            "Probe",
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
+        ));
+        let parked = poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await;
+        assert!(parked.is_pending(), "the attacher is parked, not answered");
+
+        let progress = completed();
+        let frame = Bytes::from_static(b"a reply");
+        settle_key(
+            Some(guard.watching(progress.clone())),
+            &progress,
+            &frame,
+            false,
+            None,
+        )
+        .await
+        .expect("a memory ledger records");
+
+        match n0_future::time::timeout(Duration::from_secs(10), attaching).await {
+            Ok(Claimed::Replay(replayed)) => assert_eq!(replayed, frame),
+            _ => panic!("the attacher is handed the settled reply"),
+        }
+    }
+
+    /// A retry that arrives **after** the settle is handed the same reply without
+    /// parking at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_attacher_arriving_after_the_settle_is_handed_the_reply() {
+        let ledger = memory_ledger();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+        let Claim::Fresh(guard) = ledger.claim(peer, key.clone(), [0; 32]) else {
+            panic!("the first claim must be fresh");
+        };
+        let progress = completed();
+        let frame = Bytes::from_static(b"a reply");
+        settle_key(
+            Some(guard.watching(progress.clone())),
+            &progress,
+            &frame,
+            false,
+            None,
+        )
+        .await
+        .expect("a memory ledger records");
+
+        let keys = any(&ledger);
+        let mut attaching = Box::pin(claim_key(
+            &keys,
+            "Probe",
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+            [0; 32],
+        ));
+        match poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await {
+            Poll::Ready(Claimed::Replay(replayed)) => assert_eq!(replayed, frame),
+            _ => panic!("a settled key is replayed on the first poll"),
         }
     }
 
@@ -1744,6 +2480,9 @@ pub struct ServiceBuilder<Req: 'static, Resp: 'static> {
     /// [`ServiceBuilder::limits`] replaced it, and discarded under
     /// [`Keyable::None`], which builds no ledger to hold it.
     limits: Limits,
+    /// Set by [`ServiceBuilder::deadline`]. `None` by default: no call is
+    /// answered before its handler is.
+    deadline: Option<Duration>,
 }
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
@@ -1780,6 +2519,7 @@ where
             keyable: Keyable::Any,
             records: Records::Memory,
             limits: Limits::default(),
+            deadline: None,
         }
     }
 
@@ -2073,6 +2813,48 @@ where
         self
     }
 
+    /// Answer [`RemoteError::DeadlinePassed`] to any call with no answer after
+    /// `budget`.
+    ///
+    /// **The deadline ends the wait, and what becomes of the work depends on the
+    /// call.** The caller is told at the deadline. A turn that is running finishes.
+    /// A keyed call is awaited to the end for as long as its connection survives,
+    /// and records its real answer under its key, so a retry with the same key
+    /// attaches to it or replays it and the work runs once. An unkeyed actor call
+    /// has its reply discarded. An unkeyed call to a concurrent `Handler` is
+    /// cancelled: its future is dropped where it stands.
+    ///
+    /// A caller may set a shorter deadline of its own with
+    /// [`RpcClient::with_deadline`], which travels in the request; the shorter of
+    /// the two applies. The budget is also stamped on the call as a queueing
+    /// bound, as [`QueueTimeout`](crate::QueueTimeout) does, so a message that is
+    /// still queued when the caller stops waiting never starts.
+    ///
+    /// It counts from the moment the call is claimed. A wait for the idempotency
+    /// ledger is bounded by [`Limits::attach`], not by this.
+    ///
+    /// In a browser a deadline is **clamped** to what its timer can express,
+    /// `i32::MAX` milliseconds (about 24.8 days); a longer one waits that long. The
+    /// timer would otherwise wrap it to an immediate expiry.
+    ///
+    /// # What a service-only deadline cannot end
+    ///
+    /// **A call whose own upload source stalls.** The client writes the whole
+    /// request body before it reads any reply, so a `send` call whose [`Body`]
+    /// source stops producing bytes never reads the `DeadlinePassed` the service has
+    /// already written, and a transport stop cannot end a read that is waiting on
+    /// the source. The caller's [`with_deadline`](RpcClient::with_deadline) wraps
+    /// the whole exchange, upload included, and does end it. Nor does either bound
+    /// the body of a `recv` reply, which streams after the header.
+    ///
+    /// For slow work that has to come back, leave the turn instead of racing it:
+    /// [`Deferred::away`](crate::Deferred::away).
+    #[must_use]
+    pub fn deadline(mut self, budget: Duration) -> Self {
+        self.deadline = Some(budget);
+        self
+    }
+
     /// Freeze the chain and erase the schema.
     pub fn build(self) -> Service {
         let configuration =
@@ -2119,6 +2901,7 @@ where
                     required: required.clone(),
                     blobs: self.blobs.clone(),
                     keys: keys.clone(),
+                    deadline: self.deadline,
                     _p: PhantomData,
                 }),
             })
@@ -2386,6 +3169,9 @@ pub struct RpcClient<Req, Resp> {
     /// Attached to every call this client makes. See
     /// [`with_idempotency`](Self::with_idempotency).
     idempotency: Option<Idempotency>,
+    /// Bounds every call this client makes. See
+    /// [`with_deadline`](Self::with_deadline).
+    deadline: Option<Duration>,
     _p: PhantomData<fn(Req) -> Resp>,
 }
 
@@ -2402,6 +3188,7 @@ impl<Req, Resp> Clone for RpcClient<Req, Resp> {
             conn: self.conn.clone(),
             endpoint: self.endpoint.clone(),
             idempotency: self.idempotency.clone(),
+            deadline: self.deadline,
             _p: PhantomData,
         }
     }
@@ -2499,8 +3286,57 @@ impl<Req, Resp> RpcClient<Req, Resp> {
                 conn: self.conn.clone(),
                 endpoint: self.endpoint.clone(),
                 idempotency: Some(idempotency.into()),
+                deadline: self.deadline,
                 _p: PhantomData,
             },
+        }
+    }
+
+    /// The same connection, with every [`call`](Self::call) bounded by `budget`
+    /// here and on the serving side.
+    ///
+    /// The caller stops waiting after `budget` and gets
+    /// [`Error::DeadlinePassed`], and the budget travels in the request, so the
+    /// service answers [`RemoteError::DeadlinePassed`] no later than that and sheds
+    /// a message that has not started. The shorter of this and the service's own
+    /// [`deadline`](ServiceBuilder::deadline) applies on its side. A caller usually
+    /// sees the local error, because its timer started first by about the one-way
+    /// latency.
+    ///
+    /// **It ends the caller's wait and nothing else it can see.** The far side may
+    /// not have received the call, may be running it, or may have finished with the
+    /// reply lost on the way back, and whether the work goes on depends on the call
+    /// (see [`RemoteError::DeadlinePassed`]). Combine it with a key: retrying with
+    /// the same [`IdempotencyKey`] attaches to a call still running and replays the
+    /// answer of one that finished, so the work runs once.
+    ///
+    /// ```ignore
+    /// let ticket = client
+    ///     .with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(30)))
+    ///     .with_deadline(Duration::from_secs(2))
+    ///     .reserve("ADU-014".into(), 2)
+    ///     .await;
+    /// ```
+    ///
+    /// In a browser the budget is **clamped** to `i32::MAX` milliseconds (about 24.8
+    /// days), the longest wait its timer can express; a longer one would wrap to an
+    /// immediate expiry. The clamped value is what travels in the request.
+    ///
+    /// # Not bounded
+    ///
+    /// The deadline covers the exchange up to the reply header. The body of a
+    /// `recv` reply streams after it and is not bounded by it. A [`tell`](Self::tell)
+    /// waits for nothing and ignores it.
+    #[must_use]
+    pub fn with_deadline(&self, budget: Duration) -> Self {
+        Self {
+            codec: self.codec.clone(),
+            version: self.version,
+            conn: self.conn.clone(),
+            endpoint: self.endpoint.clone(),
+            idempotency: self.idempotency.clone(),
+            deadline: Some(budget.min(TIMER_CEILING)),
+            _p: PhantomData,
         }
     }
 }
@@ -2546,6 +3382,15 @@ impl<Req, Resp> IdempotentClient<Req, Resp> {
     /// [`RpcClient::connection`].
     pub(crate) fn connection(&self) -> &Connection {
         self.inner.connection()
+    }
+
+    /// The same connection and the same key, with every call bounded by
+    /// `budget`. See [`RpcClient::with_deadline`].
+    #[must_use]
+    pub fn with_deadline(&self, budget: Duration) -> Self {
+        Self {
+            inner: self.inner.with_deadline(budget),
+        }
     }
 
     /// Point a handle at content the peer we are talking to just named.
@@ -2651,6 +3496,7 @@ where
             conn,
             endpoint: node.endpoint().clone(),
             idempotency: None,
+            deadline: None,
             _p: PhantomData,
         })
     }
@@ -2660,8 +3506,24 @@ where
     /// # Errors
     ///
     /// [`Error::Closed`] when the peer finishes the stream without answering,
-    /// plus any transport or codec failure.
+    /// [`Error::DeadlinePassed`] when [`with_deadline`](Self::with_deadline) set a
+    /// budget and it passed, plus any transport or codec failure.
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
+        match self.deadline {
+            None => self.exchange(request, body).await,
+            Some(budget) => n0_future::time::timeout(budget, self.exchange(request, body))
+                .await
+                .unwrap_or(Err(Error::DeadlinePassed {
+                    millis: millis_of(budget),
+                })),
+        }
+    }
+
+    /// One call, from opening the stream to reading the reply header.
+    ///
+    /// Split from [`call`](Self::call) so a deadline wraps all of it, upload
+    /// included, with one `timeout` and no second path.
+    async fn exchange(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
         // A dead connection must reach Peer before its stale codec can refuse.
         if let Some(error) = self.conn.close_reason() {
             return Err(error.into());
@@ -2669,6 +3531,7 @@ where
         let frame = self.codec.encode_request(
             body.declared_len(),
             self.idempotency.as_ref(),
+            self.deadline.map(millis_of),
             WireRequest::Call(request),
         )?;
         let (mut send, recv) = self.conn.open_bi().await?;
@@ -2718,7 +3581,7 @@ where
         let (mut send, recv) = self.conn.open_bi().await?;
         let frame = self
             .codec
-            .encode_request(Some(0), None, WireRequest::KeyState(key))?;
+            .encode_request(Some(0), None, None, WireRequest::KeyState(key))?;
         wire::write_frame(&mut send, frame).await?;
         send.finish()?;
 
@@ -2776,7 +3639,7 @@ where
         }
         let frame = self
             .codec
-            .encode_request(Some(0), None, WireRequest::Call(request))
+            .encode_request(Some(0), None, None, WireRequest::Call(request))
             .map_err(|error| match error {
                 Error::UnsupportedRequest { version, source } => {
                     crate::TellError::Unsupported { version, source }

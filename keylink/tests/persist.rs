@@ -1758,7 +1758,7 @@ impl Booking {
 /// `defer::a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget` reads the
 /// caller's answer, and
 /// `defer::a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out`
-/// reads it through a `Timeout` layer. The claim this paragraph declined to make
+/// reads it through a service deadline. The claim this paragraph declined to make
 /// exists now, one file over, in the file whose subject it is.
 ///
 /// **And step 5 still approves before it stops for its own reason, not to avoid

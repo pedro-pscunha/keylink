@@ -188,10 +188,12 @@ impl GatewayError {
     pub(crate) fn from_keylink(error: keylink::Error) -> Self {
         match error {
             keylink::Error::Transport(_) | keylink::Error::Closed => Self::UpstreamUnavailable,
+            keylink::Error::DeadlinePassed { .. } => Self::UpstreamTimeout,
             keylink::Error::Remote(remote) => match remote {
                 keylink::RemoteError::Unauthorized(_) => Self::Forbidden,
                 keylink::RemoteError::AccessUnavailable => Self::UpstreamUnavailable,
-                keylink::RemoteError::TimedOut { .. } => Self::UpstreamTimeout,
+                keylink::RemoteError::TimedOut { .. }
+                | keylink::RemoteError::DeadlinePassed { .. } => Self::UpstreamTimeout,
                 keylink::RemoteError::NoSuchActor { .. } => Self::ActorNotFound,
                 keylink::RemoteError::AtCapacity { .. }
                 | keylink::RemoteError::MailboxFull
@@ -447,6 +449,14 @@ mod tests {
             ),
             (
                 Error::Remote(RemoteError::TimedOut { millis: 9 }),
+                GatewayError::UpstreamTimeout,
+            ),
+            (
+                Error::Remote(RemoteError::DeadlinePassed { millis: 9 }),
+                GatewayError::UpstreamTimeout,
+            ),
+            (
+                Error::DeadlinePassed { millis: 9 },
                 GatewayError::UpstreamTimeout,
             ),
             (

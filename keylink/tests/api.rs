@@ -639,6 +639,7 @@ mod capability_matrix {
     #[cfg(feature = "blocking")]
     fn implements_blocking_wire<T: BlockingWire>() {}
     fn implements_with_idempotency<T: WithIdempotency>() {}
+    fn implements_with_deadline<T: WithDeadline>() {}
     fn implements_status<T: Status>() {}
     fn implements_own<T: Own>() {}
     fn implements_servable<T: Servable>() {}
@@ -683,6 +684,9 @@ mod capability_matrix {
         implements_wire::<depot::IdempotentClient>();
         implements_with_idempotency::<depot::RegistryClient>();
         implements_with_idempotency::<depot::Client>();
+        implements_with_deadline::<depot::RegistryClient>();
+        implements_with_deadline::<depot::Client>();
+        implements_with_deadline::<depot::IdempotentClient>();
         implements_status::<depot::ActorRef<'static>>();
         implements_status::<depot::Client>();
         implements_status::<depot::IdempotentClient>();
@@ -716,6 +720,18 @@ mod capability_matrix {
     assert_not_impl!(depot::LocalRef<'static>, WithIdempotency);
     assert_not_impl!(depot::ActorRef<'static>, WithIdempotency);
     assert_not_impl!(depot::IdempotentClient, WithIdempotency);
+
+    // A deadline bounds a caller's wait, and a local handle, a registry and a
+    // local reference have no wire to bound. The blocking clients are left out on
+    // purpose: the thread that made a blocking call bounds it.
+    assert_not_impl!(depot::Handle<Counter>, WithDeadline);
+    assert_not_impl!(depot::Registry, WithDeadline);
+    assert_not_impl!(depot::LocalRef<'static>, WithDeadline);
+    assert_not_impl!(depot::ActorRef<'static>, WithDeadline);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, WithDeadline);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, WithDeadline);
 
     assert_not_impl!(depot::Handle<Counter>, Status);
     assert_not_impl!(depot::Registry, Status);

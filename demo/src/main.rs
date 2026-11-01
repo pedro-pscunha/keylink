@@ -223,7 +223,7 @@ use current::{inventory, Item};
 // declaring a `send`, because that handler reads the upload INSIDE the serial
 // turn (RFC-04 §10.4). A peer that declared a large body and then stopped
 // writing would hold the mailbox until iroh's idle timeout, and no layer can
-// take it back — a `Timeout` refuses the caller without ending the turn.
+// take it back — a deadline answers the caller without ending the turn.
 //
 // So bulk transfer goes beside the actor instead of through it: its own
 // service, its own ALPN, its own `&self` handler. Both are registered on one

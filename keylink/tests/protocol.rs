@@ -809,14 +809,17 @@ async fn a_layer_can_require_an_idempotency_key() {
     );
 }
 
+/// A service deadline answers the caller of a slow handler, and the connection
+/// goes on serving. On an unkeyed call to a `Handler` it also drops the handler's
+/// future where it stands, which is what the `Timeout` layer this replaces did.
 #[tokio::test]
-async fn a_timeout_layer_refuses_a_slow_handler() {
+async fn a_service_deadline_refuses_a_slow_handler() {
     let server = local_node().await;
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
         .service(
             probe::service(Server::default(), Allowlist::anyone())
-                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+                .deadline(Duration::from_millis(50))
                 .build(),
         )
         .spawn()
@@ -831,11 +834,14 @@ async fn a_timeout_layer_refuses_a_slow_handler() {
         .await
         .expect_err("a handler over budget is refused");
     assert!(
-        matches!(err, Error::Remote(keylink::RemoteError::TimedOut { .. })),
-        "expected a timeout refusal, got {err:?}"
+        matches!(
+            err,
+            Error::Remote(keylink::RemoteError::DeadlinePassed { millis: 50 })
+        ),
+        "expected a deadline refusal, got {err:?}"
     );
 
-    // The connection survives the timeout.
+    // The connection survives the deadline.
     assert_eq!(client.ping().await.unwrap(), "pong");
 }
 

@@ -345,7 +345,7 @@ configuration error, not a last-one-wins race.
 
 A `Middleware` sees the request *typed*, so a per-method rule is a `match` on
 the real enum. Make the impl generic over `Req: Rpc` and one layer covers every
-service you ever define. `Timeout` ships with the crate.
+service you ever define. `QueueTimeout` ships with the crate.
 
 ### Actors, when shared state is the awkward part
 
@@ -368,9 +368,11 @@ state. Under the concurrent model that same edit fails the build, because
 `clippy::await_holding_lock` is deny-level here and a `std::sync` guard is what
 `&self` state needs.
 
-Two costs, both structural. A turn is not cancellable: dropping the call does
-not stop the handler, and a layer such as `Timeout` refuses the caller without
-ending the turn. And an actor must not call itself: keylink detects a re-entrant
+Two costs, both structural. A turn is never cancelled: dropping the call does not
+stop the handler, and a deadline answers the caller without ending the turn. Two
+remedies, both below: a deadline bounds the caller's wait and sheds work that has
+not started, and `Deferred::away` takes a slow step out of the turn so it does not
+hold the actor. And an actor must not call itself: keylink detects a re-entrant
 local call by actor identity and refuses it instead of relying on mailbox depth.
 
 ### Local mailbox policy
@@ -464,12 +466,100 @@ let warehouse = inventory::setup(Warehouse::seeded())
     .actor();
 ```
 
-Feed items and mailbox messages are interleaved fairly: with everything ready at
-once the mailbox takes half the turns and each of `n` feeds takes `1/2n`. A feed
-is **local only and never on the wire**, so declaring one does not move the ALPN.
-A feed that ends, and a feed handler that panics, both end the actor — a fault
-with no caller to resume it into would otherwise be dropped onto a state the
-handler may have left half applied — and `Ended` names which happened.
+Feed items and mailbox messages are interleaved fairly: with no off-turn work
+waiting, the mailbox takes half the turns and each of `n` feeds takes `1/2n`; with
+finished off-turn work ready too (next section), each of the three inputs takes a
+third. A feed is **local only and never on the wire**, so declaring one does not
+move the ALPN. A feed that ends, and a feed handler that panics, both end the
+actor — a fault with no caller to resume it into would otherwise be dropped onto a
+state the handler may have left half applied — and `Ended` names which happened.
+
+### Slow work, off the turn
+
+A turn holds its actor until it returns, so a handler that spends an hour on a
+check holds the actor for an hour. `#[defer]` lets the handler return without
+answering: `reply.later()` parks the caller. `Deferred::away` finishes the job.
+It sends the slow work out of the turn, and the work's output comes back as a new
+turn on the same actor, with the caller still waiting:
+
+```rust
+#[defer]
+rpc Land(change: Change) -> Landed;
+
+async fn land(&mut self, _cx: Caller<'_>, reply: Reply<Landed>, change: Change)
+    -> Replied<Landed>
+{
+    let plan = self.prepare(&change);          // in the turn, fast
+    let (deferred, replied) = reply.later();
+    deferred.away(self, run_checks(plan));     // off the turn, slow
+    replied
+}
+
+impl Back<Checked, Landed> for Repo {
+    async fn back(&mut self, checked: Checked, reply: Deferred<Landed>) {
+        match self.compare_and_swap(checked) { // in a turn again
+            Ok(landed) => reply.send(landed),  // gated by this turn's commit
+            Err(stale) => reply.away(self, recheck(stale)),
+        }
+    }
+}
+```
+
+The work belongs to the actor. It starts only after the launching turn commits, so
+an observer that refuses that turn stops it from ever starting, and a durable
+actor's work starts only after the turn that chose it is on disk. It is cancelled
+when the actor ends. `stop`, a refusal and a restart wait for the cancelled work
+to be gone, so the parked caller is told `Gone` or `Restarting` by its own
+incarnation and never by the next one. `abort` does not wait: it destroys the
+actor now, and the caller is still told `Gone`, but the actor's end can be
+published while the cancelled work is being destroyed. In a browser the wait is
+weaker for every end: the cancelled future is dropped on the executor's next
+poll, which can be after the end is published. Only the future passed to `away`
+belongs to the actor: a task it spawns, a `spawn_blocking` closure it awaits and
+anything it starts outside the process are not cancelled with it, and need their
+own cancellation. The `back` turn is an ordinary turn: the panic guard, the
+observers and the commit all apply, and other turns ran while the work was away,
+so `back` re-checks what the launching turn assumed. The work itself holds no
+reference to the state. It is not durable: a crash loses it, and the actor
+reconciles what was pending on restart. `stop` does not wait for it to finish. Calling `away` outside a turn, or with another state
+type than the running turn's, drops the work and tells the caller `Dropped` on the
+first call.
+
+### A deadline ends the wait
+
+`ServiceBuilder::deadline(budget)` answers `RemoteError::DeadlinePassed` to any
+call with no answer after `budget`, and a caller can set a shorter one of its own
+with `with_deadline`, which travels in the request. What becomes of the work
+depends on the call. A running actor turn finishes, and its reply is discarded.
+A keyed call is awaited to the end for as long as its connection survives, and
+its key settles as what the call really returned, so a retry with the same key
+attaches to it or replays its answer and the work runs once. An unkeyed call to a
+concurrent `Handler` is cancelled: its future is dropped where it stands.
+
+```rust
+let reserved = client
+    .with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(30)))
+    .with_deadline(Duration::from_secs(2))
+    .reserve("ADU-014".into(), 2)
+    .await;
+// Err(Error::DeadlinePassed { .. }) here is the caller's own timer. Retry with the same key.
+```
+
+The budget is also stamped on the call as a queueing bound, as `QueueTimeout`
+does, so a message that is still queued when the caller stops waiting never
+starts and its key stays claimable. The caller's own error is
+`Error::DeadlinePassed`, and it knows nothing about the far side: the call may not
+have arrived, may be running, or may have finished with its reply lost. A deadline
+does not bound the body of a `recv` reply, and the blocking clients do not take
+one. A service-only deadline also cannot end a call whose own upload source
+stalls: the client writes the whole request body before it reads any reply, so a
+`send` call whose `Body` stops producing never reads the `DeadlinePassed` already
+written. The caller's `with_deadline` wraps the whole exchange, upload included,
+and does end it.
+
+In a browser a deadline is clamped to `i32::MAX` milliseconds (about 24.8 days),
+the longest wait its timer can express: a longer one would wrap to an immediate
+expiry, so it waits that long instead.
 
 ### Many instances behind one ALPN
 
@@ -826,10 +916,10 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    encoding of one service's own response type.
 6. **`Interrupted` is permanent, and it is the answer that needs a decision.** A
    call whose handler was entered and produced no reply — a dead connection, a
-   shutdown, a layer that stopped waiting after dispatch — settles the key as
-   `Interrupted`. Whether the work took effect is genuinely unknown and no record
-   can make it known, so retrying that key is refused forever, by design. What a
-   caller *does*: reconcile against its own domain, then issue a **new** key.
+   shutdown — settles the key as `Interrupted`. Whether the work took effect is
+   genuinely unknown and no record can make it known, so retrying that key is
+   refused forever, by design. What a caller *does*: reconcile against its own
+   domain, then issue a **new** key.
    `client.key_state(key).await` asks without running anything, which is the only
    way to learn a state you are not willing to discover by executing.
 7. **A `feed` has no delivery guarantee at all.** It is a local stream into an
@@ -1065,13 +1155,14 @@ Known gaps, in rough priority order:
   cannot open a UDP socket, so QUIC is out of reach whatever keylink does.
   Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
-- **A running actor turn cannot be bounded from outside.** `Timeout` drops the
-  wait for the reply, not the turn, so it sheds no load once a turn has started.
-  It no longer settles an idempotency key as its own refusal — a turn that ran
-  leaves `Interrupted`, which is the truth — but the retry does not receive the
-  turn's real reply either. `QueueTimeout` is the half that does shed load: it
-  refuses a message that has not started, and leaves its key claimable, because
-  nothing ran. Past that point, bound the work inside the method. RFC-05 §7.
+- **A turn is never cancelled.** A deadline bounds the caller's wait and sheds work
+  that has not started; slow work goes off the turn with `Deferred::away`. A
+  deadline's answer to a caller does not stop a turn that is running, so it sheds
+  nothing once the turn has started, and a wedged keyed turn keeps its key
+  `Running` past the caller's deadline, bounded by the per-peer running cap. It
+  does record the turn's real reply under the key, so the retry receives it.
+  `QueueTimeout` and a deadline both refuse a message that has not started, and
+  leave its key claimable, because nothing ran.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - Idempotency records are in memory by default, so a retry across a restart
