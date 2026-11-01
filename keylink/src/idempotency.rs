@@ -2064,7 +2064,7 @@ pub(crate) enum Claim {
 #[derive(Debug)]
 pub(crate) struct Ledger {
     #[cfg(feature = "persist")]
-    contract_hash: u64,
+    contract_version: crate::Version,
     inner: Mutex<Inner>,
     limits: Limits,
     /// Where the replies recorded here go. Held by the ledger rather than
@@ -2095,7 +2095,7 @@ impl Ledger {
         let inner = Inner::default();
         let ledger = Arc::new(Self {
             #[cfg(feature = "persist")]
-            contract_hash: contract.current,
+            contract_version: contract.current,
             inner: Mutex::new(inner),
             limits,
             records,
@@ -2318,7 +2318,7 @@ impl Ledger {
     ) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if store.write(peer, key, slot, fingerprint).await.is_err() {
+            if store.write(peer, key, slot, fingerprint, self.contract_version).await.is_err() {
                 return Err(IdempotencyRefusal::Unrecordable.into());
             }
         }
@@ -2410,7 +2410,7 @@ impl Ledger {
             Some(entry) => match &entry.slot {
                 Slot::Running(_) => Reconcile::Untouched,
                 settled => {
-                    Reconcile::Write(crate::durable::encode_slot(settled, entry.fingerprint))
+                    Reconcile::Write(crate::durable::encode_slot(settled, entry.fingerprint, self.contract_version))
                 }
             },
         }

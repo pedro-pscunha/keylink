@@ -436,9 +436,9 @@ impl<Req, Resp> Lineage<Req, Resp> {
 
 /// The one recovery conversion shared by all mounts of a service.
 #[cfg(feature = "persist")]
-pub(crate) type UpgradeRecord = dyn Fn(u64, &[u8]) -> Option<Bytes> + Send + Sync;
+pub(crate) type UpgradeRecord = dyn Fn(Version, &[u8]) -> Option<Bytes> + Send + Sync;
 pub(crate) struct RecordCodec {
-    pub(crate) current: u64,
+    pub(crate) current: Version,
     #[cfg(feature = "persist")]
     pub(crate) upgrade: Arc<UpgradeRecord>,
 }
@@ -449,17 +449,17 @@ impl fmt::Debug for RecordCodec {
 }
 impl<Req: 'static, Resp: 'static> Lineage<Req, Resp> {
     pub(crate) fn records(&'static self) -> RecordCodec {
-        let current = self.entries[0].version.hash;
+        let current = self.entries[0].version;
         RecordCodec {
             current,
             #[cfg(feature = "persist")]
-            upgrade: Arc::new(move |hash, frame| {
-                if hash == current {
+            upgrade: Arc::new(move |version, frame| {
+                if version == current {
                     return Some(Bytes::copy_from_slice(frame));
                 }
                 self.entries
                     .iter()
-                    .find(|entry| entry.version.hash == hash)?
+                    .find(|entry| entry.version == version)?
                     .codec
                     .upgrade_recorded(frame)
             }),
@@ -470,9 +470,11 @@ impl<Req: 'static, Resp: 'static> Lineage<Req, Resp> {
 impl RecordCodec {
     pub(crate) fn testing() -> Self {
         Self {
-            current: 0,
+            current: Version::__new(0, 0),
             #[cfg(feature = "persist")]
-            upgrade: Arc::new(|hash, frame| (hash == 0).then(|| Bytes::copy_from_slice(frame))),
+            upgrade: Arc::new(|version, frame| {
+                (version == Version::__new(0, 0)).then(|| Bytes::copy_from_slice(frame))
+            }),
         }
     }
 }
@@ -612,5 +614,52 @@ mod tests {
             reply.message,
             WireResponse::Call(Outcome::Err(RemoteError::Unsupported { version: 2, .. }))
         ));
+    }
+    /// Watched red: compare only hashes in the current-version recovery fast
+    /// path. The isolated test read 7 instead of the required converted 700;
+    /// 0 passed, 1 failed. Restored the full identity comparison.
+    #[cfg(feature = "persist")]
+    #[test]
+    fn recovery_selects_the_label_even_when_shapes_have_equal_hashes() {
+        struct Units;
+        impl Hop for Units {
+            type Request = u64;
+            type Response = u64;
+            type NewerRequest = u64;
+            type NewerResponse = u64;
+            fn upgrade_request(r: u64) -> std::result::Result<u64, Unsupported> {
+                Ok(r)
+            }
+            fn downgrade_request(r: u64) -> std::result::Result<u64, Unsupported> {
+                Ok(r)
+            }
+            fn upgrade_response(r: u64) -> std::result::Result<u64, Unsupported> {
+                Ok(r * 100)
+            }
+            fn downgrade_response(r: u64) -> std::result::Result<u64, Unsupported> {
+                Ok(r / 100)
+            }
+        }
+        let hash = crate::__schema_hash::<u64>("units");
+        let old = Version::__new(1, hash);
+        let current = Version::__new(2, hash);
+        let lineage = Box::leak(Box::new(
+            Lineage::new::<Here<u64, u64>>("units", current)
+                .previous::<(Units, Here<u64, u64>)>(old),
+        ));
+        let encoded = wire::encode_header(Some(0), None, &WireResponse::Call(Outcome::Ok(7_u64)))
+            .expect("encodes");
+        let recorded = lineage.records();
+        let upgraded = (recorded.upgrade)(old, &encoded).expect("known older version");
+        let reply = lineage.entries[0]
+            .codec
+            .decode_response(&upgraded[4..])
+            .expect("decodes current");
+        assert!(matches!(
+            reply.message,
+            WireResponse::Call(Outcome::Ok(700))
+        ));
+        assert_eq!((recorded.upgrade)(current, &encoded), Some(encoded.clone()));
+        assert!((recorded.upgrade)(Version::__new(3, hash), &encoded).is_none());
     }
 }
