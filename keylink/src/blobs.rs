@@ -91,12 +91,12 @@ use bytes::Bytes;
 use iroh::endpoint::{ConnectError, Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use iroh_blobs::api::blobs::{AddBytesOptions, BlobStatus};
+use iroh_blobs::api::blobs::{AddBytesOptions, Bitfield, BlobStatus};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::request::get_verified_size;
 use iroh_blobs::get::{fsm, GetError};
 use iroh_blobs::protocol::{
-    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetRequest, ERR_PERMISSION,
+    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetRequest, RangeSpec, ERR_PERMISSION,
 };
 use iroh_blobs::provider::events::{
     AbortReason, ClientConnected, ConnectMode, EventMask, EventSender, ObserveMode,
@@ -1201,6 +1201,12 @@ impl Blobs {
         Ok(members.iter().map(|member| BlobId(*member)).collect())
     }
 
+    /// Which chunks of `id` this store holds, and how big the blob is if that
+    /// has been proved.
+    async fn held(&self, id: BlobId) -> Result<Bitfield> {
+        self.store().observe(id.hash()).await.map_err(store_error)
+    }
+
     /// How many members the sequence at `root` lists, if this store holds it in
     /// full, and an error when what it holds is not a whole number of addresses.
     async fn members(&self, root: BlobId) -> Result<Option<u64>> {
@@ -1433,38 +1439,50 @@ pub trait Granting {
 /// How much of a closure's root is read per store call: 1024 members.
 const ROOT_WINDOW: u64 = 32 * 1024;
 
-/// How many members one request of a closure fetch asks for.
+/// How many members one window of a closure fetch plans.
 ///
 /// Each window is planned from its own slice of the member list: the slice is
-/// read off the store, each of its members is asked of the store, and the
-/// request names the ones it lacks, one run per stretch of them. So the plan's
-/// memory is a window's and the request is a few bytes per gap, **whatever the
-/// closure's length**: this is what lets a closure have no member limit.
+/// read off the store, each of its members is asked of the store which chunks it
+/// holds, and the requests name the chunks it lacks, one run per stretch of
+/// members that lack the same thing. So the plan's memory is a window's and a
+/// request is a few bytes per gap, **whatever the closure's length**: this is
+/// what lets a closure have no member limit.
 ///
 /// **It does not make the work linear.** iroh-blobs 0.104 walks a request's
 /// offsets one at a time (`iter_non_empty_infinite`), on both ends, so a window
 /// that starts at member `k` costs `k` steps before it reaches its first member,
 /// and a whole closure of `N` members costs about `N^2 / 4096` of them. That is
 /// not measured on its own. The sizes measured: a 300,000-member closure with
-/// alternating gaps takes 74 s from a cold start (176 s on a loaded machine) (`mise run closure-300k`, which
-/// includes adding both stores' members and about a million store round trips
-/// asking what is held), against 8 s for 12,289. It is the thing to look at
-/// first if closures get much larger.
-///
-/// A member held only in part counts as lacking and is requested whole, so a
-/// window's request can have an entry for every one of its members, and the
-/// check below is that even that stays far under what iroh-blobs will read.
+/// alternating gaps takes 74 s from a cold start (176 s on a loaded machine)
+/// (`mise run closure-300k`, which includes adding both stores' members and about
+/// a million store round trips asking what is held), against 8 s for 12,289. It
+/// is the thing to look at first if closures get much larger.
 const FETCH_WINDOW: u64 = 4096;
 
-// A window's request, by construction. Inside a window every run starts within
-// `FETCH_WINDOW` offsets of the one before, so its gap is a two-byte varint; a
-// selecting run is that, the length of a one-element spec and the element
-// (1 + 1 + 2 bytes at most), and an empty run is the gap and a zero length. That
-// is 7 bytes per member at the very worst, plus the first run's offset, which is
-// a varint of at most 10 bytes, and the list's own length.
+/// The most bytes of ranges one request of a closure fetch carries.
+///
+/// A member held only in part is requested for the chunks it lacks, and those
+/// can be many spans, so a window's ranges are not bounded by its length the way
+/// whole-member requests were. A window is split into as many requests as its
+/// ranges need, each at most this many bytes of encoded runs, and a run is never
+/// split: a request holds at least one member whatever the budget.
+const REQUEST_BUDGET: usize = 8 * 1024;
+
+/// The most bytes of ranges one member may contribute to a request before it is
+/// asked for whole instead: a store that has been written in thousands of
+/// scattered pieces is cheaper to refetch than to describe.
+const MEMBER_SPEC_MAX: usize = 1024;
+
+/// What a request needs beyond its runs: a length prefix, and the run that ends
+/// the last selection. A varint of a `u64` is at most 10 bytes.
+const REQUEST_TAIL: usize = 10 + 12;
+
+// A request, by construction: the budget, the largest single member, and the
+// tail, together far under what iroh-blobs will read.
 const _: () = assert!(
-    FETCH_WINDOW as usize * 7 + 16 < iroh_blobs::protocol::MAX_MESSAGE_SIZE / 16,
-    "a fetch window's request must stay far under iroh-blobs' message limit"
+    REQUEST_BUDGET + MEMBER_SPEC_MAX + REQUEST_TAIL + 24
+        < iroh_blobs::protocol::MAX_MESSAGE_SIZE / 16,
+    "a fetch request must stay far under iroh-blobs' message limit"
 );
 
 /// The member count of a root of `size` bytes, or why it is not a closure.
@@ -1478,35 +1496,97 @@ fn count_members(root: BlobId, size: u64) -> Result<u64> {
     Ok(size / 32)
 }
 
-/// The request for exactly the members of `root` that `lacking` marks, where
-/// `lacking[i]` is member `start + i`, and nothing else: no bytes of the root,
-/// and no member that is not marked.
+/// The chunks of a blob a request must ask for, given what the store holds of
+/// it: everything, less what it holds. Nothing for a blob it holds in full.
 ///
-/// Built from its wire form, a run for each stretch of marked members (from its
-/// first offset, selecting everything) and a run that selects nothing after it,
-/// rather than with the request builder, which expands a vector of every offset
-/// below the last one it is given. Offset 0 is the root and member `n` is offset
-/// `n + 1`. One run per stretch keeps a window's request to a few bytes per gap,
-/// which for 4096 members is at most about 12 KB against a 1 MiB cap.
-fn missing_request(root: BlobId, start: u64, lacking: &[bool]) -> Result<GetRequest> {
-    let mut runs: Vec<(u64, Vec<u64>)> = Vec::new();
+/// A bitfield whose last chunk is held is open-ended past it, so the tail of a
+/// blob whose size has been proved is never asked for again, and one whose last
+/// chunk is not held keeps that chunk in the ask, which is what carries the size
+/// proof with it.
+fn lacking(held: &Bitfield) -> ChunkRanges {
+    if held.is_complete() {
+        ChunkRanges::empty()
+    } else {
+        ChunkRanges::all().difference(&held.ranges)
+    }
+}
+
+/// One run of a request's wire form: the gap from the last run, and the chunks
+/// selected from there until the next run.
+type Run = (u64, RangeSpec);
+
+fn run_bytes(run: &Run) -> usize {
+    // The runs are tiny, and measuring the encoding is the budget's definition.
+    postcard::to_stdvec(run).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The requests that ask `root` for exactly the chunks `wanted` lists, where
+/// `wanted[i]` is what to ask of member `start + i` (nothing, when empty), and
+/// nothing else: no bytes of the root, no member that is not wanted, no chunk
+/// that is not.
+///
+/// Built from the wire form, a run wherever what is wanted changes, rather than
+/// with the request builder, which expands a vector of every offset below the
+/// last one it is given. Offset 0 is the root and member `n` is offset `n + 1`.
+/// Adjacent members that want the same chunks share a run, so a stretch of whole
+/// members is one run and a window of alternating gaps is two per member.
+///
+/// Each request carries at most `budget` bytes of runs, found by encoding them,
+/// and a window whose ranges need more becomes several requests. A member whose
+/// own ranges would take more than [`MEMBER_SPEC_MAX`] bytes is asked for whole.
+fn plan(
+    root: BlobId,
+    start: u64,
+    wanted: &[ChunkRanges],
+    budget: usize,
+) -> Result<Vec<GetRequest>> {
+    let finish = |runs: &[Run]| -> Result<GetRequest> {
+        let wire = postcard::to_stdvec(runs).map_err(store_error)?;
+        let ranges = postcard::from_bytes(&wire).map_err(store_error)?;
+        Ok(GetRequest::new(root.hash(), ranges))
+    };
+    let mut requests = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
     let mut at = 0u64;
-    let mut selected = false;
-    for (index, lack) in (0u64..).zip(lacking) {
-        if *lack != selected {
-            let offset = start + index + 1;
-            runs.push((offset - at, if *lack { vec![0] } else { Vec::new() }));
-            at = offset;
-            selected = *lack;
+    let mut bytes = 10;
+    // What the last run selects. Empty until a member wants something.
+    let mut open = ChunkRanges::empty();
+    for (index, wants) in (0u64..).zip(wanted) {
+        let offset = start + index + 1;
+        let mut wants = wants.clone();
+        if run_bytes(&(0, RangeSpec::new(&wants))) > MEMBER_SPEC_MAX {
+            wants = ChunkRanges::all();
         }
+        if wants == open {
+            continue;
+        }
+        let run = (offset - at, RangeSpec::new(&wants));
+        let size = run_bytes(&run);
+        if !wants.is_empty() && !runs.is_empty() && bytes + size + REQUEST_TAIL > budget {
+            // Out of room: end this request where what is wanted stops, and
+            // begin the next with this member.
+            if !open.is_empty() {
+                runs.push((offset - at, RangeSpec::new(ChunkRanges::empty())));
+            }
+            requests.push(finish(&runs)?);
+            runs.clear();
+            at = 0;
+            bytes = 10;
+        }
+        let run = (offset - at, RangeSpec::new(&wants));
+        bytes += run_bytes(&run);
+        runs.push(run);
+        at = offset;
+        open = wants;
     }
-    if selected {
-        let end = start + lacking.len() as u64 + 1;
-        runs.push((end - at, Vec::new()));
+    if !runs.is_empty() {
+        if !open.is_empty() {
+            let end = start + wanted.len() as u64 + 1;
+            runs.push((end - at, RangeSpec::new(ChunkRanges::empty())));
+        }
+        requests.push(finish(&runs)?);
     }
-    let wire = postcard::to_stdvec(&runs).map_err(store_error)?;
-    let ranges = postcard::from_bytes(&wire).map_err(store_error)?;
-    Ok(GetRequest::new(root.hash(), ranges))
+    Ok(requests)
 }
 
 /// A store failure, as keylink reports every one.
@@ -1817,6 +1897,22 @@ async fn root_lists(
 
 // ─────────────────────────────────────────────────────────────── the client
 
+/// What [`BlobHandle::fetch_into`] did.
+///
+/// The two numbers are what makes a resume provable: after a transfer is cut,
+/// the next `fetch_into` reports in `kept` the verified bytes the store already
+/// held and did not ask for, and in `read` only the bytes that crossed the wire.
+/// Both count payload, never the hashes that verify it. `kept` counts each blob
+/// once, however many places in a closure list it, and counts the closure's own
+/// member list when the store already held it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fetched {
+    /// Payload bytes read from the holder.
+    pub read: u64,
+    /// Verified bytes the store already held and the fetch did not request.
+    pub kept: u64,
+}
+
 /// Content plus the node that holds it.
 ///
 /// Opens the blobs connection internally, so a call site names no ALPN and no
@@ -2099,28 +2195,35 @@ impl BlobHandle {
     }
 
     /// Fetch into a local store everything this handle grants that `store`
-    /// lacks. Returns the payload bytes that crossed the wire.
+    /// lacks, and say what that took.
     ///
     /// Deduplication and resume come from the store: an interrupted transfer
-    /// continues where it stopped, and content already present costs nothing,
-    /// which is zero for a blob the store already held. Measured by
-    /// `interrupted_fetch_into_resumes_from_store_progress`: after an answer
-    /// cut in half, the second fetch read 37232 of 70000 bytes, so the two
-    /// whole 16 KiB blocks the store had already validated were kept.
+    /// continues where it stopped, and content already present costs nothing.
+    /// The answer is a [`Fetched`]: the payload bytes that crossed the wire
+    /// (`read`), and the verified bytes the store already held that were not
+    /// asked for (`kept`), so a resume is provable from the outside.
+    ///
+    /// # Resume goes down to the 16 KiB chunk group
+    ///
+    /// For every blob it is about to fetch, a closure's members included, this
+    /// reads which chunks the store already holds (its bitfield) and asks for the
+    /// rest. iroh-blobs stores and verifies whole chunk groups of 16 KiB, so a
+    /// fetch cut after `g` verified groups of one member resumes by asking for
+    /// that member from group `g` on, and no verified group is sent twice.
     ///
     /// # A closure is fetched in phases, on one dial
     ///
     /// First the root alone, which costs no request when the store already holds
     /// it, and which is checked for whole addresses before it is downloaded.
-    /// Then the members, and
-    /// only the members the store lacks, 4096 of them per request: each window
-    /// reads its slice of the root, asks the store which of those members it
-    /// holds in full, and requests the rest, so a window keeps both its plan and
-    /// its request small however long the closure is. A member the store holds
-    /// only in part is requested whole again. Fetching the sequence in one
-    /// request would send the whole closure when the root is absent, because
-    /// the fetcher cannot know which members it holds until it holds the list.
-    /// The holder's grant is its claim that it has the closure.
+    /// Then the members, 4096 of them to a window: each window reads its slice of
+    /// the root, asks the store what it holds of each member, and requests the
+    /// rest, in as many requests as its ranges need (at most 8 KiB of ranges
+    /// each), so a window keeps both its plan and its requests small however long
+    /// the closure is. A blob listed twice in a window is requested once.
+    /// Fetching the sequence in one request would send the whole closure when
+    /// the root is absent, because the fetcher cannot know which members it holds
+    /// until it holds the list. The holder's grant is its claim that it has the
+    /// closure.
     ///
     /// # It does not inherit the reader's size guarantee, on purpose
     ///
@@ -2129,69 +2232,70 @@ impl BlobHandle {
     /// requests this crate builds from what the store lacks. Neither makes the
     /// [`verified_len`](Self::verified_len) preflight and comparison the reader
     /// does: there is no number handed back to announce. The content is
-    /// validated against its address as it lands in the store, and the return
-    /// value describes bytes that already arrived rather than bytes to expect.
-    /// The one size check a closure makes is its root's, before it is
-    /// downloaded, and the last chunk that check carries is counted in the
-    /// return value. Reach for [`open`](Self::open) when a length has to be
-    /// trusted before the transfer.
+    /// validated against its address as it lands in the store, and the counts
+    /// describe bytes that already arrived rather than bytes to expect. The one
+    /// size check a closure makes is its root's, before it is downloaded, and the
+    /// last chunk that check carries is counted in `read`. Reach for
+    /// [`open`](Self::open) when a length has to be trusted before the transfer.
     ///
     /// # Errors
     ///
     /// The same set as [`copy_to`](Self::copy_to).
-    pub async fn fetch_into(&self, store: &Blobs) -> Result<u64> {
+    pub async fn fetch_into(&self, store: &Blobs) -> Result<Fetched> {
         let connection = self.dial().await?;
-        let (mut bytes, members) = match self.content {
+        let (mut fetched, members) = match self.content {
             Content::Blob(_) => (self.fetch_root(&connection, store).await?, 0),
             Content::Closure(_) => self.ensure_root(&connection, store).await?,
         };
-        // The members, a window of them per request. The root is complete in
-        // the store by now. Each window reads only its own 4096 addresses off
-        // it, asks the store which of them it lacks, and requests only those.
-        // iroh-blobs' planner (`Remote::local_for_request`) is not used here,
-        // because it indexes every member of the root before it looks at the
-        // window, which would repeat the whole-root work for every window.
-        //
-        // A member the store holds only in part is requested whole again: the
-        // question asked is whether it is held in full, and what is already
-        // there is verified and rewritten rather than skipped.
+        // The members, a window of them at a time. The root is complete in the
+        // store by now. Each window reads only its own 4096 addresses off it and
+        // asks the store what it holds of each, and requests only what is
+        // lacking. iroh-blobs' planner (`Remote::local_for_request`) is not used
+        // here, because it indexes every member of the root before it looks at
+        // the window, which would repeat the whole-root work for every window.
         let remote = store.store().remote();
         let mut start = 0;
         while start < members {
             let end = (start + FETCH_WINDOW).min(members);
             let listed = store.listed(self.id(), start..end).await?;
-            // Only the first occurrence of a hash that is lacking is requested:
-            // a sequence may list the same blob twice, and one transfer fills
-            // both places. The sequence itself is untouched, so order and
-            // duplicates stay; only the request is deduplicated.
-            let mut asked = std::collections::HashSet::new();
-            let mut lacking = Vec::with_capacity(listed.len());
+            // Only the first occurrence of a hash is asked about: a sequence may
+            // list the same blob twice, and one transfer fills both places. The
+            // sequence itself is untouched, so order and duplicates stay; only
+            // the request is deduplicated.
+            let mut seen = std::collections::HashSet::new();
+            let mut wanted = Vec::with_capacity(listed.len());
             for member in &listed {
-                lacking.push(!store.has(*member).await? && asked.insert(*member));
+                if !seen.insert(*member) {
+                    wanted.push(ChunkRanges::empty());
+                    continue;
+                }
+                let held = store.held(*member).await?;
+                fetched.kept += held.total_bytes();
+                wanted.push(lacking(&held));
             }
-            if lacking.contains(&true) {
+            for request in plan(self.id(), start, &wanted, REQUEST_BUDGET)? {
                 let stats = remote
-                    .execute_get(
-                        connection.clone(),
-                        missing_request(self.id(), start, &lacking)?,
-                    )
+                    .execute_get(connection.clone(), request)
                     .await
                     .map_err(|error| self.classify(error, &connection))?;
-                bytes += stats.payload_bytes_read;
+                fetched.read += stats.payload_bytes_read;
             }
             start = end;
         }
-        Ok(bytes)
+        Ok(fetched)
     }
 
     /// The root alone, as a raw blob.
-    async fn fetch_root(&self, connection: &Connection, store: &Blobs) -> Result<u64> {
-        self.fetch_with(connection, store, HashAndFormat::raw(self.id().hash()))
-            .await
+    async fn fetch_root(&self, connection: &Connection, store: &Blobs) -> Result<Fetched> {
+        let kept = store.held(self.id()).await?.total_bytes();
+        let read = self
+            .fetch_with(connection, store, HashAndFormat::raw(self.id().hash()))
+            .await?;
+        Ok(Fetched { read, kept })
     }
 
     /// Make sure `store` holds this closure's root, and say how many members it
-    /// lists and how many payload bytes it cost to get it.
+    /// lists and what it cost to get it.
     ///
     /// The root is checked for whole addresses **before it is downloaded**, from
     /// the size the holder proves with the last chunk. A root the store already
@@ -2199,9 +2303,10 @@ impl BlobHandle {
     /// fails here and not as a fetch that succeeds. There is no limit on how
     /// many members it lists: each window of them is planned from its own slice
     /// of the root.
-    async fn ensure_root(&self, connection: &Connection, store: &Blobs) -> Result<(u64, u64)> {
+    async fn ensure_root(&self, connection: &Connection, store: &Blobs) -> Result<(Fetched, u64)> {
         if let Some(members) = store.members(self.id()).await? {
-            return Ok((0, members));
+            let kept = members * 32;
+            return Ok((Fetched { read: 0, kept }, members));
         }
         let (size, proof) = get_verified_size(connection, &self.id().hash())
             .await
@@ -2209,14 +2314,15 @@ impl BlobHandle {
         count_members(self.id(), size)?;
         // The proof is payload that crossed the wire too: the root's last chunk,
         // which the download below sends again.
-        let bytes = proof.payload_bytes_read + self.fetch_root(connection, store).await?;
+        let mut fetched = self.fetch_root(connection, store).await?;
+        fetched.read += proof.payload_bytes_read;
         let members = store.members(self.id()).await?.ok_or_else(|| {
             Error::Io(std::io::Error::other(format!(
                 "closure root {} did not land in the store",
                 self.id()
             )))
         })?;
-        Ok((bytes, members))
+        Ok((fetched, members))
     }
 
     async fn fetch_with(
@@ -3121,6 +3227,82 @@ mod tests {
         );
         assert_eq!(scope(&grants, 2, blob(1)), Some(Scope::Blob));
         assert_eq!(grants.lock().grants, 1);
+    }
+
+    /// What a plan asks of every offset, taken back out of its requests: the
+    /// union, over all of them, of the chunks each one selects at `offset`.
+    fn asked_at(requests: &[GetRequest], offset: u64) -> ChunkRanges {
+        requests.iter().fold(ChunkRanges::empty(), |all, request| {
+            all.union(&request.ranges[offset])
+        })
+    }
+
+    /// A plan asks for exactly what is wanted, member by member and chunk by
+    /// chunk, and nothing else, and a window whose ranges outgrow the budget
+    /// becomes several requests none of which is over it.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK65`) by replacing
+    /// `if !wants.is_empty() && !runs.is_empty() && bytes + size + REQUEST_TAIL > budget {`
+    /// with `if false {`: one request carries the lot and is over the budget.
+    #[test]
+    fn a_plan_asks_for_exactly_what_is_wanted_and_splits_by_bytes() {
+        let wanted: Vec<ChunkRanges> = (0u64..600)
+            .map(|nth| match nth % 5 {
+                0 => ChunkRanges::chunks(16..32),
+                1 => ChunkRanges::empty(),
+                2 => ChunkRanges::chunks(0..16) | ChunkRanges::chunks(32..48),
+                3 => ChunkRanges::all(),
+                _ => ChunkRanges::chunks(5..9) | ChunkRanges::chunks(100..),
+            })
+            .collect();
+        let budget = 512;
+        let requests = plan(blob(1), 7, &wanted, budget).expect("plans");
+
+        assert!(
+            requests.len() > 3,
+            "600 varied members do not fit 512 bytes"
+        );
+        for request in &requests {
+            let runs = postcard::to_stdvec(&request.ranges).expect("encodes").len();
+            assert!(runs <= budget, "a request of {runs} bytes is over {budget}");
+            assert_eq!(request.ranges[0], ChunkRanges::empty(), "never the root");
+        }
+        for (index, wants) in (0u64..).zip(&wanted) {
+            assert_eq!(
+                &asked_at(&requests, 7 + index + 1),
+                wants,
+                "member {index} is asked for exactly what it lacks"
+            );
+        }
+        assert_eq!(
+            asked_at(&requests, 7),
+            ChunkRanges::empty(),
+            "before the window"
+        );
+        assert_eq!(
+            asked_at(&requests, 7 + 600 + 1 + 1),
+            ChunkRanges::empty(),
+            "after the window"
+        );
+
+        // With the real budget the same window is fewer requests, and still exact.
+        let whole = plan(blob(1), 7, &wanted, REQUEST_BUDGET).expect("plans");
+        assert!(whole.len() < requests.len());
+        for (index, wants) in (0u64..).zip(&wanted) {
+            assert_eq!(&asked_at(&whole, 7 + index + 1), wants);
+        }
+    }
+
+    /// A member whose own ranges are many scattered pieces is asked for whole
+    /// instead, because describing it would cost more than refetching it.
+    #[test]
+    fn a_member_with_too_many_pieces_is_asked_for_whole() {
+        let scattered = (0..2000u64).fold(ChunkRanges::empty(), |all, nth| {
+            all | ChunkRanges::chunks(nth * 4..nth * 4 + 2)
+        });
+        let requests = plan(blob(1), 0, &[scattered], REQUEST_BUDGET).expect("plans");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(asked_at(&requests, 1), ChunkRanges::all());
     }
 
     /// Review finding 8. An accept that has checked the ledger but not yet

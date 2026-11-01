@@ -260,8 +260,8 @@ pub mod trust;
 pub use admission::{Admission, Admittance, DynamicAdmission, LiveConnection, Refusal, Revocable};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{
-    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Grant, Granting, Missing,
-    Retention, SeqId, GRANT_LIMIT,
+    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Content, Fetched, Grant, Granting,
+    Missing, Retention, SeqId, GRANT_LIMIT,
 };
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};

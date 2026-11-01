@@ -754,13 +754,16 @@ async fn a_blob_fetched_twice_into_one_store_costs_one_transfer() {
         .fetch_into(&local)
         .await
         .expect("the first fetch transfers");
-    assert!(first > 0, "the first fetch moved bytes");
+    assert!(first.read > 0, "the first fetch moved bytes");
 
     let second = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), id)
         .fetch_into(&local)
         .await
         .expect("the second fetch is free");
-    assert_eq!(second, 0, "content already held costs no payload bytes");
+    assert_eq!(
+        second.read, 0,
+        "content already held costs no payload bytes"
+    );
 }
 
 // ───────────────────────────────────────────────── verified readers and ranges
@@ -1580,12 +1583,13 @@ async fn interrupted_fetch_into_resumes_from_store_progress() {
         .await
         .expect("the second fetch completes");
     assert!(
-        second > 0,
+        second.read > 0,
         "control: the first fetch did not quietly finish, so there was a suffix to ask for"
     );
     assert!(
-        second < content.len() as u64,
-        "resume asks only for what the store is missing, not {second} of {} bytes",
+        second.read < content.len() as u64,
+        "resume asks only for what the store is missing, not {} of {} bytes",
+        second.read,
         content.len()
     );
 }
@@ -1857,7 +1861,7 @@ async fn a_blob_method_result_can_be_fetched_into_a_store() {
         .fetch_into(&local)
         .await
         .expect("fetches into a store");
-    assert!(moved > 0, "the first fetch moved bytes");
+    assert!(moved.read > 0, "the first fetch moved bytes");
 }
 
 // ───────────────────────────────────────────────── configuration is checked
@@ -2599,7 +2603,7 @@ async fn a_closure_of_5000_members_is_fetched_with_one_grant() {
     let list = 5000 * 32;
     let proof = (list - 1) % 1024 + 1;
     assert_eq!(
-        moved,
+        moved.read,
         5000 * 1024 + list + proof,
         "every member's payload, the member list, and the last chunk of it the \
          size proof carried: all payload that crossed the wire"
@@ -2741,7 +2745,7 @@ async fn missing_names_exactly_the_members_the_store_lacks() {
 
     let moved = handle.fetch_into(&local).await.expect("fetches the rest");
     assert_eq!(
-        moved,
+        moved.read,
         1000 * 1024,
         "the root was already held, and so was the rest"
     );
@@ -2749,7 +2753,7 @@ async fn missing_names_exactly_the_members_the_store_lacks() {
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 }
 
 /// Revoking a closure takes effect at the next request.
@@ -3130,12 +3134,12 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
     let moved = handle.fetch_into(&local).await.expect("fetches 20,000");
     let list = 20_000 * 32;
     let proof = (list - 1) % 1024 + 1;
-    assert_eq!(moved, 20_000 * 1024 + list + proof);
+    assert_eq!(moved.read, 20_000 * 1024 + list + proof);
     assert_eq!(
         local.missing(handle.content()).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 
     // The size proof, the root, and five windows (4096 four times, then 3616).
     let asked: Vec<GetRequest> = holder
@@ -3175,10 +3179,10 @@ async fn a_closure_of_20000_members_is_fetched_window_by_window() {
 /// arrived whole.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK62`) by replacing
-/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
-/// with `lacking.push(true);` in `keylink/src/blobs.rs`: every window then asks
-/// for all of its members, and the retry moves every member again (20,480,000
-/// bytes) instead of the roughly half it lacked.
+/// `wanted.push(lacking(&held));`
+/// with `wanted.push(ChunkRanges::all());` in `keylink/src/blobs.rs`: every
+/// window then asks for all of its members, and the retry moves every member
+/// again (20,480,000 bytes) instead of the roughly half it lacked.
 #[tokio::test]
 async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds() {
     let cluster = cluster().await;
@@ -3234,7 +3238,7 @@ async fn an_interrupted_closure_fetch_resumes_from_the_members_the_store_holds()
         .expect("the retry completes");
     let lacking_before = (20_000 - held_after_cut) as u64;
     assert_eq!(
-        second,
+        second.read,
         lacking_before * 1024,
         "exactly the members that were lacking: the root is held, the windows already \
          fetched are not asked for again, and the members of the third window that \
@@ -3299,7 +3303,7 @@ async fn a_closure_with_alternating_gaps_is_fetched(members: u32) {
 
     let moved = handle.fetch_into(&local).await.expect("fetches the rest");
     assert_eq!(
-        moved,
+        moved.read,
         u64::from(members / 2) * 4,
         "the odd members, 4 bytes each"
     );
@@ -3307,7 +3311,7 @@ async fn a_closure_with_alternating_gaps_is_fetched(members: u32) {
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
     );
-    assert_eq!(handle.fetch_into(&local).await.expect("free"), 0);
+    assert_eq!(handle.fetch_into(&local).await.expect("free").read, 0);
 }
 
 /// Three whole windows and one member over (3 * 4096 + 1), with alternating
@@ -3355,10 +3359,10 @@ async fn a_closure_of_300000_tiny_members_with_alternating_gaps_is_fetched() {
 /// 10000.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK63`) by replacing
-/// `lacking.push(!store.has(*member).await? && asked.insert(*member));`
-/// with `lacking.push(!store.has(*member).await? && { asked.insert(*member); true });`
-/// in `keylink/src/blobs.rs`: the fetch then moves every listed place and fails
-/// with `each blob crossed once` (left: 10000, right: 6000).
+/// `if !seen.insert(*member) {`
+/// with `if false {` in `keylink/src/blobs.rs`: the fetch then asks for every
+/// listed place and fails with `each blob crossed once` (left: 10000, right:
+/// 6000).
 #[tokio::test]
 async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
     let cluster = cluster().await;
@@ -3390,7 +3394,7 @@ async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
         .fetch_into(&local)
         .await
         .expect("fetches the members");
-    assert_eq!(moved, 1000 + 2000 + 3000, "each blob crossed once");
+    assert_eq!(moved.read, 1000 + 2000 + 3000, "each blob crossed once");
     assert_eq!(
         handle.missing(&local).await.expect("answers"),
         keylink::Missing::Nothing
@@ -3400,5 +3404,129 @@ async fn a_member_listed_more_than_once_in_a_window_crosses_the_wire_once() {
         read,
         vec![payload(1000), payload(2000), payload(3000)],
         "and every place it was listed is filled"
+    );
+}
+
+// ═══════════════════════════════════════ resume goes down into a member
+
+/// Where in a member's answer `groups` whole 16 KiB chunk groups end.
+///
+/// A holder's answer for one blob is its 8-byte size, then the tree in pre-order:
+/// a 64-byte parent for each node above the groups, and each group's data where
+/// it falls. Cutting the answer here ends it exactly after the `groups`-th group
+/// has arrived whole, with every parent hash that verifies it.
+fn bytes_through_group(len: u64, groups: u64) -> usize {
+    use bao_tree::{iter::BaoChunk, BaoTree, ChunkRanges as Ranges};
+    let tree = BaoTree::new(len, iroh_blobs::store::IROH_BLOCK_SIZE);
+    let mut bytes = 8usize;
+    let mut seen = 0;
+    for chunk in tree.ranges_pre_order_chunks_iter_ref(&Ranges::all(), 0) {
+        match chunk {
+            BaoChunk::Parent { .. } => bytes += 64,
+            BaoChunk::Leaf { size, .. } => {
+                bytes += size;
+                seen += 1;
+                if seen == groups {
+                    return bytes;
+                }
+            }
+        }
+    }
+    panic!("a blob of {len} bytes has fewer than {groups} groups");
+}
+
+/// **Resume inside a member.** A member of 4 MiB and 100 bytes (257 chunk groups
+/// of 16 KiB, the last of 100 bytes) is fetched through a holder that cuts its
+/// answer exactly after `K = 100` whole groups. The fetch fails. The next
+/// `fetch_into`, from the same store, asks for that member from group 100 on and
+/// so reads exactly the bytes the store lacked:
+///
+/// ```text
+/// read = 4 194 404 - 100 * 16 384 = 2 556 004
+/// kept = 32 (the member list) + 100 * 16 384 = 1 638 432
+/// ```
+///
+/// The last group is short, and it is among the groups still to come, so it is
+/// part of `read` as its own 100 bytes and no adjustment is needed to `K` whole
+/// groups held. Nothing of the first 100 groups crosses the wire twice.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK64`) by replacing
+/// `ChunkRanges::all().difference(&held.ranges)`
+/// with `ChunkRanges::all()` in `keylink/src/blobs.rs`, which is what the planner
+/// did before: it asks for a partly held member whole again, and `read` is the
+/// whole 4 194 404 bytes against the 2 556 004 that were lacking.
+#[tokio::test]
+async fn a_fetch_cut_inside_one_member_resumes_without_resending_a_verified_group() {
+    const GROUP: u64 = 16 * 1024;
+    const K: u64 = 100;
+    let len = 4 * 1024 * 1024 + 100;
+    let cluster = cluster().await;
+    let member = cluster.add_bytes(&payload(len)).await;
+    let seq = cluster
+        .blobs
+        .add_seq([member])
+        .await
+        .expect("stores the list");
+    cluster
+        .grant_content(&cluster.peer, &[Content::Closure(seq.id())])
+        .await;
+
+    let cut = bytes_through_group(len as u64, K);
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let data_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holder = forgery({
+        let data_requests = Arc::clone(&data_requests);
+        move |request: GetRequest| {
+            let (from, to) = (from.clone(), to.clone());
+            let data_requests = Arc::clone(&data_requests);
+            async move {
+                let answer = ask(from, to, request.clone()).await;
+                if request.ranges == preflight_ranges() {
+                    return answer;
+                }
+                // 1 is the member list, 2 is the member: cut that one.
+                let nth = data_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if nth == 2 {
+                    answer[..cut].to_vec()
+                } else {
+                    answer
+                }
+            }
+        }
+    })
+    .await;
+    let handle = holder.handle(seq);
+    let local = Blobs::memory();
+
+    handle
+        .fetch_into(&local)
+        .await
+        .expect_err("an answer that stops after 100 groups does not complete a fetch");
+
+    let second = handle
+        .fetch_into(&local)
+        .await
+        .expect("the retry completes");
+    println!("resume: read {} kept {}", second.read, second.kept);
+    assert_eq!(
+        second.kept,
+        32 + K * GROUP,
+        "the store kept the member list and exactly the {K} groups that arrived whole"
+    );
+    assert_eq!(
+        second.read,
+        len as u64 - K * GROUP,
+        "and only what it lacked crossed the wire: no verified group twice"
+    );
+    assert_eq!(
+        handle.missing(&local).await.expect("answers"),
+        keylink::Missing::Nothing
+    );
+    let read = read_back(&local, &[member]).await;
+    assert_eq!(
+        read,
+        vec![payload(len)],
+        "and the member is whole and identical"
     );
 }

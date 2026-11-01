@@ -2235,9 +2235,13 @@ ANCHORS = [
     ("HK60", "keylink-http/tests/blobs.rs", "keylink-http/src/error.rs",
      "                | keylink::RemoteError::GrantsExhausted { .. }"),
     ("HK63", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
-     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+     "                if !seen.insert(*member) {"),
+    ("HK64", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        ChunkRanges::all().difference(&held.ranges)"),
+    ("HK65", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if !wants.is_empty() && !runs.is_empty() && bytes + size + REQUEST_TAIL > budget {"),
     ("HK62", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
-     "                lacking.push(!store.has(*member).await? && asked.insert(*member));"),
+     "                wanted.push(lacking(&held));"),
     ("HK59", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if grants.knows(&peer) {"),
     ("HK57", "keylink/tests/grant_allocation.rs", "keylink/src/blobs.rs",
@@ -4068,7 +4072,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 392
+RECORD_BLOCKS = 394
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
