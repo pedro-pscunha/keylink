@@ -6,7 +6,14 @@ rust-version = "1.91"
 description = "Bounded authenticated HTTP/JSON gateway for generated Keylink services."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedro-pscunha/keylink"
+keywords = ["http", "gateway", "rpc", "keylink", "axum"]
+categories = ["network-programming", "web-programming::http-server"]
 readme = "README.md"
+# Two test files need the workspace and cannot run from the published package:
+# `imported.rs` uses the `imported-ledger` fixture, a path-only dev-dependency
+# cargo strips when it packages, and `api.rs` reads the root README beside this
+# crate's own. They run in the workspace, which is where the gate runs them.
+exclude = ["tests/imported.rs", "tests/api.rs"]
 
 [dependencies]
 keylink = { path = "../keylink", version = "0.1.0", default-features = false }
