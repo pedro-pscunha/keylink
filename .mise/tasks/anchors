@@ -2380,11 +2380,13 @@ ANCHORS = [
      "        set.shutdown().await;"),
     ("OT3", "keylink/tests/away.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => crate::away::push::<A>(Box::pin(async move {"),
-    # `GP1` and `AT1` live in the file they break, share the arm that hands the
-    # permit's commit to `Guard::record`, and break it two ways. The record's quote
-    # is unindented where the literal carries twelve spaces, which is what keeps it
-    # unique.
+    # `GP1` and `AT1` live in the file they break, and `GP2` in `tests/deadline.rs`. All
+    # three share the arm that hands the permit's commit to `Guard::record`, and
+    # break it two ways. The quote in `rpc.rs` is unindented where the literal
+    # carries twelve spaces, which is what keeps it unique.
     ("GP1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "            Reached::Completed => return guard.record(frame, payload, commit).await,"),
+    ("GP2", "keylink/tests/deadline.rs", "keylink/src/rpc.rs",
      "            Reached::Completed => return guard.record(frame, payload, commit).await,"),
     ("OT5", "keylink/tests/away.rs", "keylink/src/away.rs",
      "    Box::new(move |state: &mut A| Box::pin(async move { state.back(out, reply).await }))"),
@@ -4137,7 +4139,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 425
+RECORD_BLOCKS = 426
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

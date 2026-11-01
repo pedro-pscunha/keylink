@@ -337,3 +337,115 @@ async fn a_caller_deadline_is_typed_locally() {
     assert_eq!(holding.await.expect("no panic").expect("answers"), 1);
     fallback.abort();
 }
+
+// ───────────────────────────────────────────── a deadline and the content a reply names
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+pub struct Manual {
+    pub pages: u32,
+}
+
+keylink::service! {
+    service Shelf;
+
+    /// Holds on a gate, then hands back a datasheet and the right to fetch it.
+    blob Datasheet() -> Manual;
+}
+
+struct Shelf {
+    gate: Arc<Notify>,
+    published: keylink::BlobId,
+}
+
+impl shelf::Handler for Shelf {
+    async fn datasheet(&self, _cx: &keylink::Context) -> (Manual, keylink::Grant) {
+        self.gate.notified().await;
+        (Manual { pages: 3 }, self.published.into())
+    }
+}
+
+/// A keyed call that names content, answered `DeadlinePassed`, still grants the
+/// caller that content when its handler finishes, and the retry is handed the
+/// reply and can fetch what it names.
+///
+/// The late path reserves the grant and makes it live through the same permit the
+/// on-time path uses. If it dropped the permit instead, the retry would be given a
+/// reply naming content the holder had never granted, and the fetch below would be
+/// refused. Which worker publishes the record first is not asserted: the order of
+/// the grant and the record is `idempotency.rs`'s `publication` tests, and this is
+/// the wire-level check that the late path takes part at all.
+///
+/// The handler is a concurrent one on a gate, so no scheduling window decides
+/// whether the deadline passes before it finishes, and the service-only deadline
+/// is short because a `Handler` has no start to shed.
+///
+/// Made red by `scripts/break-once.sh keylink/src/rpc.rs` on `settle_key`'s
+/// `Reached::Completed => return guard.record(frame, payload, commit).await,`
+/// (indented twelve spaces; registered as `GP2`) and the replacement
+/// `Reached::Completed => return guard.record(frame, payload, || {}).await,`,
+/// which never makes a grant live. Watched: the fetch of the retry's reply is
+/// refused.
+#[tokio::test]
+async fn a_late_keyed_reply_that_names_content_still_grants_it() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let blobs = keylink::Blobs::memory();
+    let gate = Arc::new(Notify::new());
+    let published = blobs
+        .add_bytes(b"the late datasheet".to_vec())
+        .await
+        .expect("stores");
+    let _running = Server::builder(&server)
+        .service(
+            shelf::service(
+                Shelf {
+                    gate: Arc::clone(&gate),
+                    published,
+                },
+                Allowlist::anyone(),
+            )
+            .with_blobs(&blobs)
+            .deadline(Duration::from_millis(50))
+            .build(),
+        )
+        .spawn()
+        .expect("one service with a store");
+    let client = shelf::Client::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = IdempotencyKey::new("datasheet-1").expect("a valid key");
+    let keyed = || {
+        client.with_idempotency(Idempotency::attaching_for(
+            key.clone(),
+            Duration::from_secs(30),
+        ))
+    };
+
+    let first = keyed().datasheet().await;
+    assert!(
+        matches!(
+            first,
+            Err(Error::Remote(RemoteError::DeadlinePassed { .. }))
+        ),
+        "the first call is told the deadline passed"
+    );
+
+    let retry = {
+        let retrying = keyed();
+        tokio::spawn(async move { retrying.datasheet().await })
+    };
+    gate.notify_one();
+    let (manual, handle) = tokio::time::timeout(Duration::from_secs(30), retry)
+        .await
+        .expect("the retry gets the first call's reply")
+        .expect("the retry does not panic")
+        .expect("the retry gets the first call's reply");
+    assert_eq!(manual.pages, 3);
+
+    let mut fetched = Vec::new();
+    handle
+        .copy_to(&mut fetched)
+        .await
+        .expect("the late reply's content was granted, so the retry can fetch it");
+    assert_eq!(fetched, b"the late datasheet");
+}
