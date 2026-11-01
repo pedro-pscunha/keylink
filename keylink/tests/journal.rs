@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keylink::prelude::*;
-use keylink::{Caller, Deltas, Ended, Persist, Whole};
+use keylink::{Caller, Deltas, Ended, Persist, Unanswered, Whole, Withheld};
 use keylink_persist::file::Files;
 use keylink_persist::versioned::{Compaction, TornTail};
 use keylink_persist::{
@@ -214,7 +214,7 @@ async fn open<S: Snapshots>(
         .expect("claims and replays")
         .compaction(when);
     let torn = opened.torn_tail();
-    let (state, saver) = opened.start_from(Tape::default);
+    let (state, saver) = opened.start_from(Tape::default).expect("adopts");
     (state, saver, torn)
 }
 
@@ -265,6 +265,9 @@ struct Inner {
     stores: u64,
     /// The next `append`, and only that one, returns `Err`.
     failing: bool,
+    /// The next `append`, and only that one, returns `Err(Indeterminate)`: the
+    /// record "may be stored".
+    indeterminate: bool,
 }
 
 impl Memory {
@@ -278,6 +281,10 @@ impl Memory {
 
     fn fail_the_next_append(&self) {
         self.inner.lock().expect("not poisoned").failing = true;
+    }
+
+    fn fail_the_next_append_without_being_able_to_undo_it(&self) {
+        self.inner.lock().expect("not poisoned").indeterminate = true;
     }
 }
 
@@ -314,6 +321,12 @@ impl Claim for MemoryClaim {
         let mut inner = self.inner.lock().expect("not poisoned");
         if std::mem::take(&mut inner.failing) {
             return Err(Error::Io(std::io::Error::other("the log said no, once")));
+        }
+        if std::mem::take(&mut inner.indeterminate) {
+            return Err(Error::Indeterminate {
+                append: std::io::Error::other("the log said no, once"),
+                rollback: std::io::Error::other("and could not take it back"),
+            });
         }
         inner.written += record.len() as u64;
         inner.log.push((seq, record.to_vec()));
@@ -501,6 +514,111 @@ async fn a_journaled_state_does_not_open_under_the_whole_strategy() {
     );
 }
 
+/// **An append that failed and could not be undone is not called a clean
+/// refusal.** The record may be stored, so a caller told *it was not committed*
+/// would retry and apply the work twice. It is told `Indeterminate` instead, by
+/// the observer's name, and the actor ends all the same.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Persist`'s
+/// `Err(error @ keylink_persist::Error::Indeterminate { .. }) => {` arm's body
+/// `Err(Stop::indeterminate(error))` with `Err(Stop::from(error))`. Watched: the
+/// caller is told `Refused`, the sentence "it ran and was not committed".
+#[tokio::test]
+async fn an_append_that_cannot_be_undone_is_reported_as_indeterminate_to_the_caller() {
+    let memory = Memory::default();
+    let shelf = start(&memory, small()).await;
+    shelf
+        .add(1)
+        .await
+        .expect("the first turn stores the snapshot");
+    shelf.add(2).await.expect("an append");
+
+    memory.fail_the_next_append_without_being_able_to_undo_it();
+    match shelf.add(3).await {
+        Err(Unanswered::Turn(Withheld::Indeterminate { name })) => assert_eq!(name, "persist"),
+        other => panic!("a caller must not be told a retry is safe: got {other:?}"),
+    }
+    match shelf.ended().await {
+        Ended::Observer { name, fatal, .. } => assert_eq!((name, fatal), ("persist", false)),
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// A journaled state has one store. A state another store already adopted is
+/// refused when the second one tries to start from it, and two stores attached
+/// to one actor are told apart at the first turn, loudly, instead of one of them
+/// quietly finding the changes already taken.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Opened::start_from`'s
+/// `self.saver.durable.adopt(&state)?;` with `let _ = self.saver.durable.adopt(&state);`.
+/// Watched: the second `start_from` succeeds.
+#[tokio::test]
+async fn a_journaled_state_cannot_have_two_stores() {
+    let first = Memory::default();
+    let second = Memory::default();
+
+    let (state, saver_first) = Persist::<Tape, _, Deltas>::open(&first, &id())
+        .await
+        .expect("opens")
+        .start_from(Tape::default)
+        .expect("adopts");
+
+    // The same state handed to a second store.
+    let opened = Persist::<Tape, _, Deltas>::open(&second, &id())
+        .await
+        .expect("opens");
+    let refused = opened.start_from(move || state);
+    assert!(
+        matches!(refused, Err(Error::ForeignChanges)),
+        "got {:?}",
+        refused.map(|_| ())
+    );
+    drop(saver_first);
+
+    // Two stores on one actor: the second one's first turn is refused.
+    let (state, saver_a) = Persist::<Tape, _, Deltas>::open(&first, &id())
+        .await
+        .expect("opens")
+        .start_from(Tape::default)
+        .expect("adopts");
+    let (_unused, saver_b) = Persist::<Tape, _, Deltas>::open(&second, &id())
+        .await
+        .expect("opens")
+        .start_from(Tape::default)
+        .expect("adopts its own state");
+    let shelf = shelf::setup(state)
+        .observe(saver_a)
+        .observe(saver_b)
+        .actor();
+    assert!(
+        shelf.add(1).await.is_err(),
+        "the second store does not own this state's changes"
+    );
+}
+
+/// A journaled state that is persisted whole never records, so its buffer cannot
+/// grow: nothing was going to drain it.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Changes::record`'s
+/// `if pending.owner != 0 {` with `if true {`. Watched: fifty changes pending.
+#[tokio::test]
+async fn a_journaled_state_under_whole_does_not_accumulate_changes() {
+    let memory = Memory::default();
+    let (state, saver) = Persist::<Tape, _, Whole>::open(&memory, &id())
+        .await
+        .expect("opens")
+        .start_from(Tape::default);
+    let shelf = shelf::setup(state).observe(saver).actor();
+    for item in 0..50 {
+        shelf.add(item).await.expect("running");
+    }
+    let buffer = shelf
+        .with_state(|tape: &Tape| format!("{:?}", tape.changes))
+        .await
+        .expect("running");
+    assert_eq!(buffer, "Changes { owned: false, pending: 0 }");
+}
+
 // ───────────────────────────────────────────────────────────── the crash points
 
 /// Five posts, then a crash in the middle of the last append: the torn record is
@@ -566,10 +684,10 @@ async fn a_damaged_record_before_the_end_refuses_the_restore() {
     }
     shelf.stop().await.expect("stops");
 
-    // One byte inside the second of the four records. Each frame is 16 bytes of
+    // One byte inside the second of the four records. Each frame is 20 bytes of
     // header and a 44-byte record, after the 8-byte file header.
     let mut bytes = std::fs::read(scratch.journal()).expect("reads");
-    bytes[8 + 60 + 16 + 20] ^= 0xFF;
+    bytes[8 + 64 + 20 + 12] ^= 0xFF;
     std::fs::write(scratch.journal(), &bytes).expect("writes");
 
     let error = Persist::<Tape, _, Deltas>::open(&files, &id())
@@ -726,8 +844,10 @@ async fn a_panicked_turn_appends_nothing() {
 /// so that neither gets the cold disk. The shelf is pre-filled to 1, 1,000 and
 /// 100,000 items, and one warm-up turn runs first (for `Deltas` it is the turn
 /// that stores the first snapshot, which is O(state) and not what is measured).
-/// Then 200 timed turns. Bytes per turn are read off the files: the snapshot's
-/// size for `Whole`, the journal's growth for `Deltas`.
+/// Then 200 timed turns. Bytes per turn are read off the files and are a mean over the
+/// timed turns for both: the mean snapshot size for `Whole` (every turn rewrites
+/// all of it, and the shelf grows by one item a turn), the journal's growth divided
+/// by the turns for `Deltas`.
 ///
 /// **What this does not cover**: Linux (the disk here is APFS, where `sync_data`
 /// is `F_FULLFSYNC`), a loaded disk, and tail latency. 200 turns at 44 bytes never
@@ -767,7 +887,7 @@ async fn measure_deltas(scratch: &Scratch, files: &Files, size: u64, turns: u64)
     let opened = Persist::<Tape, _, Deltas>::open(files, &id())
         .await
         .expect("opens");
-    let (state, saver) = opened.start_from(|| Tape::holding(size));
+    let (state, saver) = opened.start_from(|| Tape::holding(size)).expect("adopts");
     let shelf = shelf::setup(state).observe(saver).actor();
     shelf
         .add(size)
@@ -797,12 +917,20 @@ async fn measure_whole(scratch: &Scratch, files: &Files, size: u64, turns: u64) 
     let shelf = shelf::setup(state).observe(saver).actor();
     shelf.add(size).await.expect("warm-up");
 
+    let before = std::fs::metadata(scratch.snapshot()).expect("reads").len();
     let started = Instant::now();
     for item in 0..turns {
         shelf.add(size + 1 + item).await.expect("running");
     }
     let elapsed = started.elapsed();
-    let stored = std::fs::metadata(scratch.snapshot()).expect("reads").len();
+    let after = std::fs::metadata(scratch.snapshot()).expect("reads").len();
     shelf.stop().await.expect("stops");
-    (elapsed.as_secs_f64() * 1e6 / turns as f64, stored)
+
+    // Every timed turn rewrote the whole snapshot, and the shelf grows by one item
+    // a turn, so the snapshot's size grows linearly across the run. The bytes
+    // written PER TURN are therefore the mean of the sizes after turns 1 to `turns`,
+    // which is what this returns. (It used to return `after`, the last turn's size,
+    // beside a Deltas figure that was a mean: two different quantities in one column.)
+    let mean = before + (after - before) * (turns + 1) / (2 * turns);
+    (elapsed.as_secs_f64() * 1e6 / turns as f64, mean)
 }

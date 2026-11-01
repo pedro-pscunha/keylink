@@ -581,7 +581,7 @@ fn the_port_stayed_dumb(claim: &mut ProbeClaim) {
 ///
 /// # What this does not prove
 ///
-/// **Not `take`, which is `pub(crate)`** and so visible to this module: an
+/// **Not `take_for`, `adopt_for` or `owned_by`, which are `pub(crate)`** and so visible to this module: an
 /// inherent method outranks the trait's here, and a probe on that name would fail
 /// on a clean tree. That name is held by the `compile_fail` doctest on
 /// [`Changes`], which compiles as a foreign crate. And only these names.
@@ -658,10 +658,10 @@ trait AStagedTurnComesOnlyFromStage {
     }
 }
 
-impl<D: Durable> AStagedTurnComesOnlyFromStage for Staged<D> {}
+impl<C: Claim, D: Durable> AStagedTurnComesOnlyFromStage for Staged<'_, C, D> {}
 
 fn a_staged_turn_comes_only_from_stage() {
-    type Probe = Staged<ProbeDurable>;
+    type Probe = Staged<'static, ProbeClaim, ProbeDurable>;
     let _: NoSuchMethod = Probe::new();
     let _: NoSuchMethod = Probe::from_bytes();
     let _: NoSuchMethod = Probe::from_record();

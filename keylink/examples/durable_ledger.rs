@@ -28,7 +28,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use keylink::{Allowlist, Caller, Deltas, Node, Own, Persist, Servable};
+use keylink::{Allowlist, Caller, Deltas, Node, Opened, Own, Persist, Servable};
 use keylink_persist::file::Files;
 use keylink_persist::{Changes, Durable, Journaled, RestoreError, StateId};
 
@@ -135,10 +135,19 @@ impl Durable for Ledger {
     }
 }
 
+/// The store, and the ledger read out of it.
+async fn open_state(
+    root: &std::path::Path,
+    id: &StateId,
+) -> keylink_persist::Result<(Files, Opened<Ledger, Files, Deltas>)> {
+    let store = Files::open(root).await?.limit(1024 * 1024);
+    let opened = Persist::<Ledger, _, Deltas>::open(&store, id).await?;
+    Ok((store, opened))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let root = std::env::temp_dir().join("keylink-durable-ledger-deltas");
-    let store = Files::open(&root).await?.limit(1024 * 1024);
     let id = StateId::new("ledgers/sp-01")?;
 
     // ── 1. Claim the state and read whatever is stored, in one call.
@@ -151,7 +160,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  A snapshot from a *newer* build stops here with `FromTheFuture` rather
     //  than being read as far as this build understands: half a state is worse
     //  than none, and writing the truncation back would be worse still.
-    let opened = match Persist::<Ledger, _, Deltas>::open(&store, &id).await {
+    //
+    //  **This directory outlives the process on purpose, so it can outlive the
+    //  build that wrote it.** A file layout this build cannot read stops here as
+    //  `NotAJournal` or `NotAFrame`, and for a demo that is a reason to start
+    //  over and say so. A real program would not delete its state.
+    let (_store, opened) = match open_state(&root, &id).await {
         Ok(opened) => opened,
         Err(keylink_persist::Error::Busy { id }) => {
             // NOT a transient error to retry in a loop. Another process
@@ -159,6 +173,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // exists to make visible.
             println!("another process already owns {id}");
             return Ok(());
+        }
+        Err(
+            keylink_persist::Error::NotAJournal { .. }
+            | keylink_persist::Error::Restore(keylink_persist::RestoreError::NotAFrame { .. }),
+        ) => {
+            println!(
+                "{} holds state in a layout this build cannot read; starting a new one",
+                root.display()
+            );
+            std::fs::remove_dir_all(&root)?;
+            open_state(&root, &id).await?
         }
         Err(other) => return Err(other.into()),
     };
@@ -179,7 +204,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  while a full one sits on the disk. That used to be a tuple, and
     //  `let (_restored, saver) = ..` compiled clean.
     let first_run = !opened.was_stored();
-    let (state, saver) = opened.start_from(Ledger::default);
+    let (state, saver) = opened.start_from(Ledger::default)?;
     if first_run {
         println!("first run: no snapshot under {}", root.display());
     } else {
@@ -224,8 +249,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //
     //  The first turn of a brand new ledger stored a snapshot (an atomic file
     //  replace, two `fsync`s). Every later turn appended one record to the journal
-    //  and paid one `fsync` for it, whatever the size of the ledger: 36 bytes for
-    //  an 8-byte entry (the 16-byte frame, the 12-byte record header and the entry).
+    //  and paid one `fsync` for it, whatever the size of the ledger: 40 bytes for
+    //  an 8-byte entry (the 20-byte frame, the 12-byte record header and the entry).
     //  `keylink/src/persist.rs` has the measured comparison with
     //  a whole-state store, which pays the whole ledger's size every turn. That is
     //  still the price of "a reply means it is on the disk", and the knob that

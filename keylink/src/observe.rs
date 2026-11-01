@@ -347,7 +347,18 @@ pub enum TurnOutcome<'a> {
 /// spells as a `bool` anyway. That is a judgement about one type against three
 /// call sites, not a constraint — and calling it a constraint is what this
 /// paragraph is fixing.
-pub struct Stop(Box<dyn Error + Send + Sync>, bool);
+pub struct Stop(Box<dyn Error + Send + Sync>, Stance);
+
+/// What a refusal says about the turn and about another incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stance {
+    /// The turn was not committed, and another incarnation may fare better.
+    Retryable,
+    /// The turn was not committed, and another incarnation cannot help.
+    Fatal,
+    /// The observer cannot say whether the turn was committed.
+    Indeterminate,
+}
 
 impl Stop {
     /// The only route for an observer that fails with a message rather than
@@ -362,7 +373,7 @@ impl Stop {
     /// supervisor may retry. Say [`fatal`](Self::fatal) when it is not.
     #[must_use]
     pub fn new(because: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
-        Self(because.into(), false)
+        Self(because.into(), Stance::Retryable)
     }
 
     /// Refuse, and say that another incarnation cannot help.
@@ -388,13 +399,27 @@ impl Stop {
     /// of thing another incarnation might not repeat.
     #[must_use]
     pub fn fatal(because: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
-        Self(because.into(), true)
+        Self(because.into(), Stance::Fatal)
+    }
+
+    /// Refuse, and say that **the turn may have been committed anyway.**
+    ///
+    /// For an observer whose write failed and whose undo failed too: a record
+    /// that may be stored, so that a caller told *it was not committed* would retry
+    /// and apply the work twice. The caller is told
+    /// [`Withheld::Indeterminate`] instead, which says to find out before acting.
+    ///
+    /// Not fatal: a supervised actor restarts, and the new incarnation recovers
+    /// from whatever the store holds, which is how the question gets answered.
+    #[must_use]
+    pub fn indeterminate(because: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
+        Self(because.into(), Stance::Indeterminate)
     }
 
     /// Whether this refusal said another incarnation cannot help.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        self.1
+        self.1 == Stance::Fatal
     }
 
     /// The reason and the flag, for the loop that turns them into an [`Ended`].
@@ -402,14 +427,14 @@ impl Stop {
     /// Named for the pair rather than for the reason: it used to be
     /// `into_reason` returning one box, and a name that keeps promising one
     /// thing while handing back two is how a caller drops the second.
-    pub(crate) fn into_parts(self) -> (Box<dyn Error + Send + Sync>, bool) {
+    pub(crate) fn into_parts(self) -> (Box<dyn Error + Send + Sync>, Stance) {
         (self.0, self.1)
     }
 }
 
 impl<E: Error + Send + Sync + 'static> From<E> for Stop {
     fn from(error: E) -> Self {
-        Self(Box::new(error), false)
+        Self(Box::new(error), Stance::Retryable)
     }
 }
 
@@ -1054,6 +1079,19 @@ pub enum Withheld {
     /// existed.
     #[error("the {name} observer panicked during this turn: it ran and was not committed")]
     ObserverPanicked {
+        /// [`Observer::name`], owned for [`Refused::name`](Self::Refused::name)'s
+        /// reason.
+        name: String,
+    },
+    /// An observer refused this turn and **cannot say whether it was committed.**
+    ///
+    /// The only refusal for which retrying is not safe. [`Refused`](Self::Refused)
+    /// promises the turn was not stored, so a caller may run it again. Here a
+    /// write failed and the undo failed too, so the work may be on the disk and
+    /// would be applied a second time. Find out first: ask the actor for its
+    /// state once it is back, or use a key the work carries.
+    #[error("the {name} observer could not say whether this turn was committed: it ran, and it may have been")]
+    Indeterminate {
         /// [`Observer::name`], owned for [`Refused::name`](Self::Refused::name)'s
         /// reason.
         name: String,

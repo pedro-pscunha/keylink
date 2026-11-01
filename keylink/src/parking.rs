@@ -138,6 +138,13 @@ pub(crate) enum Verdict {
         /// [`Observer::name`](crate::Observer::name).
         name: &'static str,
     },
+    /// An observer could not say whether the turn was committed, and the parked
+    /// caller is told
+    /// [`Withheld::Indeterminate`](crate::Withheld::Indeterminate) naming it.
+    Indeterminate {
+        /// [`Observer::name`](crate::Observer::name).
+        name: &'static str,
+    },
     /// The handler panicked. The reply channel is dropped, so the parked caller
     /// is told [`Withheld::Dropped`](crate::Withheld::Dropped).
     ///

@@ -31,7 +31,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink_persist::file::{FileClaim, Files};
-use keylink_persist::versioned::{FrameFault, Snapshot, Versioned, FRAME_LEN};
+use keylink_persist::versioned::{Compaction, FrameFault, Snapshot, Versioned, FRAME_LEN};
 use keylink_persist::{
     Changes, Claim, Durable, Error, Journaled, RestoreError, Seq, Snapshots, StateId,
 };
@@ -906,7 +906,7 @@ async fn the_records_after_a_snapshot_are_applied_in_order() {
     assert_eq!(ledger.entries, vec![1, 2, 3, 4]);
     assert_eq!(
         format!("{:?}", ledger.changes),
-        "Changes { pending: 0 }",
+        "Changes { owned: false, pending: 0 }",
         "a replayed change is already stored, so nothing is waiting to be stored again"
     );
 }
@@ -1136,5 +1136,151 @@ async fn records_a_snapshot_already_contains_are_skipped_and_cut() {
             .collect::<Vec<_>>(),
         vec![3],
         "the cut that the crash interrupted was finished by the open"
+    );
+}
+
+// ───────────────────────────────────────────── whose changes are whose
+
+async fn open_journaled(files: &Files, name: &str) -> (Option<Journal>, Versioned<FileClaim>) {
+    let claim = files
+        .claim(&StateId::new(name).expect("valid"))
+        .await
+        .expect("claims");
+    Versioned::open::<Journal>(claim)
+        .await
+        .expect("opens")
+        .replayed()
+        .expect("replays")
+}
+
+fn pending(ledger: &Journal) -> String {
+    format!("{:?}", ledger.changes)
+}
+
+/// **A change buffer has one owner, and nobody else can touch it.** Until a
+/// session adopts it nothing is recorded, so a journaled state run under a
+/// whole-state store, or bare, cannot grow its buffer. After that a second session
+/// can neither drain it, nor discard it, nor adopt it, and the changes survive the
+/// attempt.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Changes::adopt_for`'s
+/// `pending.owner == session` with `true`. Watched: the second session adopts the
+/// buffer, and the first `assert!` on `ForeignChanges` fails.
+#[tokio::test]
+async fn a_change_buffer_has_one_owner() {
+    let scratch = Scratch::new("owner");
+    let files = open(&scratch).await;
+    let (_, mut mine) = open_journaled(&files, "ledgers/mine").await;
+    let (_, mut theirs) = open_journaled(&files, "ledgers/theirs").await;
+
+    let mut ledger = Journal::default();
+    ledger.changes.record(Posted(1));
+    assert_eq!(
+        pending(&ledger),
+        "Changes { owned: false, pending: 0 }",
+        "a buffer nobody owns records nothing, so it cannot grow"
+    );
+
+    mine.adopt(&ledger).expect("the first session owns it");
+    mine.adopt(&ledger).expect("and may say so again");
+    ledger.changes.record(Posted(2));
+    assert_eq!(pending(&ledger), "Changes { owned: true, pending: 1 }");
+
+    assert!(matches!(theirs.adopt(&ledger), Err(Error::ForeignChanges)));
+    assert!(matches!(
+        theirs.discard(&ledger),
+        Err(Error::ForeignChanges)
+    ));
+    assert!(matches!(
+        theirs.stage(&ledger, Compaction::DEFAULT),
+        Err(Error::ForeignChanges)
+    ));
+    assert_eq!(
+        pending(&ledger),
+        "Changes { owned: true, pending: 1 }",
+        "a refused session took nothing"
+    );
+
+    // The owner drains it, and stores the first snapshot.
+    mine.stage(&ledger, Compaction::DEFAULT)
+        .expect("owned")
+        .commit()
+        .await
+        .expect("stores");
+    assert_eq!(pending(&ledger), "Changes { owned: true, pending: 0 }");
+}
+
+/// The last sequence number: a snapshot that claims to contain it is refused
+/// before the journal beside it is touched, and the last position is appended once
+/// and not a second time.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Versioned::open`'s
+/// `.checked_add(1).ok_or(Error::SeqExhausted)?` with `.wrapping_add(1)` — the
+/// wrap the review named. Watched: the open of the exhausted state is not refused
+/// and cuts the torn tail it was meant to leave alone.
+#[tokio::test]
+async fn the_last_sequence_number_is_used_once_and_never_wrapped() {
+    // ── a snapshot that already contains the last number
+    let scratch = Scratch::new("exhausted");
+    let files = open(&scratch).await;
+    plant_journal(
+        &scratch,
+        &files,
+        &[1],
+        u64::MAX,
+        1,
+        &[record(2, &[&2u64.to_le_bytes()])],
+    )
+    .await;
+    let journal = scratch.0.join("ledgers").join("sp-01.journal");
+    let mut bytes = std::fs::read(&journal).expect("reads");
+    bytes.truncate(bytes.len() - 3);
+    std::fs::write(&journal, &bytes).expect("tears the tail");
+
+    let error = replayed(&files).await.expect_err("no number is left");
+    assert!(matches!(error, Error::SeqExhausted), "got {error:?}");
+    assert_eq!(
+        std::fs::read(&journal).expect("reads"),
+        bytes,
+        "refused before recovery, which would have cut the tail"
+    );
+
+    // ── one position left: appended once, then refused
+    let scratch = Scratch::new("last-position");
+    let files = open(&scratch).await;
+    plant_journal(&scratch, &files, &[1], u64::MAX - 1, 1, &[]).await;
+    let claim = files.claim(&id()).await.expect("claims");
+    let (ledger, mut versioned) = Versioned::open::<Journal>(claim)
+        .await
+        .expect("opens")
+        .replayed()
+        .expect("replays");
+    let mut ledger = ledger.expect("stored");
+    versioned.adopt(&ledger).expect("adopts");
+
+    ledger.changes.record(Posted(2));
+    versioned
+        .stage(
+            &ledger,
+            Compaction::new(std::num::NonZeroU32::MAX, u64::MAX),
+        )
+        .expect("stages")
+        .commit()
+        .await
+        .expect("the last position is appended");
+
+    ledger.changes.record(Posted(3));
+    let before = std::fs::read(scratch.0.join("ledgers").join("sp-01.journal")).expect("reads");
+    let staged = versioned.stage(&ledger, Compaction::DEFAULT);
+    assert!(matches!(staged, Err(Error::SeqExhausted)), "got {staged:?}");
+    assert_eq!(
+        std::fs::read(scratch.0.join("ledgers").join("sp-01.journal")).expect("reads"),
+        before,
+        "nothing was written for a position that does not exist"
+    );
+    assert_eq!(
+        pending(&ledger),
+        "Changes { owned: true, pending: 1 }",
+        "a refused stage drains nothing"
     );
 }

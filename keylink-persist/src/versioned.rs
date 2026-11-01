@@ -120,15 +120,20 @@
 //! [`Versioned::store`] writes a whole snapshot and drops the records it
 //! contains. For a journaled state, [`Versioned::stage`] drains what a turn
 //! recorded and decides between appending it and folding the log into a new
-//! snapshot by a [`Compaction`] policy; [`Versioned::commit`] does what it decided.
+//! snapshot by a [`Compaction`] policy; [`Staged::commit`] does what it decided.
 //! The two are split so that `&D` is borrowed only in the synchronous half and
-//! never held across an await.
+//! never held across an await, and [`Staged`] holds the wrapper exclusively until
+//! it is committed: a staged turn cannot be committed late, after a later turn
+//! has been, or through another wrapper. A journaled state's changes belong to
+//! the one wrapper that [`adopt`](Versioned::adopt)ed them.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
-use crate::{Claim, Durable, Journaled, RestoreError, Result, Seq};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+use crate::{Claim, Durable, Error, Journaled, RestoreError, Result, Seq};
 
 // ────────────────────────────────────────────────────────────────── the frame
 
@@ -142,7 +147,7 @@ const LAYOUT: u16 = 2;
 ///
 /// A caller sizing a store's limit needs this, because a limit applies to what
 /// reaches the adapter and what reaches the adapter is the payload plus this.
-/// See [`Error::TooLarge`](crate::Error::TooLarge).
+/// See [`Error::TooLarge`].
 pub const FRAME_LEN: usize = 20;
 
 /// The header length is not a multiple of eight, and that is a property the
@@ -326,22 +331,27 @@ fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<(D, Seq), RestoreErro
 /// One record per turn makes a turn all-or-nothing: a torn tail cuts a whole
 /// turn and never half of one. The version is in the record, so a log written
 /// across an upgrade holds mixed versions and each migrates on its own.
-fn encode_record<D: Journaled>(deltas: &[D::Delta]) -> Vec<u8> {
+fn encode_record<D: Journaled>(deltas: &[D::Delta]) -> Result<Vec<u8>> {
     let mut record = Vec::new();
     record.extend_from_slice(&<D::Delta as Durable>::VERSION.to_le_bytes());
-    // `try_from` and not `as`: a count that wrapped would be read back as a
-    // different record. A turn that recorded four billion changes is not a turn.
-    record.extend_from_slice(
-        &u32::try_from(deltas.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes(),
-    );
+    record.extend_from_slice(&wire_u32(deltas.len())?.to_le_bytes());
     for delta in deltas {
         let bytes = delta.snapshot();
-        record.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+        record.extend_from_slice(&wire_u32(bytes.len())?.to_le_bytes());
         record.extend_from_slice(&bytes);
     }
-    record
+    Ok(record)
+}
+
+/// A count or a length as the four bytes the record format gives it.
+///
+/// **Refused, never clamped.** Writing `u32::MAX` beside the full payload would
+/// produce a record that is acknowledged and that no parser can read back.
+fn wire_u32(n: usize) -> Result<u32> {
+    u32::try_from(n).map_err(|_| Error::TooLarge {
+        offered: n as u64,
+        limit: u64::from(u32::MAX),
+    })
 }
 
 /// Split a record into its delta version and each delta's bytes.
@@ -554,10 +564,14 @@ pub struct TornTail {
 #[derive(Debug)]
 pub struct Versioned<C: Claim> {
     claim: C,
+    /// Who this wrapper is, for the [`Changes`](crate::Changes) buffers it owns.
+    /// Never zero; every `open` takes a new one.
+    session: u64,
     /// The last log record the stored snapshot contains.
     through: Seq,
-    /// The position the next append takes. Always `through + 1` or later.
-    next: Seq,
+    /// The position the next append takes, or `None` once every number is used.
+    /// Always `through + 1` or later.
+    next: Option<Seq>,
     /// The bytes of the stored snapshot, frame included. `None` before the first
     /// ever store.
     snapshot_bytes: Option<u64>,
@@ -567,6 +581,10 @@ pub struct Versioned<C: Claim> {
     /// snapshot repeats it, and so does `open`.
     stale: bool,
 }
+
+/// The next session number. A process-wide counter and not a random value: two
+/// wrappers must never share one, and nothing here needs it to be unguessable.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 impl<C: Claim> Versioned<C> {
     /// Take a claim, read the snapshot and every record after it, and keep the
@@ -588,8 +606,8 @@ impl<C: Claim> Versioned<C> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`](crate::Error::Io) when the store cannot be read.
-    /// - [`Error::Restore`](crate::Error::Restore) wrapping
+    /// - [`Error::Io`] when the store cannot be read.
+    /// - [`Error::Restore`] wrapping
     ///   [`RestoreError::NotAFrame`] for bytes that are not a snapshot this
     ///   build can read — an unframed file from before framing existed is this
     ///   case, and it is refused rather than mis-parsed;
@@ -600,8 +618,10 @@ impl<C: Claim> Versioned<C> {
     /// - [`RestoreError::LogWithoutSnapshot`] when records exist and the snapshot
     ///   they follow does not, and [`RestoreError::Gap`] when the records skip a
     ///   position.
-    /// - [`Error::NotAJournal`](crate::Error::NotAJournal) when the stored log is
-    ///   not one this build reads, or is damaged before its end.
+    /// - [`Error::NotAJournal`] when the stored log is not one this build reads,
+    ///   or is damaged before its end.
+    /// - [`Error::SeqExhausted`] when the snapshot says it contains the last
+    ///   sequence number there is. Decided before the log is touched.
     pub async fn open<D: Durable>(mut claim: C) -> Result<Recovered<C, D>> {
         let (state, through, snapshot_bytes) = match claim.load().await? {
             Some(bytes) => {
@@ -611,7 +631,8 @@ impl<C: Claim> Versioned<C> {
             None => (None, Seq::new(0), None),
         };
 
-        let from = Seq::new(through.get() + 1);
+        // Before `recover`, which may cut a torn tail: a refusal modifies nothing.
+        let from = Seq::new(through.get().checked_add(1).ok_or(Error::SeqExhausted)?);
         let tail = claim.recover(from).await?;
         if tail.earlier > 0 {
             // A snapshot reached the disk and the cut that should have followed
@@ -626,27 +647,31 @@ impl<C: Claim> Versioned<C> {
             .into());
         }
 
-        let mut expected = from;
+        let mut expected = Some(from);
+        let mut last = through;
         let mut log_bytes = 0_u64;
         for (found, record) in &tail.records {
-            if *found != expected {
+            // Past the last number there is nothing a record could be.
+            let Some(want) = expected else {
+                return Err(RestoreError::BadRecord { seq: *found }.into());
+            };
+            if *found != want {
                 return Err(RestoreError::Gap {
-                    expected,
+                    expected: want,
                     found: *found,
                 }
                 .into());
             }
-            expected = Seq::new(expected.get() + 1);
+            last = want;
+            expected = want.get().checked_add(1).map(Seq::new);
             log_bytes += record.len() as u64;
         }
 
-        let torn = tail.torn.map(|bytes| TornTail {
-            bytes,
-            after: Seq::new(expected.get() - 1),
-        });
+        let torn = tail.torn.map(|bytes| TornTail { bytes, after: last });
         Ok(Recovered {
             versioned: Self {
                 claim,
+                session: NEXT_SESSION.fetch_add(1, AtomicOrdering::Relaxed),
                 through,
                 next: expected,
                 snapshot_bytes,
@@ -657,6 +682,15 @@ impl<C: Claim> Versioned<C> {
             records: tail.records,
             torn,
         })
+    }
+
+    /// The last position this wrapper has appended or been opened at.
+    fn appended_through(&self) -> Seq {
+        match self.next {
+            // `next` is `through + 1` or later, so it is never zero.
+            Some(next) => Seq::new(next.get() - 1),
+            None => Seq::new(u64::MAX),
+        }
     }
 
     /// Frame `snapshot` as version [`D::VERSION`](Durable::VERSION), replace what
@@ -677,31 +711,54 @@ impl<C: Claim> Versioned<C> {
     ///
     /// # Errors
     ///
-    /// - [`Error::TooLarge`](crate::Error::TooLarge) when the frame **plus**
+    /// - [`Error::TooLarge`] when the frame **plus**
     ///   the payload is over the adapter's limit. The number it reports is what
     ///   reached the adapter, which is [`FRAME_LEN`] more than the payload.
-    /// - [`Error::Io`](crate::Error::Io) when the write fails. The previous
+    /// - [`Error::Io`] when the write fails. The previous
     ///   snapshot is intact.
     pub async fn store<D: Durable>(&mut self, snapshot: &Snapshot<D>) -> Result<()> {
         // Everything appended so far is in this snapshot: it was taken in the
         // turn that appended the last of it.
-        let through = Seq::new(self.next.get() - 1);
+        let through = self.appended_through();
         let framed = frame(D::VERSION, through, &snapshot.bytes);
         self.claim.store(&framed).await?;
 
-        let records_may_exist = self.next.get() > self.through.get() + 1 || self.stale;
+        let records_may_exist = through > self.through || self.stale;
         self.through = through;
         self.snapshot_bytes = Some(framed.len() as u64);
         self.log_bytes = 0;
         if records_may_exist {
+            // The first position that is not in the snapshot. When there is none
+            // left, the cut keeps the last record: harmless, because a state
+            // whose snapshot contains the last number is refused at `open`.
+            let cut = self.next.unwrap_or(Seq::new(u64::MAX));
             // Not `?`: see above.
-            self.stale = self.claim.truncate_before(self.next).await.is_err();
+            self.stale = self.claim.truncate_before(cut).await.is_err();
         }
         Ok(())
     }
 
-    /// Drain this turn's changes and decide what to write. Synchronous, so the
-    /// `&D` is never held across an await.
+    /// Make this wrapper the one persistence session that owns `state`'s change
+    /// buffer.
+    ///
+    /// Called once, before the state's first turn (`keylink`'s
+    /// `Opened::start_from` does it). Until then the buffer records nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ForeignChanges`] when a different session already owns it: a state
+    /// cannot have two stores.
+    pub fn adopt<D: Journaled>(&self, state: &D) -> Result<()> {
+        if state.changes().adopt_for(self.session) {
+            Ok(())
+        } else {
+            Err(Error::ForeignChanges)
+        }
+    }
+
+    /// Drain this turn's changes and decide what to write. Synchronous in what it
+    /// reads, so the `&D` is never held across an await: the result borrows this
+    /// wrapper and nothing else.
     ///
     /// - The first turn ever stores a snapshot, so a record never exists without
     ///   the snapshot it follows.
@@ -711,42 +768,80 @@ impl<C: Claim> Versioned<C> {
     ///   `when`'s threshold, in which case it stores a snapshot instead and the
     ///   changes are dropped because the snapshot contains them.
     ///
-    /// The result must be handed to [`commit`](Self::commit).
-    pub fn stage<D: Journaled>(&self, state: &D, when: Compaction) -> Staged<D> {
-        let deltas = state.changes().take();
-        let Some(snapshot_bytes) = self.snapshot_bytes else {
-            return Staged(Step::Compact(Snapshot::of(state)));
-        };
-        if deltas.is_empty() {
-            return Staged(Step::Nothing);
-        }
-        let record = encode_record::<D>(&deltas);
-        if when.due(snapshot_bytes, self.log_bytes, record.len() as u64) {
-            Staged(Step::Compact(Snapshot::of(state)))
-        } else {
-            Staged(Step::Append(record))
-        }
-    }
-
-    /// Write what [`stage`](Self::stage) decided.
+    /// **The result holds this wrapper exclusively until it is committed or
+    /// dropped.** A turn staged against one wrapper cannot be committed through
+    /// another, and a second turn cannot be staged, let alone committed, in
+    /// between: both are borrow errors. A snapshot staged before an append can
+    /// therefore never be stored after it and cut that append away. Dropping it
+    /// without committing loses the drained changes, and it is `#[must_use]`.
+    ///
+    /// ```compile_fail
+    /// # use keylink_persist::versioned::{Compaction, Versioned};
+    /// # use keylink_persist::{Claim, Journaled};
+    /// # async fn f<C: Claim, D: Journaled>(v: &mut Versioned<C>, state: &D) {
+    /// let first = v.stage(state, Compaction::DEFAULT).unwrap();
+    /// let second = v.stage(state, Compaction::DEFAULT).unwrap();
+    /// second.commit().await.unwrap();
+    /// first.commit().await.unwrap();
+    /// # }
+    /// ```
+    ///
+    /// The same code with the second turn staged after the first is committed is
+    /// what this accepts:
+    ///
+    /// ```
+    /// # use keylink_persist::versioned::{Compaction, Versioned};
+    /// # use keylink_persist::{Claim, Journaled};
+    /// # async fn f<C: Claim, D: Journaled>(v: &mut Versioned<C>, state: &D) {
+    /// v.stage(state, Compaction::DEFAULT).unwrap().commit().await.unwrap();
+    /// v.stage(state, Compaction::DEFAULT).unwrap().commit().await.unwrap();
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// As [`store`](Self::store) for a snapshot, and for an append
-    /// [`Error::TooLarge`](crate::Error::TooLarge) or
-    /// [`Error::Io`](crate::Error::Io). A failed append leaves the log as it was,
-    /// so the turn is refused cleanly.
-    pub async fn commit<D: Durable>(&mut self, staged: Staged<D>) -> Result<()> {
-        match staged.0 {
-            Step::Nothing => Ok(()),
-            Step::Append(record) => {
-                self.claim.append(self.next, &record).await?;
-                self.next = Seq::new(self.next.get() + 1);
-                self.log_bytes += record.len() as u64;
-                Ok(())
-            }
-            Step::Compact(snapshot) => self.store(&snapshot).await,
+    /// - [`Error::ForeignChanges`] when `state`'s changes are not this wrapper's
+    ///   (never adopted, or adopted by another). Nothing is drained.
+    /// - [`Error::TooLarge`] when a turn recorded more changes, or one change was
+    ///   longer, than the record format can count: refused rather than written
+    ///   with a different number.
+    /// - [`Error::SeqExhausted`] when an append would need a position that does
+    ///   not exist.
+    pub fn stage<D: Journaled>(&mut self, state: &D, when: Compaction) -> Result<Staged<'_, C, D>> {
+        // Ownership and exhaustion are checked before anything is drained, so a
+        // stage refused for either loses no change.
+        let changes = state.changes();
+        if !changes.owned_by(self.session) {
+            return Err(Error::ForeignChanges);
         }
+        let drained = || changes.take_for(self.session).unwrap_or_default();
+        let Some(snapshot_bytes) = self.snapshot_bytes else {
+            drop(drained());
+            return Ok(Staged {
+                versioned: self,
+                step: Step::Compact(Snapshot::of(state)),
+            });
+        };
+        if self.next.is_none() {
+            return Err(Error::SeqExhausted);
+        }
+        let deltas = drained();
+        if deltas.is_empty() {
+            return Ok(Staged {
+                versioned: self,
+                step: Step::Nothing,
+            });
+        }
+        let record = encode_record::<D>(&deltas)?;
+        let step = if when.due(snapshot_bytes, self.log_bytes, record.len() as u64) {
+            Step::Compact(Snapshot::of(state))
+        } else {
+            Step::Append(record)
+        };
+        Ok(Staged {
+            versioned: self,
+            step,
+        })
     }
 
     /// Drain this turn's changes and write nothing: the turn is not being
@@ -754,14 +849,27 @@ impl<C: Claim> Versioned<C> {
     ///
     /// For a turn that panicked. Its changes are half of a turn, and they must
     /// not be carried into the next one.
-    pub fn discard<D: Journaled>(&self, state: &D) {
-        drop(state.changes().take());
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ForeignChanges`] when `state`'s changes are not this wrapper's.
+    /// They are left alone: a wrapper cannot discard another store's changes.
+    pub fn discard<D: Journaled>(&mut self, state: &D) -> Result<()> {
+        state
+            .changes()
+            .take_for(self.session)
+            .map(drop)
+            .ok_or(Error::ForeignChanges)
     }
 }
 
-/// What one turn will write. Built only by [`Versioned::stage`].
+/// What one turn will write, holding the wrapper that produced it. Built only by
+/// [`Versioned::stage`].
 #[must_use = "a staged turn that is never committed is a turn that is not stored"]
-pub struct Staged<D: Durable>(Step<D>);
+pub struct Staged<'v, C: Claim, D: Durable> {
+    versioned: &'v mut Versioned<C>,
+    step: Step<D>,
+}
 
 enum Step<D: Durable> {
     Nothing,
@@ -769,10 +877,38 @@ enum Step<D: Durable> {
     Compact(Snapshot<D>),
 }
 
-impl<D: Durable> std::fmt::Debug for Staged<D> {
+impl<C: Claim, D: Durable> Staged<'_, C, D> {
+    /// Write what [`stage`](Versioned::stage) decided.
+    ///
+    /// # Errors
+    ///
+    /// As [`Versioned::store`] for a snapshot, and for an append
+    /// [`Error::TooLarge`], [`Error::Io`], and [`Error::Indeterminate`]. A failed
+    /// append leaves the log as it was, so the turn is refused cleanly, **except
+    /// for `Indeterminate`**: the record may be stored, and the caller must not be
+    /// told that a retry is safe.
+    pub async fn commit(self) -> Result<()> {
+        let Self { versioned, step } = self;
+        match step {
+            Step::Nothing => Ok(()),
+            Step::Append(record) => {
+                // Checked before any I/O. Counters move only after the append
+                // resolved, so a refused append leaves them as they were.
+                let seq = versioned.next.ok_or(Error::SeqExhausted)?;
+                versioned.claim.append(seq, &record).await?;
+                versioned.next = seq.get().checked_add(1).map(Seq::new);
+                versioned.log_bytes += record.len() as u64;
+                Ok(())
+            }
+            Step::Compact(snapshot) => versioned.store(&snapshot).await,
+        }
+    }
+}
+
+impl<C: Claim, D: Durable> std::fmt::Debug for Staged<'_, C, D> {
     /// What it will do, and nothing else: the bytes are the state's own.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.0 {
+        f.write_str(match self.step {
             Step::Nothing => "Staged(Nothing)",
             Step::Append(_) => "Staged(Append)",
             Step::Compact(_) => "Staged(Compact)",
@@ -824,11 +960,11 @@ impl<C: Claim, D: Durable> Recovered<C, D> {
 }
 
 impl<C: Claim, D: Journaled> Recovered<C, D> {
-    /// The snapshot with every later record applied in order, and its change
-    /// buffer cleared.
+    /// The snapshot with every later record applied in order.
     ///
-    /// The buffer is cleared because [`Journaled::apply`] may have recorded, and
-    /// a replayed change is already stored.
+    /// The state's change buffer is not yet adopted by anyone while this runs, so
+    /// nothing [`Journaled::apply`] records is kept: a replayed change is already
+    /// stored.
     ///
     /// # Errors
     ///
@@ -858,7 +994,6 @@ impl<C: Claim, D: Journaled> Recovered<C, D> {
                 state.apply(delta);
             }
         }
-        drop(state.changes().take());
         Ok((Some(state), versioned))
     }
 }
@@ -1107,7 +1242,8 @@ mod tests {
     /// deltas.
     #[test]
     fn a_record_round_trips() {
-        let record = encode_record::<Holder>(&[Bytes(b"one".to_vec()), Bytes(Vec::new())]);
+        let record = encode_record::<Holder>(&[Bytes(b"one".to_vec()), Bytes(Vec::new())])
+            .expect("a small record encodes");
         assert_eq!(&record[..4], &5u32.to_le_bytes(), "the delta's version");
         assert_eq!(&record[4..8], &2u32.to_le_bytes(), "the count");
         assert_eq!(
@@ -1118,7 +1254,7 @@ mod tests {
 
     #[test]
     fn a_record_that_does_not_add_up_does_not_parse() {
-        let good = encode_record::<Holder>(&[Bytes(b"one".to_vec())]);
+        let good = encode_record::<Holder>(&[Bytes(b"one".to_vec())]).expect("encodes");
         // Cut anywhere short, or padded: neither is a record.
         for cut in 0..good.len() {
             assert_eq!(parse_record(&good[..cut]), None, "cut at {cut}");
@@ -1128,7 +1264,10 @@ mod tests {
         assert_eq!(parse_record(&padded), None);
         // And a record of no deltas is not one: a turn that changed nothing
         // writes nothing.
-        assert_eq!(parse_record(&encode_record::<Holder>(&[])), None);
+        assert_eq!(
+            parse_record(&encode_record::<Holder>(&[]).expect("encodes")),
+            None
+        );
     }
 
     /// The policy: fold once the log reaches `ratio` times the snapshot, and never
@@ -1158,5 +1297,25 @@ mod tests {
 
         // A log that overflows the arithmetic is due, not a panic.
         assert!(Compaction::new(two, 0).due(u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    /// A count or a length that does not fit four bytes is refused and not
+    /// clamped to `u32::MAX` beside the full payload.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `wire_u32`'s
+    /// `u32::try_from(n).map_err(|_| Error::TooLarge {` with
+    /// `Ok(u32::try_from(n).unwrap_or(u32::MAX)).map_err(|_: ()| Error::TooLarge {`
+    /// — the clamp the review named. Watched: the over-long length gives `Ok`.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_length_that_does_not_fit_four_bytes_is_refused() {
+        assert_eq!(wire_u32(7).expect("fits"), 7);
+        assert_eq!(wire_u32(u32::MAX as usize).expect("fits"), u32::MAX);
+        let error = wire_u32(u32::MAX as usize + 1).expect_err("does not fit");
+        assert!(
+            matches!(error, Error::TooLarge { offered, limit }
+                if offered == u64::from(u32::MAX) + 1 && limit == u64::from(u32::MAX)),
+            "got {error:?}"
+        );
     }
 }

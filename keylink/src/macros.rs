@@ -9528,7 +9528,10 @@ macro_rules! __keylink_local_method {
         /// [`Observer`](keylink::Observer) refused the turn that ran — the actor
         /// is alive, and a supervised one may be restarting —
         /// [`ObserverPanicked`](keylink::Withheld::ObserverPanicked) when one
-        /// fell over instead of deciding, and
+        /// fell over instead of deciding,
+        /// [`Indeterminate`](keylink::Withheld::Indeterminate) when one could not
+        /// say whether the turn was committed — the only one after which a retry
+        /// is not safe — and
         /// [`Expired`](keylink::Withheld::Expired) when a queueing budget ran
         /// out before the turn started, which a local origin cannot do today.
         /// Plus [`Reentrant`](keylink::Unanswered::Reentrant) when the call was

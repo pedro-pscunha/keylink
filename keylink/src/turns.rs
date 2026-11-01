@@ -207,6 +207,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 // By module path and not from the crate root: Wave 2's review found `guarded` and
 // `catching` re-exported `pub` with no consumer outside this crate, so they are
 // `pub(crate)` now and the root no longer names them.
+use crate::observe::Stance;
 use crate::panic::{catching, guarded};
 use crate::parking::{Parking, Verdict};
 use crate::{
@@ -777,6 +778,7 @@ impl<T> Deferred<T> {
             Verdict::Committed => reply.answer(Answered::Ran(value)),
             Verdict::Refused { name } => reply.answer(Answered::Refused { name }),
             Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),
+            Verdict::Indeterminate { name } => reply.answer(Answered::Indeterminate { name }),
             // Dropped, not answered. `Answered::Faulted` needs the `Panic`
             // itself, there is one, and it is the turn's own caller's — see
             // `Verdict::Faulted`.
@@ -839,6 +841,12 @@ pub(crate) enum Answered<T> {
         /// [`Observer::name`].
         name: &'static str,
     },
+    /// An observer refused a completed turn and could not say whether it was
+    /// committed. See [`Withheld::Indeterminate`].
+    Indeterminate {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
 }
 
 impl<T> Answered<T> {
@@ -855,6 +863,7 @@ impl<T> Answered<T> {
             Self::Expired => Answered::Expired,
             Self::Refused { name } => Answered::Refused { name },
             Self::ObserverPanicked { name } => Answered::ObserverPanicked { name },
+            Self::Indeterminate { name } => Answered::Indeterminate { name },
         }
     }
 }
@@ -895,6 +904,14 @@ enum ObserverVerdict {
     /// No flag, because there is no claim to carry — [`Ended::Observer`]'s own
     /// `fatal` field says so where a caller meets it.
     Panicked {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
+    /// [`Observer::after_turn`] returned [`Stop::indeterminate`](crate::Stop::indeterminate):
+    /// the turn may have been committed. Never fatal, for the reason
+    /// [`Panicked`](Self::Panicked) is not: a new incarnation recovers from the
+    /// store and that is how the question gets answered.
+    Indeterminate {
         /// [`Observer::name`].
         name: &'static str,
     },
@@ -1022,8 +1039,13 @@ where
         match ran {
             Ok(Ok(())) => {}
             Ok(Err(stop)) => {
-                let (reason, fatal) = stop.into_parts();
-                withheld = Some((ObserverVerdict::Refused { name, fatal }, Arc::from(reason)));
+                let (reason, stance) = stop.into_parts();
+                let verdict = match stance {
+                    Stance::Retryable => ObserverVerdict::Refused { name, fatal: false },
+                    Stance::Fatal => ObserverVerdict::Refused { name, fatal: true },
+                    Stance::Indeterminate => ObserverVerdict::Indeterminate { name },
+                };
+                withheld = Some((verdict, Arc::from(reason)));
                 break;
             }
             // `Panic` implements `Display` and not `Error`, and is not `Sync`,
@@ -1057,6 +1079,9 @@ where
         (Some(_), _) => Verdict::Faulted,
         (None, Some((ObserverVerdict::Refused { name, .. }, _))) => Verdict::Refused { name },
         (None, Some((ObserverVerdict::Panicked { name }, _))) => Verdict::ObserverPanicked { name },
+        (None, Some((ObserverVerdict::Indeterminate { name }, _))) => {
+            Verdict::Indeterminate { name }
+        }
         (None, None) => Verdict::Committed,
     };
     for release in parked {
@@ -1088,11 +1113,13 @@ where
                 // for it would be a claim nobody made. It is written here, on the
                 // one line that needs a flag, rather than into the slot the caller
                 // also reads.
-                ObserverVerdict::Panicked { name } => Ended::Observer {
-                    name,
-                    error,
-                    fatal: false,
-                },
+                ObserverVerdict::Panicked { name } | ObserverVerdict::Indeterminate { name } => {
+                    Ended::Observer {
+                        name,
+                        error,
+                        fatal: false,
+                    }
+                }
             };
             (answer, Some(who), Some(end))
         }
@@ -1183,6 +1210,7 @@ where
         (Ok(value), None) => Answered::Ran(value),
         (Ok(_), Some(ObserverVerdict::Refused { name, .. })) => Answered::Refused { name },
         (Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },
+        (Ok(_), Some(ObserverVerdict::Indeterminate { name })) => Answered::Indeterminate { name },
         (Err(panic), _) => Answered::Faulted(panic),
     });
     end
@@ -1252,6 +1280,7 @@ where
             None => Answered::Ran(value),
             Some(ObserverVerdict::Refused { name, .. }) => Answered::Refused { name },
             Some(ObserverVerdict::Panicked { name }) => Answered::ObserverPanicked { name },
+            Some(ObserverVerdict::Indeterminate { name }) => Answered::Indeterminate { name },
         }),
         Ok(Replied(Settled::Later)) => {}
         // The `Panic` is dropped rather than reported, because the channel it
@@ -3032,7 +3061,8 @@ where
             // spent the budget. Both happen here instead, and the ZERO is the
             // honest duration of a build that produced no actor.
             Err(stop) => {
-                let (error, fatal) = stop.into_parts();
+                let (error, stance) = stop.into_parts();
+                let fatal = stance == Stance::Fatal;
                 if !fatal && budget.spend(Duration::ZERO) {
                     n0_future::time::sleep(limit.backoff()).await;
                     continue;
@@ -4134,6 +4164,9 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
                     name: name.to_owned(),
                 }))
             }
+            Answered::Indeterminate { name } => Err(TurnLost::Turn(Withheld::Indeterminate {
+                name: name.to_owned(),
+            })),
             // Unreachable from here today — a local `Origin` carries no
             // `Queueing`, so there is no budget to expire — and answered with the
             // variant that means what happened anyway.
@@ -5028,6 +5061,9 @@ pub(crate) async fn asked<T>(
                 name: name.to_owned(),
             }))
         }
+        Ok(Answered::Indeterminate { name }) => Err(Unanswered::Turn(Withheld::Indeterminate {
+            name: name.to_owned(),
+        })),
         Ok(Answered::Expired) => Err(Unanswered::Turn(Withheld::Expired)),
         Err(_) => Err(Unanswered::Turn(withheld_for(fate.standing()))),
     }
@@ -5128,6 +5164,13 @@ pub(crate) fn rendered<Resp>(
         // sentence for both until the two were split.
         Answered::ObserverPanicked { name } => (
             Outcome::Err(RemoteError::Withheld(Withheld::ObserverPanicked {
+                name: name.to_owned(),
+            })),
+            Body::empty(),
+        ),
+        // Its own sentence: the one refusal after which a retry is not safe.
+        Answered::Indeterminate { name } => (
+            Outcome::Err(RemoteError::Withheld(Withheld::Indeterminate {
                 name: name.to_owned(),
             })),
             Body::empty(),
@@ -5607,6 +5650,7 @@ mod tests {
                 Answered::Expired => "Expired",
                 Answered::Refused { .. } => "Refused",
                 Answered::ObserverPanicked { .. } => "ObserverPanicked",
+                Answered::Indeterminate { .. } => "Indeterminate",
             }
         }
 
@@ -5616,6 +5660,7 @@ mod tests {
             Answered::Expired,
             Answered::Refused { name: "observer" },
             Answered::ObserverPanicked { name: "observer" },
+            Answered::Indeterminate { name: "observer" },
         ] {
             let arm = label(&answered);
             if let (Outcome::Err(error), _body) = rendered(answered, 0) {
@@ -5643,7 +5688,7 @@ mod tests {
 
     /// Every [`Withheld`] there is, sampled once.
     ///
-    /// A function and not a `const`, because three of the seven carry a
+    /// A function and not a `const`, because four of the eight carry a
     /// [`String`].
     ///
     /// # What keeps it complete is [`schema_variants`], and it was not [`produced`]
@@ -5660,7 +5705,7 @@ mod tests {
     /// [`schema_variants`] reads it, [`variant_name`] names each sample against
     /// it, and the guard compares the two sets — so a loss that reached the type
     /// and not this array is a failing assertion that says which one.
-    fn every_withheld() -> [Withheld; 7] {
+    fn every_withheld() -> [Withheld; 8] {
         [
             Withheld::Panicked {
                 message: "boom".to_owned(),
@@ -5669,6 +5714,9 @@ mod tests {
                 name: "observer".to_owned(),
             },
             Withheld::ObserverPanicked {
+                name: "observer".to_owned(),
+            },
+            Withheld::Indeterminate {
                 name: "observer".to_owned(),
             },
             Withheld::Dropped,
@@ -5695,6 +5743,7 @@ mod tests {
             Withheld::Panicked { .. } => "Panicked",
             Withheld::Refused { .. } => "Refused",
             Withheld::ObserverPanicked { .. } => "ObserverPanicked",
+            Withheld::Indeterminate { .. } => "Indeterminate",
             Withheld::Dropped => "Dropped",
             Withheld::Restarting { .. } => "Restarting",
             Withheld::Gone => "Gone",
@@ -5757,6 +5806,9 @@ mod tests {
             Withheld::Refused { .. } => from_rendered(Answered::Refused { name: "observer" }),
             Withheld::ObserverPanicked { .. } => {
                 from_rendered(Answered::ObserverPanicked { name: "observer" })
+            }
+            Withheld::Indeterminate { .. } => {
+                from_rendered(Answered::Indeterminate { name: "observer" })
             }
             Withheld::Dropped => from_lost(Standing::Running),
             Withheld::Restarting { .. } => {

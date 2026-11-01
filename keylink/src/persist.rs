@@ -96,32 +96,38 @@
 //!
 //! **Bytes per turn are computed from the format, and
 //! `tests/journal.rs::deltas_keep_the_bytes_per_turn_constant_while_the_state_grows`
-//! measures them**: a `Deltas` turn writes 16 (the frame) plus 12 (the record's
+//! measures them**: a `Deltas` turn writes 20 (the frame) plus 12 (the record's
 //! version, count and the delta's length) plus the delta; a `Whole` turn writes 20
 //! plus the whole state.
 //!
 //! **Time per turn, `Whole` against `Deltas`, measured back to back.** Same
 //! machine as the figures below (Apple M5 Max, `Mac17,6`, APFS on the internal
-//! SSD, macOS build 26B118), 2026-10-31, over `Files`. 200 timed turns after a
+//! SSD, macOS build 26B118), 2026-11-01, over `Files`. 200 timed turns after a
 //! warm-up turn, three runs per cell, **alternating which strategy goes first**.
 //! The shelf is pre-filled to the stated number of 32-byte items and grows by 200
-//! during the run, which is why `Whole`'s bytes per turn are a little over
-//! `20 + 32 * items`.
+//! during the run.
 //!
-//! | items | `Whole`, µs per turn (3 runs) | `Deltas`, µs per turn (3 runs) | median ratio | bytes per turn |
+//! | items | `Whole`, µs per turn (3 runs) | `Deltas`, µs per turn (3 runs) | median ratio | bytes per turn, mean over the timed turns |
 //! |---|---|---|---|---|
-//! | 1 | 9,698 / 10,613 / 13,090 | 4,324 / 5,102 / 6,656 | 0.48 | 6,484 against 60 |
-//! | 1,000 | 10,180 / 13,422 / 13,895 | 4,466 / 6,459 / 7,858 | 0.48 | 38,452 against 60 |
-//! | 100,000 | 22,310 / 23,123 / 30,308 | 6,409 / 7,051 / 7,112 | 0.30 | 3,206,452 against 60 |
+//! | 1 | 9,421 / 10,098 / 10,827 | 3,485 / 4,590 / 4,695 | 0.45 | 3,300 against 64 |
+//! | 1,000 | 11,080 / 11,103 / 11,731 | 4,359 / 5,886 / 6,660 | 0.53 | 35,268 against 64 |
+//! | 100,000 | 15,699 / 16,402 / 18,248 | 5,234 / 5,932 / 5,978 | 0.36 | 3,203,268 against 64 |
 //!
-//! **What these figures do not cover.** The machine was heavily loaded by other
-//! sessions' builds while they ran (load average about 130), so the `Whole`
-//! figures are slower than the 7.6 ms below, and the spread inside a cell is the
-//! noise. Read the ratio, not the microseconds. They are macOS, where `sync_data`
-//! is `F_FULLFSYNC`; **nothing was run on Linux**. A fold turn is not in them by
-//! construction: 200 turns of 44 bytes never reach the threshold at these sizes.
-//! And a mean says nothing about the tail. `tests/journal.rs::
-//! the_per_turn_cost_whole_against_deltas` reproduces the table.
+//! **Bytes per turn are the same quantity in both columns**: the mean number of
+//! bytes a timed turn wrote. For `Whole` that is the mean snapshot size, because
+//! every turn rewrites all of it and it grows by one item a turn (the column used
+//! to hold the *last* turn's size, which is not a mean). For `Deltas` it is the
+//! journal's growth divided by the turns: a 64-byte frame (a 20-byte header, a
+//! 12-byte record header and the 32-byte delta).
+//!
+//! **What these figures do not cover.** The machine was loaded by other sessions'
+//! builds while they ran (load average 45 to 66 at the end), so the `Whole`
+//! figures are slower than the 7.6 ms below in some cells and faster in others, and
+//! the spread inside a cell is the noise. Read the ratio, not the microseconds.
+//! They are macOS, where `sync_data` is `F_FULLFSYNC`; **nothing was run on
+//! Linux**. A fold turn is not in them by construction: 200 turns of 44 bytes never
+//! reach the threshold at these sizes. And a mean says nothing about the tail.
+//! `tests/journal.rs::the_per_turn_cost_whole_against_deltas` reproduces the table.
 //!
 //! The saving is not 2x at a small state, because the `Whole` turn is already
 //! less than two full flushes. It grows with the state, because `Whole` pays for
@@ -301,7 +307,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// if let Some(torn) = opened.torn_tail() {
 ///     eprintln!("recovery cut {} bytes after record {}", torn.bytes, torn.after);
 /// }
-/// let (state, saver) = opened.start_from(Ledger::default);
+/// let (state, saver) = opened.start_from(Ledger::default)?;
 /// let ledger = ledger::setup(state).observe(saver).actor();
 /// ledger.post(1).await?;
 /// # Ok(())
@@ -570,7 +576,9 @@ impl<D, S: Snapshots, M> Opened<D, S, M> {
     pub fn torn_tail(&self) -> Option<TornTail> {
         self.torn
     }
+}
 
+impl<D, S: Snapshots> Opened<D, S, Whole> {
     /// The state to start the actor from, and the observer that will keep it
     /// current.
     ///
@@ -583,8 +591,36 @@ impl<D, S: Snapshots, M> Opened<D, S, M> {
     /// let (state, saver) = Persist::<Ledger, _, Whole>::open(&store, &id).await?.start_from(Ledger::default);
     /// let ledger = ledger::setup(state).observe(saver).actor();
     /// ```
-    pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S, M>) {
+    pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S, Whole>) {
         (self.restored.unwrap_or_else(first), self.saver)
+    }
+}
+
+impl<D: Journaled, S: Snapshots> Opened<D, S, Deltas> {
+    /// The state to start the actor from, and the observer that will keep it
+    /// current. As for `Whole`, and one thing more: **the state's change buffer is
+    /// bound to this store here**, before its first turn.
+    ///
+    /// Until it is, the buffer records nothing; from now on only this store can
+    /// drain it. That is what stops a second store, attached to the same actor, from
+    /// emptying changes this one is about to write.
+    ///
+    /// ```ignore
+    /// let (state, saver) = Persist::<Ledger, _, Deltas>::open(&store, &id).await?.start_from(Ledger::default)?;
+    /// let ledger = ledger::setup(state).observe(saver).actor();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ForeignChanges`](keylink_persist::Error::ForeignChanges) when the
+    /// state `first` built already belongs to another store: a state has one.
+    pub fn start_from(
+        self,
+        first: impl FnOnce() -> D,
+    ) -> keylink_persist::Result<(D, Persist<D, S, Deltas>)> {
+        let state = self.restored.unwrap_or_else(first);
+        self.saver.durable.adopt(&state)?;
+        Ok((state, self.saver))
     }
 }
 
@@ -700,9 +736,16 @@ where
     /// reproduces the state from before the turn and not the half of it.
     fn after_turn<'a>(&'a mut self, state: &'a D, turn: TurnInfo<'a>) -> TurnFut<'a> {
         let staged = match turn.outcome {
-            TurnOutcome::Completed => self.durable.stage(state, self.strategy.0),
+            TurnOutcome::Completed => match self.durable.stage(state, self.strategy.0) {
+                Ok(staged) => staged,
+                // Another store owns this state's changes, or the log has no
+                // positions left. Refused at the turn that finds out.
+                Err(error) => return Box::pin(async move { Err(Stop::from(error)) }),
+            },
             TurnOutcome::Panicked { .. } => {
-                self.durable.discard(state);
+                // Drained and thrown away. If this store does not own the changes
+                // they are left alone: the turn is refused all the same.
+                let _ = self.durable.discard(state);
                 return Box::pin(async {
                     Err(Stop::new(
                         "a panicked turn is not stored: the state may be half-applied",
@@ -712,8 +755,15 @@ where
         };
 
         Box::pin(async move {
-            self.durable.commit(staged).await?;
-            Ok(())
+            match staged.commit().await {
+                Ok(()) => Ok(()),
+                // The record may be stored. A refusal that said "it was not
+                // committed" would invite a retry that applies it twice.
+                Err(error @ keylink_persist::Error::Indeterminate { .. }) => {
+                    Err(Stop::indeterminate(error))
+                }
+                Err(error) => Err(Stop::from(error)),
+            }
         })
     }
 

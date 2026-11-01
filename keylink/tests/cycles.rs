@@ -215,6 +215,7 @@ impl ring::Actor for Peer {
                 keylink::Withheld::Panicked { .. }
                 | keylink::Withheld::Refused { .. }
                 | keylink::Withheld::ObserverPanicked { .. }
+                | keylink::Withheld::Indeterminate { .. }
                 | keylink::Withheld::Expired
                 | keylink::Withheld::Dropped
                 | keylink::Withheld::Restarting { .. },
@@ -305,6 +306,7 @@ fn answered(hop: Result<u64, keylink::Unanswered>) -> u64 {
             keylink::Withheld::Panicked { .. }
             | keylink::Withheld::Refused { .. }
             | keylink::Withheld::ObserverPanicked { .. }
+            | keylink::Withheld::Indeterminate { .. }
             | keylink::Withheld::Expired
             | keylink::Withheld::Dropped
             | keylink::Withheld::Restarting { .. },

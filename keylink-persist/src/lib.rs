@@ -236,8 +236,11 @@ pub trait Claim: Send + 'static {
     ///
     /// # Errors
     ///
-    /// [`Error::TooLarge`] when the record is over the adapter's cap, and
-    /// [`Error::Io`] when the write fails. Neither disturbs what is stored.
+    /// [`Error::TooLarge`] when the record, or the log it would make, is over the
+    /// adapter's cap, and [`Error::Io`] when the write fails. Neither disturbs
+    /// what is stored. [`Error::Indeterminate`] when the write failed **and could
+    /// not be undone**: the record may be stored, and the claim must refuse
+    /// everything after it.
     fn append(&mut self, seq: Seq, record: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Every record from `from` on, after cutting a torn tail.
@@ -631,8 +634,8 @@ pub trait Journaled: Durable {
     /// Re-do one stored change on restore.
     ///
     /// Must not [`record`](Changes::record): a replayed change is already
-    /// stored. A restore drops whatever this call recorded rather than storing it
-    /// a second time.
+    /// stored. A restore runs this on a state whose buffer nobody has adopted yet,
+    /// so anything it did record would be dropped; the rule is still the rule.
     fn apply(&mut self, delta: Self::Delta);
 }
 
@@ -642,17 +645,30 @@ pub trait Journaled: Durable {
 /// so only a turn, which holds the state exclusively, can record: a
 /// `with_state` read gets `&State` and cannot.
 ///
-/// There is no public way to take the changes out. The owner of the state's
-/// claim drains them through
-/// [`Versioned::stage`](versioned::Versioned::stage), and nothing else holds
-/// that. From outside this crate, no name drains one (made red by making `take`
-/// public, whereupon this fence compiles and rustdoc fails it):
+/// # One owner, bound before the first turn
+///
+/// A buffer records nothing until a persistence session has **adopted** it
+/// ([`Versioned::adopt`](versioned::Versioned::adopt), which `keylink`'s
+/// `Opened::start_from` does for a journaled state). From then on only that
+/// session can drain it, and a second session that tries to adopt it, drain it or
+/// discard it is refused with [`Error::ForeignChanges`]. Two consequences:
+///
+/// - A state run **without** a store that drains it, spawned bare or under a
+///   whole-state store, records nothing, so its buffer cannot grow without bound.
+///   A change recorded there is dropped, which is correct: nothing was going to
+///   store it.
+/// - Two journaled stores attached to one actor cannot both think they own its
+///   changes. The second one's first turn is refused, loudly.
+///
+/// There is no public way to take the changes out. From outside this crate, no
+/// name drains one (made red by making `take_for` public, whereupon this fence
+/// compiles and rustdoc fails it):
 ///
 /// ```compile_fail
 /// use keylink_persist::Changes;
 ///
 /// let changes: Changes<u8> = Changes::default();
-/// let _ = changes.take();
+/// let _ = changes.take_for(1);
 /// ```
 ///
 /// A mutex holds them, and not a `Cell`, so that a journaled state stays `Sync`.
@@ -662,49 +678,83 @@ pub trait Journaled: Durable {
 /// **Not `Clone`, on purpose.** A clone that carried pending changes would store
 /// them twice. A state that derives `Clone` implements it by hand, or leaves this
 /// field out and builds a fresh one with [`Default`].
-///
-/// **A journaled state that is run without a store that drains this buffer** (the
-/// actor spawned bare, or under a whole-state store) never empties it, and it
-/// grows with every recorded change.
-pub struct Changes<T>(std::sync::Mutex<Vec<T>>);
+pub struct Changes<T>(std::sync::Mutex<Pending<T>>);
+
+/// What a [`Changes`] holds: who may drain it, and what is waiting.
+struct Pending<T> {
+    /// The session that adopted the buffer, or `0` for none.
+    owner: u64,
+    changes: Vec<T>,
+}
 
 impl<T> Default for Changes<T> {
     fn default() -> Self {
-        Self(std::sync::Mutex::new(Vec::new()))
+        Self(std::sync::Mutex::new(Pending {
+            owner: 0,
+            changes: Vec::new(),
+        }))
     }
 }
 
 impl<T> Changes<T> {
     /// Record one change, in the turn that made it.
+    ///
+    /// **Dropped, silently, until a persistence session has adopted this
+    /// buffer.** See the type's header for why that is the right answer.
     pub fn record(&mut self, delta: T) {
-        self.0
+        let pending = self
+            .0
             .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(delta);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.owner != 0 {
+            pending.changes.push(delta);
+        }
     }
 
-    /// Everything recorded since the last call, oldest first.
-    pub(crate) fn take(&self) -> Vec<T> {
-        std::mem::take(
-            &mut *self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+    /// Bind this buffer to `session`. `false` when another session has it.
+    pub(crate) fn adopt_for(&self, session: u64) -> bool {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.owner == 0 {
+            pending.owner = session;
+        }
+        pending.owner == session
+    }
+
+    /// Whether `session` owns this buffer.
+    pub(crate) fn owned_by(&self, session: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner
+            == session
+    }
+
+    /// Everything recorded since the last call, oldest first, if `session` owns
+    /// this buffer. `None` is somebody else's buffer, left untouched.
+    pub(crate) fn take_for(&self, session: u64) -> Option<Vec<T>> {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (pending.owner == session).then(|| std::mem::take(&mut pending.changes))
     }
 }
 
 impl<T> fmt::Debug for Changes<T> {
-    /// How many changes are waiting, and nothing else: they are the state's own
-    /// encoding and this crate never looks inside.
+    /// How many changes are waiting and whether anyone owns the buffer, and
+    /// nothing else: the changes are the state's own encoding and this crate
+    /// never looks inside.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pending = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("Changes")
-            .field("pending", &pending)
+            .field("owned", &(pending.owner != 0))
+            .field("pending", &pending.changes.len())
             .finish()
     }
 }
@@ -1177,6 +1227,45 @@ pub enum Error {
         /// Which check refused it.
         fault: JournalFault,
     },
+
+    /// An append failed, and the cut that should have undone it failed too: **the
+    /// record may be stored.**
+    ///
+    /// Distinct from [`Io`](Self::Io) on purpose. A clean `Io` from
+    /// [`Claim::append`] promises the log is as it was before the call, so the
+    /// turn did not happen and a retry is safe. This one promises nothing: the
+    /// record may survive, be replayed on the next recovery, and be applied a
+    /// second time by a caller that retried. An adapter that returns it must also
+    /// fail every later operation on that claim.
+    ///
+    /// The right response is to recover and look, not to retry.
+    #[error(
+        "the append failed ({append}) and could not be rolled back ({rollback}): the record may be stored"
+    )]
+    Indeterminate {
+        /// Why the append failed.
+        append: std::io::Error,
+        /// Why undoing it failed.
+        rollback: std::io::Error,
+    },
+
+    /// A journaled state's changes belong to another persistence session.
+    ///
+    /// Reported when a session tries to adopt, drain or discard a
+    /// [`Changes`] buffer that a different one owns. Two journaled stores on one
+    /// actor, or a store handed a state that another store already adopted,
+    /// both land here, at the first turn and not as lost data later.
+    #[error("this state's changes belong to another persistence session")]
+    ForeignChanges,
+
+    /// The log has used every sequence number.
+    ///
+    /// A stored snapshot that claims to contain the last number there is, or an
+    /// append that would need the next one. Refused before anything is read or
+    /// written, because every position after this one would wrap. Not reachable by
+    /// appending one record at a time.
+    #[error("the log has no sequence numbers left")]
+    SeqExhausted,
 
     /// The underlying store failed.
     #[error("the snapshot store failed: {0}")]

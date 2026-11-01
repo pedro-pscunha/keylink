@@ -290,8 +290,9 @@ through `Journaled::apply` (the code a restore runs too) and records the change,
 and the observer appends it. Every so often a `Compaction` policy folds the log
 into a new snapshot, and that one turn costs the size of the state. A state
 written by `Deltas` and opened by `Whole` is refused rather than read without its
-log. On this machine, back to back, a `Deltas` turn took 0.3 to 0.5 times as long
-as a `Whole` one and wrote 60 bytes against the whole state; the table, and what
+log. On this machine, back to back, a `Deltas` turn took 0.36 to 0.53 times as long
+as a `Whole` one (median of three runs per size) and wrote 64 bytes against the
+whole state; the table, and what
 it does not cover, is in `Persist`'s rustdoc. An unrecorded change is lost on
 restart without a word, so a test should reopen the state and compare its
 encoding with the live one, as `keylink/tests/journal.rs` does.
